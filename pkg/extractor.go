@@ -161,18 +161,37 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 // callPlayerAPI makes the innertube player API call
 func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 	// Build request body
+	client := InnertubeClient{
+		HL:            "en",
+		GL:            "US",
+		ClientName:    e.config.Name,
+		ClientVersion: e.config.Version,
+		UserAgent:     e.config.UserAgent,
+		TimeZone:      "UTC",
+		UTCOffset:     0,
+	}
+
+	// Add device info if present (IOS/Android clients)
+	if e.config.DeviceMake != "" {
+		client.DeviceMake = e.config.DeviceMake
+	}
+	if e.config.DeviceModel != "" {
+		client.DeviceModel = e.config.DeviceModel
+	}
+	if e.config.Platform != "" {
+		client.Platform = e.config.Platform
+	}
+	if e.config.OSName != "" {
+		client.OSName = e.config.OSName
+	}
+	if e.config.OSVersion != "" {
+		client.OSVersion = e.config.OSVersion
+	}
+
 	reqBody := InnertubeRequest{
 		VideoID: videoID,
 		Context: InnertubeContext{
-			Client: InnertubeClient{
-				HL:            "en",
-				GL:            "US",
-				ClientName:    e.config.Name,
-				ClientVersion: e.config.Version,
-				UserAgent:     e.config.UserAgent,
-				TimeZone:      "UTC",
-				UTCOffset:     0,
-			},
+			Client: client,
 		},
 		ContentCheckOK: true,
 		RacyCheckOK:    true,

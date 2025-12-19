@@ -28,13 +28,18 @@ var PremiumAudioItags = []int{
 	251, // 160kbps Opus (fallback)
 }
 
-// === ANDROID_VR CLIENT (no cipher needed) ===
+// === IOS CLIENT (no cipher needed) - DEFAULT for video mode ===
 const (
-	AndroidVRClientName    = "ANDROID_VR"
-	AndroidVRClientVersion = "1.60.19"
-	AndroidVRAPIEndpoint   = "https://www.youtube.com/youtubei/v1/player"
-	AndroidVRAPIKey        = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-	AndroidVRUserAgent     = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+	IOSClientName    = "IOS"
+	IOSClientVersion = "19.45.4"
+	IOSAPIEndpoint   = "https://www.youtube.com/youtubei/v1/player"
+	IOSAPIKey        = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
+	IOSUserAgent     = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
+	IOSDeviceMake    = "Apple"
+	IOSDeviceModel   = "iPhone16,2"
+	IOSPlatform      = "MOBILE"
+	IOSOSName        = "iPhone"
+	IOSOSVersion     = "18.1.0.22B83"
 )
 
 // Video itags - prioritized order (1080p)
@@ -45,9 +50,9 @@ var VideoItags = []int{
 	136, // 720p AVC (fallback)
 }
 
-// Standard audio itags (ANDROID_VR)
+// Standard audio itags (IOS)
 var StandardAudioItags = []int{
+	140, // 128kbps AAC (best compatibility)
 	251, // 160kbps Opus
-	140, // 128kbps AAC
 	250, // 70kbps Opus
 }

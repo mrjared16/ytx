@@ -15,13 +15,18 @@ type InnertubeContext struct {
 }
 
 type InnertubeClient struct {
-	HL            string `json:"hl"`
-	GL            string `json:"gl"`
-	ClientName    string `json:"clientName"`
-	ClientVersion string `json:"clientVersion"`
-	UserAgent     string `json:"userAgent,omitempty"`
-	TimeZone      string `json:"timeZone"`
-	UTCOffset     int    `json:"utcOffsetMinutes"`
+	HL                string `json:"hl"`
+	GL                string `json:"gl"`
+	ClientName        string `json:"clientName"`
+	ClientVersion     string `json:"clientVersion"`
+	UserAgent         string `json:"userAgent,omitempty"`
+	TimeZone          string `json:"timeZone"`
+	UTCOffset         int    `json:"utcOffsetMinutes"`
+	DeviceMake        string `json:"deviceMake,omitempty"`
+	DeviceModel       string `json:"deviceModel,omitempty"`
+	Platform          string `json:"platform,omitempty"`
+	OSName            string `json:"osName,omitempty"`
+	OSVersion         string `json:"osVersion,omitempty"`
 }
 
 type PlaybackContext struct {
@@ -111,6 +116,12 @@ type ClientConfig struct {
 	NeedsCipher  bool
 	NeedsCookies bool
 	Headers      map[string]string
+	// Device info (for IOS/Android clients)
+	DeviceMake  string
+	DeviceModel string
+	Platform    string
+	OSName      string
+	OSVersion   string
 }
 
 // VideoResult extends Result with video URL
