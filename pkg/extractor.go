@@ -23,6 +23,15 @@ var cipherCache struct {
 	expiry time.Time
 }
 
+// Global visitorData cache (valid for ~30 minutes)
+var visitorDataCache struct {
+	sync.RWMutex
+	data   string
+	expiry time.Time
+}
+
+const visitorDataTTL = 30 * time.Minute
+
 // Extractor handles YouTube stream extraction
 type Extractor struct {
 	config        ClientConfig
@@ -32,6 +41,9 @@ type Extractor struct {
 	cipher        *Cipher       // lazy initialized, only for music mode
 	cacheManager  *CacheManager // file-based persistent cache
 	cipherRetried atomic.Bool   // track if we've already retried with fresh cipher
+	visitorData   string        // required since Jan 2025 for all API requests
+	profile       bool          // enable profiling
+	timings       Timings       // profiling timers
 }
 
 // NewExtractor creates a new extractor for the given mode
@@ -79,48 +91,277 @@ func NewExtractor(mode ClientMode, cookieFile string) (*Extractor, error) {
 	return ext, nil
 }
 
+// SetProfile enables profiling for this extractor
+func (e *Extractor) SetProfile(enabled bool) {
+	e.profile = enabled
+}
+
+// fetchVisitorData gets visitorData from YouTube using WEB client (required since Jan 2025)
+// Uses a global cache to avoid redundant fetches across bulk operations
+func (e *Extractor) fetchVisitorData(videoID string) error {
+	// Check instance cache first
+	if e.visitorData != "" {
+		return nil
+	}
+
+	// Check global cache (for bulk operations)
+	visitorDataCache.RLock()
+	if visitorDataCache.data != "" && time.Now().Before(visitorDataCache.expiry) {
+		e.visitorData = visitorDataCache.data
+		visitorDataCache.RUnlock()
+		return nil
+	}
+	visitorDataCache.RUnlock()
+
+	// For music mode, get visitorData from music.youtube.com page
+	if e.config.NeedsCookies {
+		if err := e.fetchMusicVisitorData(videoID); err != nil {
+			return err
+		}
+		e.cacheVisitorData()
+		return nil
+	}
+
+	// Use WEB client to get visitorData - this is critical!
+	// ANDROID_VR returns LOGIN_REQUIRED without visitorData,
+	// but WEB client returns visitorData that then works with ANDROID_VR
+	reqBody := InnertubeRequest{
+		VideoID: videoID,
+		Context: InnertubeContext{
+			Client: InnertubeClient{
+				HL:            "en",
+				GL:            "US",
+				ClientName:    WEBClientName,
+				ClientVersion: WEBClientVersion,
+				TimeZone:      "UTC",
+				UTCOffset:     0,
+			},
+		},
+		ContentCheckOK: true,
+		RacyCheckOK:    true,
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	apiURL := fmt.Sprintf("%s?key=%s&prettyPrint=false", WEBAPIEndpoint, WEBAPIKey)
+	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(jsonBody))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", WEBUserAgent)
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var playerResp PlayerResponse
+	if err := json.NewDecoder(resp.Body).Decode(&playerResp); err != nil {
+		return err
+	}
+
+	if playerResp.ResponseContext.VisitorData != "" {
+		e.visitorData = playerResp.ResponseContext.VisitorData
+		e.cacheVisitorData()
+	}
+
+	return nil
+}
+
+// cacheVisitorData stores visitorData in the global cache
+func (e *Extractor) cacheVisitorData() {
+	if e.visitorData == "" {
+		return
+	}
+	visitorDataCache.Lock()
+	visitorDataCache.data = e.visitorData
+	visitorDataCache.expiry = time.Now().Add(visitorDataTTL)
+	visitorDataCache.Unlock()
+}
+
+// musicVisitorDataRegex extracts visitorData from music.youtube.com HTML
+var musicVisitorDataRegex = regexp.MustCompile(`"visitorData"\s*:\s*"([^"]+)"`)
+
+// fetchMusicVisitorData gets visitorData from music.youtube.com page
+func (e *Extractor) fetchMusicVisitorData(videoID string) error {
+	watchURL := fmt.Sprintf("https://music.youtube.com/watch?v=%s", videoID)
+	req, err := http.NewRequest("GET", watchURL, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("User-Agent", e.config.UserAgent)
+	req.Header.Set("Cookie", BuildCookieHeader(e.cookies))
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	matches := musicVisitorDataRegex.FindSubmatch(body)
+	if len(matches) >= 2 {
+		e.visitorData = string(matches[1])
+	}
+
+	return nil
+}
+
 // Extract gets the best audio stream URL for a video
 func (e *Extractor) Extract(videoID string) (*Result, error) {
-	// 1. Call innertube API
+	var totalStart time.Time
+	if e.profile {
+		totalStart = time.Now()
+		e.timings = Timings{} // Reset timings
+	}
+
+	// Parallel fetch: visitorData, cipher (pre-warm), and prepare for API call
+	// This saves ~150-250ms by overlapping network calls
+	type visitorResult struct {
+		err error
+	}
+	type cipherResult struct {
+		cipher *Cipher
+		err    error
+	}
+
+	visitorCh := make(chan visitorResult, 1)
+	cipherCh := make(chan cipherResult, 1)
+
+	var visitorStart, cipherPrewarmStart time.Time
+	if e.profile {
+		visitorStart = time.Now()
+		cipherPrewarmStart = time.Now()
+	}
+
+	// Fetch visitorData in parallel
+	go func() {
+		err := e.fetchVisitorData(videoID)
+		visitorCh <- visitorResult{err: err}
+	}()
+
+	// Pre-warm cipher cache AND JS engine in parallel (if not already cached)
+	go func() {
+		cipher, err := e.getCachedCipher(videoID)
+		// Pre-warm JS engine while API call is in flight (saves ~150ms)
+		if err == nil && len(cipher.playerJS) > 0 && cipher.nFunctionName != "" {
+			_, _ = GetCachedEngine(cipher.playerJS, cipher.nFunctionName)
+		}
+		cipherCh <- cipherResult{cipher: cipher, err: err}
+	}()
+
+	// Wait for visitorData (required for API call)
+	visitorRes := <-visitorCh
+	if e.profile {
+		e.timings.VisitorDataMs = time.Since(visitorStart).Milliseconds()
+	}
+	if visitorRes.err != nil {
+		// Non-fatal, continue without it
+	}
+
+	// Call innertube API (now with visitorData ready)
+	var apiStart time.Time
+	if e.profile {
+		apiStart = time.Now()
+	}
 	playerResp, err := e.callPlayerAPI(videoID)
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
 	}
+	if e.profile {
+		e.timings.PlayerAPIMs = time.Since(apiStart).Milliseconds()
+	}
 
-	// 2. Check playability
+	// Wait for cipher pre-warm to complete
+	cipherRes := <-cipherCh
+	if e.profile {
+		e.timings.CipherInitMs = time.Since(cipherPrewarmStart).Milliseconds()
+	}
+	if cipherRes.err == nil {
+		e.cipher = cipherRes.cipher
+	}
+
+	// Check playability
 	if playerResp.PlayabilityStatus.Status != "OK" {
 		return nil, fmt.Errorf("video not playable: %s - %s",
 			playerResp.PlayabilityStatus.Status,
 			playerResp.PlayabilityStatus.Reason)
 	}
 
-	// 3. Find best audio stream
+	// Find best audio stream
 	stream := e.findBestAudioStream(playerResp.StreamingData.AdaptiveFormats)
 	if stream == nil {
 		return nil, fmt.Errorf("no audio stream found")
 	}
 
-	// 4. Get stream URL (may need decryption)
+	// Get stream URL (may need decryption) - cipher already initialized
 	streamURL, err := e.getStreamURL(videoID, stream)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get stream URL: %w", err)
 	}
 
-	return &Result{
+	result := &Result{
 		URL:      streamURL,
 		Itag:     stream.Itag,
 		Bitrate:  stream.Bitrate,
 		MimeType: stream.MimeType,
 		Title:    playerResp.VideoDetails.Title,
 		Author:   playerResp.VideoDetails.Author,
-	}, nil
+	}
+
+	if e.profile {
+		e.timings.TotalMs = time.Since(totalStart).Milliseconds()
+		// Get JS engine name if available
+		if cachedEngine != nil {
+			e.timings.JSEngine = cachedEngine.Name()
+		}
+		result.Timings = &e.timings
+	}
+
+	return result, nil
 }
 
 // ExtractVideo gets video and audio stream URLs (for MPV playback)
 func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
+	var totalStart time.Time
+	if e.profile {
+		totalStart = time.Now()
+		e.timings = Timings{} // Reset timings
+	}
+
+	// 0. Fetch visitorData first (required since Jan 2025)
+	var visitorStart time.Time
+	if e.profile {
+		visitorStart = time.Now()
+	}
+	if err := e.fetchVisitorData(videoID); err != nil {
+		// Non-fatal, continue without it
+	}
+	if e.profile {
+		e.timings.VisitorDataMs = time.Since(visitorStart).Milliseconds()
+	}
+
+	var apiStart time.Time
+	if e.profile {
+		apiStart = time.Now()
+	}
 	playerResp, err := e.callPlayerAPI(videoID)
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
+	}
+	if e.profile {
+		e.timings.PlayerAPIMs = time.Since(apiStart).Milliseconds()
 	}
 
 	if playerResp.PlayabilityStatus.Status != "OK" {
@@ -141,12 +382,12 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 		return nil, fmt.Errorf("no audio stream found")
 	}
 
-	// ANDROID_VR returns direct URLs (no cipher)
+	// ANDROID_VR with visitorData returns direct URLs (no cipher)
 	if video.URL == "" || audio.URL == "" {
 		return nil, fmt.Errorf("no direct URLs - cipher required but video mode doesn't support it")
 	}
 
-	return &VideoResult{
+	result := &VideoResult{
 		VideoURL:  video.URL,
 		AudioURL:  audio.URL,
 		VideoItag: video.Itag,
@@ -155,7 +396,14 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 		Height:    video.Height,
 		Title:     playerResp.VideoDetails.Title,
 		Author:    playerResp.VideoDetails.Author,
-	}, nil
+	}
+
+	if e.profile {
+		e.timings.TotalMs = time.Since(totalStart).Milliseconds()
+		result.Timings = &e.timings
+	}
+
+	return result, nil
 }
 
 // callPlayerAPI makes the innertube player API call
@@ -186,6 +434,11 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 	}
 	if e.config.OSVersion != "" {
 		client.OSVersion = e.config.OSVersion
+	}
+
+	// Add visitorData if we have it (required since Jan 2025)
+	if e.visitorData != "" {
+		client.VisitorData = e.visitorData
 	}
 
 	reqBody := InnertubeRequest{
@@ -249,6 +502,11 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 	var playerResp PlayerResponse
 	if err := json.NewDecoder(resp.Body).Decode(&playerResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Capture visitorData for subsequent requests (required since Jan 2025)
+	if playerResp.ResponseContext.VisitorData != "" && e.visitorData == "" {
+		e.visitorData = playerResp.ResponseContext.VisitorData
 	}
 
 	return &playerResp, nil
@@ -331,6 +589,10 @@ func (e *Extractor) getCachedCipher(videoID string) (*Cipher, error) {
 	if e.cacheManager != nil {
 		if cache, err := e.cacheManager.Load(); err == nil && e.cacheManager.IsValid(cache) {
 			cipher := NewCipherFromCache(cache)
+			// Load player.js from separate cache file
+			if playerJS, err := e.cacheManager.LoadPlayerJS(); err == nil {
+				cipher.playerJS = playerJS
+			}
 			// Also populate in-memory cache
 			cipherCache.Lock()
 			cipherCache.cipher = cipher
@@ -354,8 +616,18 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 		return cipherCache.cipher, nil
 	}
 
-	// Fetch new cipher
-	cipher, _, err := NewCipherWithURL(videoID, e.httpClient)
+	// Try to use cached base.js path (saves ~150ms by skipping embed page)
+	var cachedPath string
+	if e.cacheManager != nil {
+		if cache, err := e.cacheManager.Load(); err == nil && cache.BaseJSPath != "" {
+			cachedPath = cache.BaseJSPath
+		}
+	}
+
+	// Fetch new cipher (will try cached path first, fallback to embed page)
+	// Use config.Origin for domain reuse (music.youtube.com for music mode)
+	// This saves ~50-80ms by reusing existing HTTP/2 connection instead of new TLS handshake
+	cipher, playerPath, err := NewCipherWithCachedPath(videoID, e.httpClient, cachedPath, e.config.Origin)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +638,13 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 
 	// Save to file cache (ignore errors - graceful degradation)
 	if e.cacheManager != nil {
-		_ = e.cacheManager.Save(cipher.ToCache())
+		cacheData := cipher.ToCache()
+		cacheData.BaseJSPath = playerPath // Store base.js path for next time
+		_ = e.cacheManager.Save(cacheData)
+		// Also save player.js (compressed) for n-transform
+		if len(cipher.playerJS) > 0 {
+			_ = e.cacheManager.SavePlayerJS(cipher.playerJS)
+		}
 	}
 
 	return cipher, nil
@@ -478,15 +756,29 @@ func (e *Extractor) unthrottle(videoID, streamURL string) (string, error) {
 	}
 
 	// Initialize cipher if needed (using cache)
+	var cipherStart time.Time
+	if e.profile && e.cipher == nil {
+		cipherStart = time.Now()
+	}
 	if e.cipher == nil {
 		e.cipher, err = e.getCachedCipher(videoID)
 		if err != nil {
 			return "", fmt.Errorf("failed to initialize cipher: %w", err)
 		}
+		if e.profile {
+			e.timings.CipherInitMs = time.Since(cipherStart).Milliseconds()
+		}
 	}
 
 	// Transform n-parameter
+	var transformStart time.Time
+	if e.profile {
+		transformStart = time.Now()
+	}
 	transformedN, err := e.cipher.TransformN(nParam)
+	if e.profile {
+		e.timings.NTransformMs = time.Since(transformStart).Milliseconds()
+	}
 	if err != nil {
 		// Log but don't fail - some videos work without n transform
 		return streamURL, nil

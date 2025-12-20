@@ -27,6 +27,7 @@ type InnertubeClient struct {
 	Platform          string `json:"platform,omitempty"`
 	OSName            string `json:"osName,omitempty"`
 	OSVersion         string `json:"osVersion,omitempty"`
+	VisitorData       string `json:"visitorData,omitempty"`
 }
 
 type PlaybackContext struct {
@@ -40,9 +41,14 @@ type ContentPlaybackContext struct {
 // === INNERTUBE RESPONSE ===
 
 type PlayerResponse struct {
+	ResponseContext   ResponseContext   `json:"responseContext"`
 	PlayabilityStatus PlayabilityStatus `json:"playabilityStatus"`
 	StreamingData     StreamingData     `json:"streamingData"`
 	VideoDetails      VideoDetails      `json:"videoDetails"`
+}
+
+type ResponseContext struct {
+	VisitorData string `json:"visitorData"`
 }
 
 type PlayabilityStatus struct {
@@ -82,13 +88,24 @@ type VideoDetails struct {
 
 // === CLI OUTPUT ===
 
+// Timings captures duration of each stage for profiling
+type Timings struct {
+	VisitorDataMs int64  `json:"visitor_data_ms,omitempty"`
+	PlayerAPIMs   int64  `json:"player_api_ms,omitempty"`
+	CipherInitMs  int64  `json:"cipher_init_ms,omitempty"`
+	NTransformMs  int64  `json:"n_transform_ms,omitempty"`
+	TotalMs       int64  `json:"total_ms,omitempty"`
+	JSEngine      string `json:"js_engine,omitempty"`
+}
+
 type Result struct {
-	URL      string `json:"url"`
-	Itag     int    `json:"itag"`
-	Bitrate  int    `json:"bitrate"`
-	MimeType string `json:"mimeType,omitempty"`
-	Title    string `json:"title,omitempty"`
-	Author   string `json:"author,omitempty"`
+	URL      string   `json:"url"`
+	Itag     int      `json:"itag"`
+	Bitrate  int      `json:"bitrate"`
+	MimeType string   `json:"mimeType,omitempty"`
+	Title    string   `json:"title,omitempty"`
+	Author   string   `json:"author,omitempty"`
+	Timings  *Timings `json:"timings,omitempty"`
 }
 
 type ErrorResult struct {
@@ -126,14 +143,15 @@ type ClientConfig struct {
 
 // VideoResult extends Result with video URL
 type VideoResult struct {
-	VideoURL  string `json:"video_url"`
-	AudioURL  string `json:"audio_url"`
-	VideoItag int    `json:"video_itag"`
-	AudioItag int    `json:"audio_itag"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	Title     string `json:"title"`
-	Author    string `json:"author"`
+	VideoURL  string   `json:"video_url"`
+	AudioURL  string   `json:"audio_url"`
+	VideoItag int      `json:"video_itag"`
+	AudioItag int      `json:"audio_itag"`
+	Width     int      `json:"width"`
+	Height    int      `json:"height"`
+	Title     string   `json:"title"`
+	Author    string   `json:"author"`
+	Timings   *Timings `json:"timings,omitempty"`
 }
 
 // BulkResult for streaming output
