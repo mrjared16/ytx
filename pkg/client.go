@@ -5,22 +5,22 @@ func GetClientConfig(mode ClientMode) ClientConfig {
 	switch mode {
 	case ModeVideo:
 		return ClientConfig{
-			Name:         IOSClientName,
-			Version:      IOSClientVersion,
-			APIEndpoint:  IOSAPIEndpoint,
-			APIKey:       IOSAPIKey,
-			UserAgent:    IOSUserAgent,
+			Name:         AndroidVRClientName,
+			Version:      AndroidVRClientVersion,
+			APIEndpoint:  AndroidVRAPIEndpoint,
+			APIKey:       AndroidVRAPIKey,
+			UserAgent:    AndroidVRUserAgent,
 			Origin:       "https://www.youtube.com",
 			NeedsCipher:  false,
 			NeedsCookies: false,
-			DeviceMake:   IOSDeviceMake,
-			DeviceModel:  IOSDeviceModel,
-			Platform:     IOSPlatform,
-			OSName:       IOSOSName,
-			OSVersion:    IOSOSVersion,
+			DeviceMake:   AndroidVRDeviceMake,
+			DeviceModel:  AndroidVRDeviceModel,
+			Platform:     AndroidVRPlatform,
+			OSName:       AndroidVROSName,
+			OSVersion:    AndroidVROSVersion,
 			Headers: map[string]string{
-				"X-Youtube-Client-Name":    "5",
-				"X-Youtube-Client-Version": IOSClientVersion,
+				"X-Youtube-Client-Name":    "28",
+				"X-Youtube-Client-Version": AndroidVRClientVersion,
 			},
 		}
 	case ModeMusic:
