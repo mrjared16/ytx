@@ -24,7 +24,7 @@ import (
 // 3. Extract source text for self-contained code
 // 4. Pre-compile JS program once, reuse for all decryptions
 //
-// This is more robust than regex and doesn't require new dependencies
+// For n-function: Use kkdai's approach - extract raw function body and ExportTo
 type Cipher struct {
 	sigFunctionName string
 	sigParam        int
@@ -32,46 +32,92 @@ type Cipher struct {
 	jsCode          string        // Self-contained JS with function + dependencies
 	playerURL       string        // Player JS URL (for cache versioning)
 	compiled        *goja.Program // Pre-compiled JS program for fast execution
+	playerJS        []byte        // Full player JS for n-function extraction
 }
+
+// NFunctionName returns the n-function name (for debugging)
+func (c *Cipher) NFunctionName() string { return c.nFunctionName }
+
+// PlayerJSLen returns the length of playerJS (for debugging)
+func (c *Cipher) PlayerJSLen() int { return len(c.playerJS) }
 
 // Base.js URL pattern
 var basejsPattern = regexp.MustCompile(`/s/player/[\w-]+/[\w./-]+/base\.js`)
 
-// NewCipher creates a new cipher by fetching and parsing the player JS
-func NewCipher(videoID string, httpClient *http.Client) (*Cipher, error) {
-	cipher, _, err := NewCipherWithURL(videoID, httpClient)
-	return cipher, err
-}
+// NewCipherWithCachedPath creates a new cipher, optionally using a cached base.js path
+// If cachedPath is provided and valid, skips the embed page fetch (~150ms savings)
+// baseURL allows domain reuse (e.g., music.youtube.com for music mode) to avoid extra TLS handshake
+func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath string, baseURL string) (*Cipher, string, error) {
+	var playerPath string
+	var playerJS []byte
+	var err error
 
-// NewCipherWithURL creates a new cipher and returns the player URL for caching
-func NewCipherWithURL(videoID string, httpClient *http.Client) (*Cipher, string, error) {
-	// 1. Get embed page to find player JS URL
-	embedURL := fmt.Sprintf("https://www.youtube.com/embed/%s?hl=en", videoID)
-	embedBody, err := httpGetBytes(httpClient, embedURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to fetch embed page: %w", err)
+	// For player.js, prefer the provided baseURL (for connection reuse with music.youtube.com)
+	// But for embed page, always use youtube.com (music.youtube.com/embed doesn't work)
+	playerBaseURL := baseURL
+	if playerBaseURL == "" {
+		playerBaseURL = PlayerJSURLBase
 	}
 
-	// 2. Extract player JS path
-	playerPath := basejsPattern.FindString(string(embedBody))
+	// Determine engine type for pre-spawning
+	engineType := GetEngineType()
+	var engineName string
+	switch engineType {
+	case EngineBun:
+		engineName = "bun"
+	case EngineNode:
+		engineName = "node"
+	case EngineAuto:
+		// Auto mode: try bun first
+		engineName = "bun"
+	}
+
+	// Pre-spawn JS process in parallel with player.js download (saves ~100-150ms)
+	// This overlaps process startup with network I/O
+	if engineName != "" {
+		go PreSpawnJSProcess(engineName)
+	}
+
+	// Try cached path first (skip embed page fetch)
+	// Use playerBaseURL to benefit from connection reuse
+	if cachedPath != "" {
+		playerURL := playerBaseURL + cachedPath
+		playerJS, err = httpGetBytes(httpClient, playerURL)
+		if err == nil {
+			playerPath = cachedPath
+		}
+		// If cached path fails, fall through to embed page fetch
+	}
+
+	// Fallback: fetch embed page to find current base.js URL
+	// Always use youtube.com for embed page (music.youtube.com/embed doesn't work)
 	if playerPath == "" {
-		return nil, "", errors.New("unable to find base.js URL in embed page")
+		embedURL := fmt.Sprintf("%s/embed/%s?hl=en", PlayerJSURLBase, videoID)
+		embedBody, err := httpGetBytes(httpClient, embedURL)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to fetch embed page: %w", err)
+		}
+
+		playerPath = basejsPattern.FindString(string(embedBody))
+		if playerPath == "" {
+			return nil, "", errors.New("unable to find base.js URL in embed page")
+		}
+
+		// Use playerBaseURL for the actual player.js fetch (connection reuse)
+		playerURL := playerBaseURL + playerPath
+		playerJS, err = httpGetBytes(httpClient, playerURL)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to fetch player JS: %w", err)
+		}
 	}
 
-	// 3. Fetch player JS
-	playerURL := "https://www.youtube.com" + playerPath
-	playerJS, err := httpGetBytes(httpClient, playerURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to fetch player JS: %w", err)
-	}
-
-	// 4. Find signature function name and param
+	// Find signature function name and param
 	sigName, sigParam, err := findSigFunctionName(playerJS)
 	if err != nil {
 		return nil, "", err
 	}
 
-	// 5. Extract sig function and dependencies using AST
+	// Extract sig function and dependencies using AST
 	jsCode, err := extractWithAST(string(playerJS), sigName)
 	if err != nil {
 		// Fallback to simple extraction if AST fails
@@ -81,16 +127,10 @@ func NewCipherWithURL(videoID string, httpClient *http.Client) (*Cipher, string,
 		}
 	}
 
-	// 6. Find n-function (optional)
+	// Find n-function name (we don't need the body, playerJS is used directly)
 	nName := findNFunctionName(playerJS)
-	if nName != "" {
-		nCode, err := extractWithAST(string(playerJS), nName)
-		if err == nil {
-			jsCode += "\n" + nCode
-		}
-	}
 
-	// 7. Pre-compile the JS program for faster execution
+	// Pre-compile the JS program for faster execution
 	compiled, err := goja.Compile("cipher", jsCode, false)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to compile cipher JS: %w", err)
@@ -103,6 +143,7 @@ func NewCipherWithURL(videoID string, httpClient *http.Client) (*Cipher, string,
 		jsCode:          jsCode,
 		playerURL:       playerPath,
 		compiled:        compiled,
+		playerJS:        playerJS,
 	}, playerPath, nil
 }
 
@@ -125,7 +166,7 @@ func NewCipherFromCache(cache *CipherCache) *Cipher {
 func (c *Cipher) ToCache() *CipherCache {
 	now := time.Now()
 	return &CipherCache{
-		Version:     1,
+		Version:     currentCacheVersion,
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(cacheTTL),
 		PlayerURL:   c.playerURL,
@@ -345,6 +386,8 @@ func extractStatement(js string, idx int) string {
 }
 
 // extractSimple is the fallback extraction without AST
+// NOTE: Uses hardcoded legacy dependency names as a safety net when AST parsing fails.
+// The main path (extractWithAST) uses dynamic discovery and should be preferred.
 func extractSimple(js []byte, funcName string) (string, error) {
 	jsStr := string(js)
 
@@ -419,35 +462,54 @@ func (c *Cipher) DecryptSignature(sig string) (string, error) {
 	return result.String(), nil
 }
 
-// TransformN transforms the n-parameter
+// TransformN transforms the n-parameter using the configured JS engine
+// This is the critical function for bypassing YouTube's throttling
+//
+// Engine selection (via --js-engine flag):
+// - auto: Bun → Node (default)
+// - bun: Force Bun subprocess
+// - node: Force Node.js subprocess
+//
+// Why we need a full JS runtime:
+// - The n-function is only a thin wrapper: function(S){return MP[z[7]](this,19,S)}
+// - MP is a 707KB function with 533 dependencies inside the IIFE closure
+// - You cannot extract the n-function without the ENTIRE 2.6MB player.js
+// - goja (ES5.1) fails with "ReferenceError: MP is not defined" and lacks ES2020+ support
 func (c *Cipher) TransformN(n string) (string, error) {
 	if c.nFunctionName == "" {
 		return n, nil
 	}
 
-	vm := goja.New()
-
-	// Use pre-compiled program if available
-	if c.compiled != nil {
-		if _, err := vm.RunProgram(c.compiled); err != nil {
-			return n, nil
-		}
-	} else {
-		if _, err := vm.RunString(c.jsCode); err != nil {
-			return n, nil
-		}
+	// Need full player.js for the JS runtime
+	if len(c.playerJS) == 0 {
+		return n, fmt.Errorf("no player.js available for n-transform")
 	}
 
-	result, err := vm.RunString(fmt.Sprintf("%s('%s')", c.nFunctionName, escapeJSString(n)))
+	// Use cached engine for efficiency (engine type set via SetEngineType)
+	engine, err := GetCachedEngine(c.playerJS, c.nFunctionName)
 	if err != nil {
-		return n, nil
+		return n, err
 	}
 
-	if result == nil || goja.IsUndefined(result) || goja.IsNull(result) {
-		return n, nil
+	return engine.TransformN(n)
+}
+
+// TransformNBatch transforms multiple n-parameters in a single IPC call
+func (c *Cipher) TransformNBatch(nValues []string) ([]string, error) {
+	if c.nFunctionName == "" || len(nValues) == 0 {
+		return nValues, nil
 	}
 
-	return result.String(), nil
+	if len(c.playerJS) == 0 {
+		return nValues, fmt.Errorf("no player.js available for n-transform")
+	}
+
+	engine, err := GetCachedEngine(c.playerJS, c.nFunctionName)
+	if err != nil {
+		return nValues, err
+	}
+
+	return engine.TransformNBatch(nValues)
 }
 
 // findSigFunctionName finds the signature function name and optional param
@@ -492,19 +554,21 @@ func findSigFunctionName(js []byte) (string, int, error) {
 
 // findNFunctionName finds the n-parameter function name
 func findNFunctionName(js []byte) string {
-	pattern := regexp.MustCompile(`\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]{0,3})\[(\d+)\](.+)\|\|([a-zA-Z0-9]{0,3})`)
+	// Pattern from pytubefix: exactly 3-char variable and function names
+	pattern := regexp.MustCompile(`var\s+[a-zA-Z0-9$_]{3}\s*=\s*\[([a-zA-Z0-9$_]{3})\]`)
 	match := pattern.FindSubmatch(js)
+	if len(match) >= 2 {
+		return string(match[1])
+	}
+
+	// Fallback pattern for older player.js versions
+	pattern2 := regexp.MustCompile(`\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]{1,3})\[(\d+)\](.+)\|\|([a-zA-Z0-9]{1,3})`)
+	match = pattern2.FindSubmatch(js)
 	if len(match) >= 5 {
 		idx, _ := strconv.Atoi(string(match[2]))
 		if idx == 0 {
 			return string(match[4])
 		}
-		return string(match[1])
-	}
-
-	pattern2 := regexp.MustCompile(`var\s+[a-zA-Z0-9_$]{1,4}\s*=\s*\[([a-zA-Z0-9_$]{1,4})\]`)
-	match = pattern2.FindSubmatch(js)
-	if len(match) >= 2 {
 		return string(match[1])
 	}
 

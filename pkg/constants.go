@@ -28,18 +28,27 @@ var PremiumAudioItags = []int{
 	251, // 160kbps Opus (fallback)
 }
 
-// === IOS CLIENT (no cipher needed) - DEFAULT for video mode ===
+// === WEB CLIENT (for fetching visitorData) ===
 const (
-	IOSClientName    = "IOS"
-	IOSClientVersion = "19.45.4"
-	IOSAPIEndpoint   = "https://www.youtube.com/youtubei/v1/player"
-	IOSAPIKey        = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
-	IOSUserAgent     = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
-	IOSDeviceMake    = "Apple"
-	IOSDeviceModel   = "iPhone16,2"
-	IOSPlatform      = "MOBILE"
-	IOSOSName        = "iPhone"
-	IOSOSVersion     = "18.1.0.22B83"
+	WEBClientName    = "WEB"
+	WEBClientVersion = "2.20241126.01.00"
+	WEBAPIEndpoint   = "https://www.youtube.com/youtubei/v1/player"
+	WEBAPIKey        = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+	WEBUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+// === ANDROID_VR CLIENT (for video mode - works with visitorData) ===
+const (
+	AndroidVRClientName    = "ANDROID_VR"
+	AndroidVRClientVersion = "1.60.19"
+	AndroidVRAPIEndpoint   = "https://www.youtube.com/youtubei/v1/player"
+	AndroidVRAPIKey        = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"
+	AndroidVRUserAgent     = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+	AndroidVRDeviceMake    = "Oculus"
+	AndroidVRDeviceModel   = "Quest 3"
+	AndroidVRPlatform      = "MOBILE"
+	AndroidVROSName        = "Android"
+	AndroidVROSVersion     = "12L"
 )
 
 // Video itags - prioritized order (1080p)
