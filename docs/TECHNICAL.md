@@ -715,19 +715,23 @@ When YouTube breaks the extractor:
 
 ## Conclusion
 
-go-ytmusic achieves optimal performance for the TUI music player + MPV use case by:
+ytx achieves optimal performance for the TUI music player + MPV use case by:
 
 1. **Eliminating cipher for video** (ANDROID_VR client)
 2. **Using premium client for music** (WEB_MUSIC with SAPISIDHASH)
-3. **Native Go execution** (no Python/Node.js overhead)
+3. **Native Go execution** (no Python/Node.js overhead for cipher)
 4. **AST-based cipher parsing** (robust to YouTube changes)
-5. **Persistent file-based cipher cache** (83% faster on warm calls)
+5. **Persistent file-based cipher cache** (faster on warm calls)
 6. **Bucket-based batching** (rate-limit safe for large playlists)
 7. **Fail-forward retry logic** (self-healing when cipher changes)
 8. **Streaming NDJSON output** (start buffering immediately)
+9. **Pre-warm JS engine during cipher fetch** (saves ~200ms)
+10. **Cache base.js URL path** (skip embed page on warm starts)
+11. **Batch n-transform** (single IPC call for bulk mode)
 
-**Result:**
-- Video: ~210ms (14x faster than pytubefix)
-- Music (cold): ~1800ms (first call)
-- Music (warm): ~300ms (83% faster, file cache hit)
-- Bulk 50 tracks: ~3s (45x faster than pytubefix)
+**Result (Verified HTTP 200 OK):**
+- Video: ~400ms
+- Music (cold): ~900ms
+- Music (warm): ~400ms
+- Bulk 5 tracks: ~700ms (7+ videos/sec)
+- n-transform: ~5ms (down from 215ms)
