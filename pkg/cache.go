@@ -1,15 +1,18 @@
 package ytx
 
 import (
+	"compress/gzip"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
 )
 
 const (
-	cacheFileName = "cipher.json"
-	cacheTTL      = 6 * time.Hour
+	cacheFileName   = "cipher.json"
+	playerCacheFile = "player.js.gz" // Compressed player.js for n-transform
+	cacheTTL        = 6 * time.Hour
 )
 
 // CipherCache represents the persisted cipher data
@@ -17,7 +20,8 @@ type CipherCache struct {
 	Version     int       `json:"version"`
 	CreatedAt   time.Time `json:"created_at"`
 	ExpiresAt   time.Time `json:"expires_at"`
-	PlayerURL   string    `json:"player_url"`
+	PlayerURL   string    `json:"player_url"`  // e.g., /s/player/xxx/base.js
+	BaseJSPath  string    `json:"basejs_path"` // Cached base.js path for fast refresh
 	SigFunction string    `json:"sig_function"`
 	SigParam    int       `json:"sig_param"`
 	NFunction   string    `json:"n_function"`
@@ -96,10 +100,100 @@ func (cm *CacheManager) Invalidate() error {
 	return err
 }
 
-// IsValid checks if a cache entry is still valid (not expired)
+// currentCacheVersion is the current cache format version
+// Increment when cache structure changes to invalidate old caches
+const currentCacheVersion = 2
+
+// IsValid checks if a cache entry is still valid (not expired and correct version)
 func (cm *CacheManager) IsValid(cache *CipherCache) bool {
 	if cache == nil {
 		return false
 	}
+	// Invalidate old cache versions
+	if cache.Version < currentCacheVersion {
+		return false
+	}
 	return time.Now().Before(cache.ExpiresAt)
+}
+
+// PlayerCachePath returns the path to the compressed player.js cache
+func (cm *CacheManager) PlayerCachePath() string {
+	return filepath.Join(cm.cacheDir, playerCacheFile)
+}
+
+// SavePlayerJS saves player.js compressed with gzip
+func (cm *CacheManager) SavePlayerJS(playerJS []byte) error {
+	tmpPath := cm.PlayerCachePath() + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gzw := gzip.NewWriter(f)
+	if _, err := gzw.Write(playerJS); err != nil {
+		return err
+	}
+	if err := gzw.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, cm.PlayerCachePath())
+}
+
+// LoadPlayerJS loads the compressed player.js cache
+func (cm *CacheManager) LoadPlayerJS() ([]byte, error) {
+	f, err := os.Open(cm.PlayerCachePath())
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer gzr.Close()
+
+	return io.ReadAll(gzr)
+}
+
+// Purge removes all cache files (cipher.json and player.js.gz)
+func (cm *CacheManager) Purge() error {
+	var lastErr error
+
+	// Remove cipher cache
+	if err := os.Remove(cm.CachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	// Remove player.js cache
+	if err := os.Remove(cm.PlayerCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	return lastErr
+}
+
+// CacheDir returns the cache directory path
+func (cm *CacheManager) CacheDir() string {
+	return cm.cacheDir
+}
+
+// PurgeCache is a standalone function to purge cache without needing an extractor
+func PurgeCache() error {
+	cm, err := NewCacheManager()
+	if err != nil {
+		return err
+	}
+	return cm.Purge()
+}
+
+// GetCacheDir returns the cache directory path
+func GetCacheDir() (string, error) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		return "", err
+	}
+	return cm.CacheDir(), nil
 }
