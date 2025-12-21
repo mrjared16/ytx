@@ -44,7 +44,13 @@ type Extractor struct {
 	visitorData   string        // required since Jan 2025 for all API requests
 	profile       bool          // enable profiling
 	timings       Timings       // profiling timers
+	fetchSubs     bool          // whether to include subtitles in output
+	subLangs      []string      // subtitle languages to fetch (nil = default, empty = all)
 }
+
+// defaultSubtitleLangs are fetched when --subs is used without --sub-langs
+// Users can override via --sub-langs flag
+var defaultSubtitleLangs = []string{"en"}
 
 // NewExtractor creates a new extractor for the given mode
 func NewExtractor(mode ClientMode, cookieFile string) (*Extractor, error) {
@@ -94,6 +100,14 @@ func NewExtractor(mode ClientMode, cookieFile string) (*Extractor, error) {
 // SetProfile enables profiling for this extractor
 func (e *Extractor) SetProfile(enabled bool) {
 	e.profile = enabled
+}
+
+// SetFetchSubtitles enables subtitle extraction with optional language filter.
+// If langs is nil or empty, uses default language (en).
+// Use []string{"all"} to fetch all available languages.
+func (e *Extractor) SetFetchSubtitles(langs []string) {
+	e.fetchSubs = true
+	e.subLangs = langs
 }
 
 // fetchVisitorData gets visitorData from YouTube using WEB client (required since Jan 2025)
@@ -396,6 +410,15 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 		Height:    video.Height,
 		Title:     playerResp.VideoDetails.Title,
 		Author:    playerResp.VideoDetails.Author,
+	}
+
+	// Extract subtitles if requested (from same response - zero extra latency)
+	if e.fetchSubs {
+		subtitles := extractSubtitles(playerResp.Captions, e.subLangs)
+		if len(subtitles) > 0 {
+			result.Subtitles = subtitles
+			result.SubURL = subtitles[0].URL
+		}
 	}
 
 	if e.profile {
@@ -812,4 +835,86 @@ func ExtractVideoID(input string) string {
 	}
 
 	return input // Return as-is, let the API handle validation
+}
+
+// extractSubtitles extracts and filters subtitles from player response captions.
+// langs behavior:
+//   - nil or empty: use defaultSubtitleLangs
+//   - contains "all": return all available languages
+//   - otherwise: filter to specified languages only
+func extractSubtitles(captions *CaptionsRenderer, langs []string) []Subtitle {
+	if captions == nil || captions.PlayerCaptionsTracklistRenderer == nil {
+		return nil
+	}
+
+	tracks := captions.PlayerCaptionsTracklistRenderer.CaptionTracks
+	if len(tracks) == 0 {
+		return nil
+	}
+
+	// Determine which languages to include
+	fetchAll := false
+	if len(langs) == 0 {
+		langs = defaultSubtitleLangs
+	} else {
+		for _, l := range langs {
+			if l == "all" {
+				fetchAll = true
+				break
+			}
+		}
+	}
+
+	// Build language set for O(1) lookup
+	var langSet map[string]bool
+	if !fetchAll {
+		langSet = make(map[string]bool, len(langs))
+		for _, l := range langs {
+			langSet[l] = true
+		}
+	}
+
+	subtitles := make([]Subtitle, 0, len(tracks))
+	for _, track := range tracks {
+		if track.BaseURL == "" {
+			continue
+		}
+
+		// Filter by language if not fetching all
+		if !fetchAll && !langSet[track.LanguageCode] {
+			continue
+		}
+
+		// Build WebVTT URL using net/url for safety
+		u, err := url.Parse(track.BaseURL)
+		if err != nil {
+			continue
+		}
+		q := u.Query()
+		q.Set("fmt", "vtt")
+		u.RawQuery = q.Encode()
+
+		// Get display name
+		name := track.Name.SimpleText
+		if name == "" {
+			name = track.LanguageCode
+		}
+
+		subtitles = append(subtitles, Subtitle{
+			URL:    u.String(),
+			Lang:   track.LanguageCode,
+			Name:   name,
+			IsAuto: track.Kind == "asr",
+		})
+	}
+
+	// Sort: manual before auto, then alphabetically by language
+	sort.Slice(subtitles, func(i, j int) bool {
+		if subtitles[i].IsAuto != subtitles[j].IsAuto {
+			return !subtitles[i].IsAuto // manual first
+		}
+		return subtitles[i].Lang < subtitles[j].Lang
+	})
+
+	return subtitles
 }

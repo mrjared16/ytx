@@ -41,10 +41,11 @@ type ContentPlaybackContext struct {
 // === INNERTUBE RESPONSE ===
 
 type PlayerResponse struct {
-	ResponseContext   ResponseContext   `json:"responseContext"`
-	PlayabilityStatus PlayabilityStatus `json:"playabilityStatus"`
-	StreamingData     StreamingData     `json:"streamingData"`
-	VideoDetails      VideoDetails      `json:"videoDetails"`
+	ResponseContext   ResponseContext    `json:"responseContext"`
+	PlayabilityStatus PlayabilityStatus  `json:"playabilityStatus"`
+	StreamingData     StreamingData      `json:"streamingData"`
+	VideoDetails      VideoDetails       `json:"videoDetails"`
+	Captions          *CaptionsRenderer  `json:"captions,omitempty"`
 }
 
 type ResponseContext struct {
@@ -84,6 +85,39 @@ type VideoDetails struct {
 	LengthSeconds    string `json:"lengthSeconds"`
 	Author           string `json:"author"`
 	ShortDescription string `json:"shortDescription"`
+}
+
+// === CAPTION TYPES ===
+
+// CaptionsRenderer from playerResponse.captions
+type CaptionsRenderer struct {
+	PlayerCaptionsTracklistRenderer *CaptionTracklist `json:"playerCaptionsTracklistRenderer"`
+}
+
+// CaptionTracklist contains the list of caption tracks
+type CaptionTracklist struct {
+	CaptionTracks []CaptionTrack `json:"captionTracks"`
+}
+
+// CaptionTrack represents a single caption/subtitle track
+type CaptionTrack struct {
+	BaseURL      string      `json:"baseUrl"`
+	LanguageCode string      `json:"languageCode"`
+	Name         CaptionName `json:"name"`
+	Kind         string      `json:"kind"` // "asr" for auto-generated
+}
+
+// CaptionName contains the display name for a caption track
+type CaptionName struct {
+	SimpleText string `json:"simpleText,omitempty"`
+}
+
+// Subtitle is the CLI output format for subtitles
+type Subtitle struct {
+	URL    string `json:"url"`
+	Lang   string `json:"lang"`
+	Name   string `json:"name"`
+	IsAuto bool   `json:"is_auto,omitempty"`
 }
 
 // === CLI OUTPUT ===
@@ -143,15 +177,17 @@ type ClientConfig struct {
 
 // VideoResult extends Result with video URL
 type VideoResult struct {
-	VideoURL  string   `json:"video_url"`
-	AudioURL  string   `json:"audio_url"`
-	VideoItag int      `json:"video_itag"`
-	AudioItag int      `json:"audio_itag"`
-	Width     int      `json:"width"`
-	Height    int      `json:"height"`
-	Title     string   `json:"title"`
-	Author    string   `json:"author"`
-	Timings   *Timings `json:"timings,omitempty"`
+	VideoURL  string     `json:"video_url"`
+	AudioURL  string     `json:"audio_url"`
+	SubURL    string     `json:"sub_url,omitempty"`
+	VideoItag int        `json:"video_itag"`
+	AudioItag int        `json:"audio_itag"`
+	Width     int        `json:"width"`
+	Height    int        `json:"height"`
+	Title     string     `json:"title"`
+	Author    string     `json:"author"`
+	Subtitles []Subtitle `json:"subtitles,omitempty"`
+	Timings   *Timings   `json:"timings,omitempty"`
 }
 
 // BulkResult for streaming output

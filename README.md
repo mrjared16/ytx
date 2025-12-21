@@ -64,11 +64,14 @@ Extract video + audio URLs for players like MPV. No authentication required.
 
 ```bash
 ytx video VIDEO_ID
+ytx video VIDEO_ID --subs              # Include subtitles (en by default)
+ytx video VIDEO_ID --sub-langs all     # Include all available subtitles
+ytx video VIDEO_ID --sub-langs en,es   # Include specific languages
 ```
 
 **Example:**
 ```bash
-ytx video hbl2Cuw75oE
+ytx video hbl2Cuw75oE --subs
 ```
 
 **Output:**
@@ -76,12 +79,17 @@ ytx video hbl2Cuw75oE
 {
   "video_url": "https://...",
   "audio_url": "https://...",
+  "sub_url": "https://...",
   "video_itag": 137,
   "audio_itag": 140,
   "width": 1920,
   "height": 1080,
   "title": "Rick Astley - Never Gonna Give You Up",
-  "author": "Rick Astley"
+  "author": "Rick Astley",
+  "subtitles": [
+    {"url": "https://...", "lang": "en", "name": "English"},
+    {"url": "https://...", "lang": "en", "name": "English", "is_auto": true}
+  ]
 }
 ```
 
@@ -93,8 +101,20 @@ video_url=$(echo "$result" | jq -r '.video_url')
 audio_url=$(echo "$result" | jq -r '.audio_url')
 mpv "$video_url" --audio-file="$audio_url"
 
-# Or just audio
-mpv --no-video "$audio_url"
+# Play with subtitles
+result=$(ytx video hbl2Cuw75oE --subs)
+mpv "$(echo $result | jq -r '.video_url')" \
+    --audio-file="$(echo $result | jq -r '.audio_url')" \
+    --sub-file="$(echo $result | jq -r '.sub_url')"
+
+# Load all subtitle tracks
+result=$(ytx video VIDEO_ID --subs)
+mpv_args=("$(echo $result | jq -r '.video_url')")
+mpv_args+=(--audio-file="$(echo $result | jq -r '.audio_url')")
+while IFS= read -r sub; do
+  mpv_args+=(--sub-file="$sub")
+done < <(echo $result | jq -r '.subtitles[].url')
+mpv "${mpv_args[@]}"
 ```
 
 ### Music Mode (Premium 256kbps)

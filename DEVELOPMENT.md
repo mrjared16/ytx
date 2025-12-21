@@ -11,9 +11,8 @@ ytx/
 │   ├── extractor.go   # Core extraction logic (API calls, stream selection)
 │   ├── bulk.go        # Optimized bulk extraction with batch n-transform
 │   ├── cipher.go      # Signature decryption (music mode only)
-│   ├── jsengine.go    # JS engine interface (Bun/Node/QuickJS)
+│   ├── jsengine.go    # JS engine interface (Bun/Node)
 │   ├── jsrunner.go    # Subprocess-based JS runner (Bun/Node)
-│   ├── jsrunner_quickjs.go  # Embedded QuickJS fallback
 │   ├── nrunner.mjs    # Node/Bun script for n-transform
 │   ├── auth.go        # SAPISIDHASH authentication for premium access
 │   ├── constants.go   # Client constants, API endpoints, itag priorities
@@ -46,8 +45,7 @@ go build -o ytx ./cmd/ytx
 ```bash
 ./ytx music VIDEO_ID --js-engine bun      # Force Bun (fastest)
 ./ytx music VIDEO_ID --js-engine node     # Force Node.js
-./ytx music VIDEO_ID --js-engine quickjs  # Force embedded QuickJS
-./ytx music VIDEO_ID --js-engine auto     # Auto: Bun → Node → QuickJS
+./ytx music VIDEO_ID --js-engine auto     # Auto: Bun → Node (default)
 ```
 
 ### Performance Optimizations (Latest)
@@ -83,6 +81,11 @@ go build -o ytx ./cmd/ytx
 ```bash
 # Video mode (no auth needed)
 time ./ytx video dQw4w9WgXcQ --profile
+
+# Video mode with subtitles
+./ytx video dQw4w9WgXcQ --subs                # Default: en
+./ytx video dQw4w9WgXcQ --sub-langs all       # All languages
+./ytx video dQw4w9WgXcQ --sub-langs en,es     # Specific languages
 
 # Music mode (needs Premium cookies)
 time ./ytx music dQw4w9WgXcQ --profile
@@ -142,8 +145,7 @@ The dynamic discovery should handle this automatically. If not, check the builti
 
 - `github.com/dop251/goja` - Pure Go JavaScript interpreter (signature decryption)
 - `github.com/dop251/goja/parser` - JS AST parsing
-- `github.com/buke/quickjs-go` - Embedded QuickJS (n-transform fallback)
 
-### External (optional, for faster n-transform)
-- `bun` - Preferred JS runtime (2x faster than Node)
+### External (for n-transform)
+- `bun` - Preferred JS runtime (faster than Node)
 - `node` - Fallback JS runtime

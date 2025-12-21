@@ -32,6 +32,8 @@ Modes:
             purge - Remove all cached cipher and player.js data
 
 Options:
+    --subs              Include subtitles in output (video mode only)
+    --sub-langs LANGS   Subtitle languages: "en" (default), "all", or comma-separated (e.g., "en,es,ja")
     --cookies PATH      Path to Netscape-format cookies.txt (optional, defaults to ~/.config/ytx/cookies.txt)
     --bulk IDS          Comma-separated video IDs for bulk extraction
     --js-engine ENGINE  bun|node|auto (default: auto, tries Bun → Node)
@@ -39,18 +41,16 @@ Options:
 
 Output:
     video mode: {"video_url":"...","audio_url":"...","video_itag":137,"audio_itag":251}
+    with --subs: {"video_url":"...","audio_url":"...","sub_url":"...","subtitles":[{"url":"...","lang":"en","name":"English"}]}
     music mode: {"url":"...","itag":141,"bitrate":256000,"title":"..."}
     bulk mode:  NDJSON (one JSON per line, streamed)
 
-    With --profile:
-    {"url":"...","timings":{"visitor_data_ms":200,"player_api_ms":150,"cipher_init_ms":400,"n_transform_ms":5,"total_ms":755,"js_engine":"bun"}}
-
 Examples:
     ytx video hbl2Cuw75oE
-    ytx music hbl2Cuw75oE
+    ytx video hbl2Cuw75oE --subs
+    ytx video hbl2Cuw75oE --sub-langs all
+    ytx video hbl2Cuw75oE --sub-langs ja,ko
     ytx music hbl2Cuw75oE --cookies ~/cookies.txt
-    ytx music --bulk hbl2Cuw75oE,dQw4w9WgXcQ --cookies ~/cookies.txt
-    ytx music VIDEO_ID --js-engine bun --profile
     ytx cache purge
 `
 
@@ -81,12 +81,22 @@ func handleVideoMode() {
 
 	var videoID string
 	var profile bool
+	var fetchSubs bool
+	var subLangs string
 
 	// Parse arguments
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--profile":
 			profile = true
+		case "--subs":
+			fetchSubs = true
+		case "--sub-langs":
+			fetchSubs = true // implies --subs
+			if i+1 < len(args) {
+				subLangs = args[i+1]
+				i++
+			}
 		default:
 			if !strings.HasPrefix(args[i], "-") && videoID == "" {
 				videoID = ytxpkg.ExtractVideoID(args[i])
@@ -95,7 +105,7 @@ func handleVideoMode() {
 	}
 
 	if videoID == "" {
-		printError("MISSING_VIDEO_ID", "Usage: ytx video VIDEO_ID [--profile]", "")
+		printError("MISSING_VIDEO_ID", "Usage: ytx video VIDEO_ID [--subs] [--sub-langs LANGS] [--profile]", "")
 		os.Exit(1)
 	}
 
@@ -114,6 +124,18 @@ func handleVideoMode() {
 	// Enable profiling if requested
 	if profile {
 		extractor.SetProfile(true)
+	}
+
+	// Enable subtitle extraction if requested
+	if fetchSubs {
+		var langs []string
+		if subLangs == "all" {
+			langs = []string{"all"}
+		} else if subLangs != "" {
+			langs = strings.Split(subLangs, ",")
+		}
+		// nil/empty = use default language (en)
+		extractor.SetFetchSubtitles(langs)
 	}
 
 	result, err := extractor.ExtractVideo(videoID)
