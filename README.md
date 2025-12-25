@@ -8,7 +8,7 @@ Fast YouTube stream URL extractor written in Go. Designed for integration with m
 
 ## Features
 
-- **Video Mode**: Extract 1080p video + audio URLs (**~240ms**) - no authentication required
+- **Video Mode**: Extract video + audio URLs (**~240ms**) - no authentication required, configurable max resolution
 - **Music Mode**: Extract 256kbps premium audio (~1100ms) - requires YouTube Premium cookies
 - **Bulk Mode**: Extract multiple tracks with pipelined requests (3 tracks in ~1100ms)
 - **Direct URLs**: No cipher required for video mode (ANDROID_VR client)
@@ -64,9 +64,11 @@ Extract video + audio URLs for players like MPV. No authentication required.
 
 ```bash
 ytx video VIDEO_ID
-ytx video VIDEO_ID --subs              # Include subtitles (en by default)
-ytx video VIDEO_ID --sub-langs all     # Include all available subtitles
-ytx video VIDEO_ID --sub-langs en,es   # Include specific languages
+ytx video VIDEO_ID --max-height 1080    # Limit to 1080p (saves bandwidth)
+ytx video VIDEO_ID --max-height 720     # Limit to 720p
+ytx video VIDEO_ID --subs               # Include subtitles (en by default)
+ytx video VIDEO_ID --sub-langs all      # Include all available subtitles
+ytx video VIDEO_ID --sub-langs en,es    # Include specific languages
 ```
 
 **Example:**

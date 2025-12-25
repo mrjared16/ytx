@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	ytxpkg "github.com/mrjared16/ytx/pkg"
@@ -34,6 +35,7 @@ Modes:
 Options:
     --subs              Include subtitles in output (video mode only)
     --sub-langs LANGS   Subtitle languages: "en" (default), "all", or comma-separated (e.g., "en,es,ja")
+    --max-height HEIGHT Maximum video height in pixels (e.g., 1080, 720, 480)
     --cookies PATH      Path to Netscape-format cookies.txt (optional, defaults to ~/.config/ytx/cookies.txt)
     --bulk IDS          Comma-separated video IDs for bulk extraction
     --js-engine ENGINE  bun|node|auto (default: auto, tries Bun → Node)
@@ -47,6 +49,7 @@ Output:
 
 Examples:
     ytx video hbl2Cuw75oE
+    ytx video hbl2Cuw75oE --max-height 1080
     ytx video hbl2Cuw75oE --subs
     ytx video hbl2Cuw75oE --sub-langs all
     ytx video hbl2Cuw75oE --sub-langs ja,ko
@@ -83,6 +86,7 @@ func handleVideoMode() {
 	var profile bool
 	var fetchSubs bool
 	var subLangs string
+	var maxHeight int
 
 	// Parse arguments
 	for i := 0; i < len(args); i++ {
@@ -97,6 +101,16 @@ func handleVideoMode() {
 				subLangs = args[i+1]
 				i++
 			}
+		case "--max-height":
+			if i+1 < len(args) {
+				h, err := strconv.Atoi(args[i+1])
+				if err != nil || h <= 0 {
+					printError("INVALID_MAX_HEIGHT", fmt.Sprintf("Invalid max-height: %s (must be positive integer)", args[i+1]), "")
+					os.Exit(1)
+				}
+				maxHeight = h
+				i++
+			}
 		default:
 			if !strings.HasPrefix(args[i], "-") && videoID == "" {
 				videoID = ytxpkg.ExtractVideoID(args[i])
@@ -105,7 +119,7 @@ func handleVideoMode() {
 	}
 
 	if videoID == "" {
-		printError("MISSING_VIDEO_ID", "Usage: ytx video VIDEO_ID [--subs] [--sub-langs LANGS] [--profile]", "")
+		printError("MISSING_VIDEO_ID", "Usage: ytx video VIDEO_ID [--subs] [--sub-langs LANGS] [--max-height HEIGHT] [--profile]", "")
 		os.Exit(1)
 	}
 
@@ -136,6 +150,11 @@ func handleVideoMode() {
 		}
 		// nil/empty = use default language (en)
 		extractor.SetFetchSubtitles(langs)
+	}
+
+	// Set max height limit if specified
+	if maxHeight > 0 {
+		extractor.SetMaxHeight(maxHeight)
 	}
 
 	result, err := extractor.ExtractVideo(videoID)

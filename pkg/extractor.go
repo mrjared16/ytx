@@ -46,6 +46,7 @@ type Extractor struct {
 	timings       Timings       // profiling timers
 	fetchSubs     bool          // whether to include subtitles in output
 	subLangs      []string      // subtitle languages to fetch (nil = default, empty = all)
+	maxHeight     int           // max video height (0 = no limit)
 }
 
 // defaultSubtitleLangs are fetched when --subs is used without --sub-langs
@@ -108,6 +109,12 @@ func (e *Extractor) SetProfile(enabled bool) {
 func (e *Extractor) SetFetchSubtitles(langs []string) {
 	e.fetchSubs = true
 	e.subLangs = langs
+}
+
+// SetMaxHeight sets the maximum video height (e.g., 1080 for 1080p).
+// Set to 0 to disable limit (default behavior).
+func (e *Extractor) SetMaxHeight(height int) {
+	e.maxHeight = height
 }
 
 // fetchVisitorData gets visitorData from YouTube using WEB client (required since Jan 2025)
@@ -566,11 +573,15 @@ func (e *Extractor) findBestAudioStream(formats []Format) *Format {
 	return &audioFormats[0]
 }
 
-// findBestVideoStream finds the highest quality video stream
+// findBestVideoStream finds the highest quality video stream within maxHeight limit
 func (e *Extractor) findBestVideoStream(formats []Format) *Format {
 	var videoFormats []Format
 	for _, f := range formats {
 		if strings.HasPrefix(f.MimeType, "video/") && f.Height > 0 {
+			// Apply height limit if set
+			if e.maxHeight > 0 && f.Height > e.maxHeight {
+				continue
+			}
 			videoFormats = append(videoFormats, f)
 		}
 	}
@@ -579,7 +590,7 @@ func (e *Extractor) findBestVideoStream(formats []Format) *Format {
 		return nil
 	}
 
-	// Try preferred itags first
+	// Try preferred itags first (only if they're within height limit)
 	for _, targetItag := range VideoItags {
 		for i := range videoFormats {
 			if videoFormats[i].Itag == targetItag {
@@ -588,7 +599,7 @@ func (e *Extractor) findBestVideoStream(formats []Format) *Format {
 		}
 	}
 
-	// Fallback: sort by height and return highest
+	// Fallback: sort by height and return highest (within limit)
 	sort.Slice(videoFormats, func(i, j int) bool {
 		return videoFormats[i].Height > videoFormats[j].Height
 	})
