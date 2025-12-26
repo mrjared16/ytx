@@ -454,7 +454,28 @@ make release
 ## Requirements
 
 - Go 1.25+
+- Bun or Node.js (for n-parameter transform in music mode)
 - For music mode: YouTube Premium account and Netscape-format cookies file
+
+## Troubleshooting
+
+### HTTP 403 on Music Mode
+
+If URLs return 403, the cipher/n-transform may be broken due to YouTube updates.
+
+```bash
+# Quick check: compare with yt-dlp
+yt-dlp -f 141 -g "https://music.youtube.com/watch?v=VIDEO_ID"  # Should work
+./ytx music VIDEO_ID | jq -r '.url' | xargs curl -sI | head -1  # If 403, broken
+```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md#when-youtube-breaks-things) for debugging guide.
+
+### yt-dlp Reference
+
+When extraction breaks, check yt-dlp's fixes in:
+- `yt_dlp/extractor/youtube/jsc/_builtin/vendor/yt.solver.core.js` - Function finder
+- `yt_dlp/extractor/youtube/_video.py` - Main extraction logic
 
 ## License
 

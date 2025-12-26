@@ -121,13 +121,75 @@ UPDATE_GOLDEN=1 go test -v ./pkg/... -run TestExtractorRegression
 
 ## When YouTube Breaks Things
 
+### Quick Diagnosis
+
+```bash
+# 1. Check if yt-dlp works (baseline)
+yt-dlp -f 141 -g "https://music.youtube.com/watch?v=hbl2Cuw75oE"
+
+# 2. Check if ytx gets the URL but it returns 403
+./ytx music hbl2Cuw75oE | jq -r '.url' | xargs curl -sI | head -1
+# If "HTTP 403" -> cipher/n-transform is broken
+# If "HTTP 200" -> working correctly
+
+# 3. Compare n parameter between ytx and yt-dlp
+YTX_N=$(./ytx music hbl2Cuw75oE | jq -r '.url' | tr '&' '\n' | grep '^n=' | cut -d= -f2)
+YTDLP_N=$(yt-dlp -f 141 -g "https://music.youtube.com/watch?v=hbl2Cuw75oE" | tr '&' '\n' | grep '^n=' | cut -d= -f2)
+echo "ytx n: $YTX_N"
+echo "yt-dlp n: $YTDLP_N"
+# If different -> n-function is wrong (most common issue)
+```
+
+### Root Cause: Decoy Functions (Dec 2024 Incident)
+
+YouTube adds **decoy wrapper functions** to break regex-based scrapers:
+
+```javascript
+// DECOY (what regex finds):
+klj=function(S){return MP[z[7]](this,19,S)};  // Just a wrapper!
+
+// REAL (what we need):
+realFunc=function(S){var W=S.split("");try{...}catch(e){...}...}
+```
+
+**Solution:** Use yt-dlp's AST-based solver which validates function body structure.
+
+### yt-dlp Reference Files
+
+When yt-dlp releases a fix, check these files:
+
+| File | Purpose |
+|------|---------|
+| `yt_dlp/extractor/youtube/jsc/_builtin/vendor/yt.solver.core.js` | AST-based function finder (meriyah parser) |
+| `yt_dlp/extractor/youtube/_video.py:3400-3460` | Challenge solving in `_extract_formats_and_subtitles` |
+| `yt_dlp/extractor/youtube/_video.py:2183-2215` | `_extract_signature_timestamp` - sts extraction |
+| `yt_dlp/extractor/youtube/_video.py:2632-2650` | `_generate_player_context` - API request body |
+| `yt_dlp/extractor/youtube/_base.py` | Client configs, headers, SAPISIDHASH |
+
+### Testing with yt-dlp's Solver (POC)
+
+```bash
+# Run the POC to test yt-dlp's solver directly
+bun poc_solver.mjs
+
+# This uses yt-dlp's yt.solver.core.js to:
+# 1. Parse player.js with meriyah AST parser
+# 2. Find correct n-function and sig-function
+# 3. Transform challenge values
+```
+
 ### Cipher Function Pattern Changes
 
-If signature decryption fails, check `pkg/cipher.go:findSigFunctionName()`. The marker pattern may need updating:
+If signature decryption fails, the issue is likely in `pkg/cipher.go:findSigFunctionName()` or `findNFunctionName()`.
 
+**Old approach (FRAGILE - DO NOT USE):**
 ```go
-marker := []byte(",decodeURIComponent(")
+// Finds decoys, not real functions
+pattern := regexp.MustCompile(`var\s+[a-zA-Z0-9$_]{3}\s*=\s*\[([a-zA-Z0-9$_]{3})\]`)
 ```
+
+**New approach (ROBUST):**
+Use yt-dlp's solver via subprocess, or validate function body has `try-catch` structure.
 
 ### Client Version Updates
 
@@ -137,9 +199,19 @@ Update `pkg/constants.go`:
 ClientVersion = "1.20251216.01.00"
 ```
 
-### New Dependencies
+### Verify Cookie Status
 
-The dynamic discovery should handle this automatically. If not, check the builtins filter in `pkg/cipher.go:extractWithAST()`.
+```bash
+./verify_cookie.sh ~/.config/ytx/cookies.txt
+# Returns: premium, non-premium, or non-auth
+```
+
+### Clear Cache and Retry
+
+```bash
+rm ~/.cache/ytx/cipher.json
+./ytx music VIDEO_ID
+```
 
 ## Dependencies
 

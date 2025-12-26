@@ -58,17 +58,40 @@ YouTube encrypts stream URLs for certain clients to prevent unauthorized access.
 
 The decryption functions are embedded in YouTube's player JavaScript (`base.js`, ~2.3MB), which changes frequently.
 
-**Example cipher function pattern:**
-```javascript
-Fl = function(a, b) {
-    b = (b + a.length) % a.length;
-    a = a.split("");
-    var c = a[0];
-    a[0] = a[b % a.length];
-    a[b % a.length] = c;
-    return a.join("")
-};
+#### Why Simple Regex Fails (Lesson Learned Dec 2024)
+
+YouTube intentionally adds **decoy functions** to break naive scrapers. A simple regex like:
+```regex
+var\s+[a-zA-Z0-9$_]{3}\s*=\s*\[([a-zA-Z0-9$_]{3})\]
 ```
+
+May match a **wrapper function** instead of the real transform function:
+```javascript
+// DECOY - This is what regex finds:
+klj=function(S){return MP[z[7]](this,19,S)};  // Just a wrapper!
+
+// REAL - This is what we need (has try-catch, complex logic):
+realFunc=function(S){var W=S.split("");try{...}catch(e){return X[...]+a}...}
+```
+
+**The fix:** Use AST-based validation to check function body structure, not just variable assignment patterns.
+
+#### yt-dlp Reference Files for Cipher/N-Transform
+
+When YouTube breaks the cipher, check these yt-dlp files for fixes:
+
+| Component | yt-dlp File | Description |
+|-----------|-------------|-------------|
+| **JS Challenge Solver** | `yt_dlp/extractor/youtube/jsc/_builtin/vendor/yt.solver.core.js` | AST-based function finder using meriyah parser |
+| **Bun/Node runner** | `yt_dlp/extractor/youtube/jsc/_builtin/bun.py` | How yt-dlp spawns JS runtime |
+| **Challenge types** | `yt_dlp/extractor/youtube/jsc/_types.py` | SIG and N challenge definitions |
+| **Main extraction** | `yt_dlp/extractor/youtube/_video.py` | Lines 3400-3460: `_extract_formats_and_subtitles` |
+| **Signature timestamp** | `yt_dlp/extractor/youtube/_video.py` | Lines 2183-2215: `_extract_signature_timestamp` |
+| **Player context** | `yt_dlp/extractor/youtube/_video.py` | Lines 2632-2650: `_generate_player_context` |
+
+**Key insight from yt-dlp's solver (`yt.solver.core.js` lines 296-348):**
+- N-function validation: Check if function body's second-to-last statement is a `TryStatement` with `CatchClause`
+- Signature function: Look for `LogicalExpression` containing `decodeURIComponent`
 
 ### Client Types and Their Properties
 
@@ -90,6 +113,22 @@ Fl = function(a, b) {
 
 **Architecture:** Monolithic extractor supporting 1000+ sites.
 
+**Key Source Files:**
+```
+yt-dlp/yt_dlp/extractor/youtube/
+├── _video.py          # Main extraction logic (3800+ lines)
+├── _base.py           # Client configs, API headers, auth
+├── jsc/               # JavaScript Challenge solving
+│   ├── _director.py   # Orchestrates JS challenge providers
+│   ├── _types.py      # Challenge type definitions
+│   └── _builtin/
+│       ├── bun.py     # Bun runtime integration
+│       ├── node.py    # Node.js fallback
+│       └── vendor/
+│           └── yt.solver.core.js  # AST-based function finder
+└── pot/               # PO Token handling (for WEB client)
+```
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                      yt-dlp                             │
@@ -99,8 +138,8 @@ Fl = function(a, b) {
 │  3. If cipher needed:                                   │
 │     a. Extract player JS URL from HTML                  │
 │     b. Fetch base.js (~2.3MB)                           │
-│     c. Parse cipher functions with regex                │
-│     d. Execute cipher in Python (native)                │
+│     c. Parse cipher functions with AST (meriyah)        │
+│     d. Execute via Bun/Node subprocess                  │
 │  4. Return stream URLs                                  │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -674,42 +713,110 @@ Premium authenticated accounts have significantly higher rate limits than anonym
 
 ---
 
-## Part 7: Maintenance Considerations
+## Part 7: Maintenance and Troubleshooting
 
 ### What Breaks When YouTube Updates?
 
-| Component | Frequency | Impact | go-ytmusic Resilience |
-|-----------|-----------|--------|----------------------|
+| Component | Frequency | Impact | ytx Resilience |
+|-----------|-----------|--------|----------------|
 | Client versions | Weekly | Low | Update constants.go |
 | API endpoints | Rarely | High | Update constants.go |
-| Cipher function names | Weekly | Medium | AST handles automatically |
-| Cipher algorithm | Rarely | High | AST extracts dependencies |
+| Cipher function names | Weekly | Medium | Use yt-dlp solver |
+| Cipher algorithm | Rarely | High | Use yt-dlp solver |
 | New encryption scheme | Very rare | Critical | Requires code changes |
 
-### Why AST is More Maintainable
+### When Extraction Breaks: Debugging Guide
 
-**Regex approach (yt-dlp, pytubefix, kkdai):**
+**Symptoms:** HTTP 403 on stream URLs despite successful API response.
+
+**Step 1: Verify the issue**
+```bash
+# Check if yt-dlp works (baseline)
+yt-dlp -f 141 -g "https://music.youtube.com/watch?v=hbl2Cuw75oE"
+curl -sI "$(!!)" | head -1  # Should be HTTP 200
+
+# Check ytx
+./ytx music hbl2Cuw75oE
+curl -sI "$(./ytx music hbl2Cuw75oE | jq -r '.url')" | head -1  # If 403, cipher is broken
+```
+
+**Step 2: Compare n and sig values**
+```bash
+# Extract and compare
+YTX_URL=$(./ytx music VIDEO_ID | jq -r '.url')
+YTDLP_URL=$(yt-dlp -f 141 -g "https://music.youtube.com/watch?v=VIDEO_ID")
+
+# Compare n parameter
+echo "$YTX_URL" | tr '&' '\n' | grep '^n='
+echo "$YTDLP_URL" | tr '&' '\n' | grep '^n='
+
+# If different, n-transform is broken
+# If same n but different sig, signature decryption is broken
+```
+
+**Step 3: Check yt-dlp for fixes**
+
+Key files to check when yt-dlp releases a fix:
+1. `yt_dlp/extractor/youtube/jsc/_builtin/vendor/yt.solver.core.js` - Function finding logic
+2. `yt_dlp/extractor/youtube/_video.py` - Main extraction changes
+3. `yt_dlp/extractor/youtube/_base.py` - Client configuration updates
+
+### yt-dlp Reference: Key Functions
+
+**Signature Timestamp Extraction** (`_video.py:2183-2215`):
 ```python
-# Breaks if YouTube renames 'Fl' to 'Gl' or changes structure
+def _extract_signature_timestamp(self, video_id, player_url, ytcfg=None, fatal=False):
+    # Extract signatureTimestamp (sts) from player.js
+    # Regex: r'(?:signatureTimestamp|sts)\s*:\s*(?P<sts>[0-9]{5})'
+    # This 5-digit number tells YouTube which cipher version we're using
+```
+
+**Player Context Generation** (`_video.py:2632-2650`):
+```python
+def _generate_player_context(cls, sts=None, use_ad_playback_context=False):
+    context = {'html5Preference': 'HTML5_PREF_WANTS'}
+    if sts is not None:
+        context['signatureTimestamp'] = sts  # Required for cipher validation
+    return {'playbackContext': {'contentPlaybackContext': context}, ...}
+```
+
+**N-Function Validation** (`jsc/_builtin/vendor/yt.solver.core.js:330-348`):
+```javascript
+// Real n-function has try-catch structure:
+const tryNode = block.body.at(-2);
+if (tryNode?.type !== 'TryStatement' || tryNode.handler?.type !== 'CatchClause') {
+    return null;  // Not the real function
+}
+// Catch block must contain: return X[...] + identifier
+```
+
+### Why AST is More Maintainable Than Regex
+
+**Regex approach (OLD - DO NOT USE):**
+```python
+# Breaks if YouTube renames 'Fl' to 'Gl' or adds decoys
 FUNCTION_PATTERN = r'(\w+)=function\(a,b\)\{.*?a\.split\(""\).*?\}'
 ```
 
-**AST approach (go-ytmusic):**
-```go
-// Finds function by signature pattern matching, not name
-// Automatically extracts all dependencies
-program, _ := parser.ParseFile(nil, "", jsCode, 0)
-// Walk AST, find function matching signature pattern
+**AST approach (yt-dlp's solution):**
+```javascript
+// Uses meriyah to parse JS into AST
+// Validates function BODY structure, not just name
+// Finds function by control flow pattern (try-catch), not variable name
+const ast = meriyah.parse(playerCode);
+// Walk AST, find function with correct body structure
 ```
 
 ### Update Checklist
 
 When YouTube breaks the extractor:
 
-1. **Check client version:** Update `ClientVersion` in constants.go
-2. **Check API key:** Update `ClientKey` if needed
-3. **Test extraction:** `./go-ytmusic video dQw4w9WgXcQ`
-4. **If cipher fails:** The AST approach usually handles it automatically
+1. **Check if yt-dlp works:** `yt-dlp -f 141 -g VIDEO_URL`
+2. **If yt-dlp works:** Check their recent commits for cipher fixes
+3. **Update client version:** `pkg/constants.go` - `ClientVersion`
+4. **Update solver:** Copy latest `yt.solver.core.js` if function finding changed
+5. **Test extraction:** `./ytx music VIDEO_ID` and verify HTTP 200
+6. **Clear cache:** `rm ~/.cache/ytx/cipher.json` to force re-extraction
 
 ---
 
