@@ -17,15 +17,16 @@ const (
 
 // CipherCache represents the persisted cipher data
 type CipherCache struct {
-	Version     int       `json:"version"`
-	CreatedAt   time.Time `json:"created_at"`
-	ExpiresAt   time.Time `json:"expires_at"`
-	PlayerURL   string    `json:"player_url"`  // e.g., /s/player/xxx/base.js
-	BaseJSPath  string    `json:"basejs_path"` // Cached base.js path for fast refresh
-	SigFunction string    `json:"sig_function"`
-	SigParam    int       `json:"sig_param"`
-	NFunction   string    `json:"n_function"`
-	JSCode      string    `json:"js_code"`
+	Version            int       `json:"version"`
+	CreatedAt          time.Time `json:"created_at"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	PlayerURL          string    `json:"player_url"`  // e.g., /s/player/xxx/base.js
+	BaseJSPath         string    `json:"basejs_path"` // Cached base.js path for fast refresh
+	SigFunction        string    `json:"sig_function"`
+	SigParam           int       `json:"sig_param"`
+	NFunction          string    `json:"n_function"`
+	SignatureTimestamp int       `json:"signature_timestamp"` // STS for API requests
+	JSCode             string    `json:"js_code"`
 }
 
 // CacheManager handles persistent cipher caching

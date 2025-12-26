@@ -45,3 +45,5 @@ cookies.txt
 
 # Release directory
 release/
+.claude
+.serena

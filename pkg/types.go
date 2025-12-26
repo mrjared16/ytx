@@ -35,7 +35,8 @@ type PlaybackContext struct {
 }
 
 type ContentPlaybackContext struct {
-	HTML5Preference string `json:"html5Preference"`
+	HTML5Preference    string `json:"html5Preference"`
+	SignatureTimestamp int    `json:"signatureTimestamp,omitempty"`
 }
 
 // === INNERTUBE RESPONSE ===

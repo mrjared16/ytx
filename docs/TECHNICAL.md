@@ -761,6 +761,68 @@ Key files to check when yt-dlp releases a fix:
 2. `yt_dlp/extractor/youtube/_video.py` - Main extraction changes
 3. `yt_dlp/extractor/youtube/_base.py` - Client configuration updates
 
+### Case Study: Premium Audio (itag 141) Not Returned (Dec 2025)
+
+**Symptom:** ytx returns itag=140 (128kbps) instead of itag=141 (256kbps) even with YouTube Premium.
+
+**Debugging Approach - Isolate Each Function:**
+
+The stream URL extraction is a pipeline:
+```
+F0: HTML Page → visitorData
+F1: player.js → signatureTimestamp (STS)
+F2: callPlayerAPI(visitorData, STS) → itag list + signatureCipher
+F3: DecryptSignature(s) → sig
+F4: TransformN(n) → n'
+F5: BuildURL(base, sig, n') → final URL
+```
+
+Build POCs to test each function in isolation:
+```go
+// POC: Test if API returns itag 141
+// 1. Fetch visitorData from music.youtube.com
+// 2. Fetch signatureTimestamp from player.js
+// 3. Call API with/without signatureTimestamp
+// 4. Compare which itags are returned
+```
+
+**Root Cause:** The `signatureTimestamp` field was missing from the API request body.
+
+YouTube requires `signatureTimestamp` in `playbackContext.contentPlaybackContext` to return premium formats. This 5-digit number (e.g., `20438`) is extracted from player.js and tells YouTube which cipher version the client understands.
+
+**The Fix:**
+
+1. Extract STS from player.js:
+```go
+// pkg/cipher.go
+func findSignatureTimestamp(js []byte) int {
+    pattern := regexp.MustCompile(`["']?signatureTimestamp["']?\s*[=:]\\s*(\\d+)`)
+    match := pattern.FindSubmatch(js)
+    if len(match) >= 2 {
+        sts, _ := strconv.Atoi(string(match[1]))
+        return sts
+    }
+    return 0
+}
+```
+
+2. Include STS in API request:
+```go
+// pkg/types.go
+type ContentPlaybackContext struct {
+    HTML5Preference    string `json:"html5Preference"`
+    SignatureTimestamp int    `json:"signatureTimestamp,omitempty"`
+}
+```
+
+3. Change execution order - cipher must be ready BEFORE API call:
+```
+BEFORE: fetchVisitorData → callPlayerAPI → waitForCipher → decrypt
+AFTER:  fetchVisitorData → waitForCipher → callPlayerAPI(with STS) → decrypt
+```
+
+**Key Insight:** When debugging API issues, build isolated POCs that make the same request with/without specific parameters. This quickly identifies which parameter is causing the issue.
+
 ### yt-dlp Reference: Key Functions
 
 **Signature Timestamp Extraction** (`_video.py:2183-2215`):

@@ -26,13 +26,14 @@ import (
 //
 // For n-function: Use kkdai's approach - extract raw function body and ExportTo
 type Cipher struct {
-	sigFunctionName string
-	sigParam        int
-	nFunctionName   string
-	jsCode          string        // Self-contained JS with function + dependencies
-	playerURL       string        // Player JS URL (for cache versioning)
-	compiled        *goja.Program // Pre-compiled JS program for fast execution
-	playerJS        []byte        // Full player JS for n-function extraction
+	sigFunctionName    string
+	sigParam           int
+	nFunctionName      string
+	signatureTimestamp int           // STS from player.js, needed for API requests
+	jsCode             string        // Self-contained JS with function + dependencies
+	playerURL          string        // Player JS URL (for cache versioning)
+	compiled           *goja.Program // Pre-compiled JS program for fast execution
+	playerJS           []byte        // Full player JS for n-function extraction
 }
 
 // NFunctionName returns the n-function name (for debugging)
@@ -40,6 +41,9 @@ func (c *Cipher) NFunctionName() string { return c.nFunctionName }
 
 // PlayerJSLen returns the length of playerJS (for debugging)
 func (c *Cipher) PlayerJSLen() int { return len(c.playerJS) }
+
+// SignatureTimestamp returns the STS value needed for API requests
+func (c *Cipher) SignatureTimestamp() int { return c.signatureTimestamp }
 
 // Base.js URL pattern
 var basejsPattern = regexp.MustCompile(`/s/player/[\w-]+/[\w./-]+/base\.js`)
@@ -130,6 +134,9 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	// Find n-function name (we don't need the body, playerJS is used directly)
 	nName := findNFunctionName(playerJS)
 
+	// Extract signatureTimestamp (STS) from player.js
+	sts := findSignatureTimestamp(playerJS)
+
 	// Pre-compile the JS program for faster execution
 	compiled, err := goja.Compile("cipher", jsCode, false)
 	if err != nil {
@@ -137,13 +144,14 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	}
 
 	return &Cipher{
-		sigFunctionName: sigName,
-		sigParam:        sigParam,
-		nFunctionName:   nName,
-		jsCode:          jsCode,
-		playerURL:       playerPath,
-		compiled:        compiled,
-		playerJS:        playerJS,
+		sigFunctionName:    sigName,
+		sigParam:           sigParam,
+		nFunctionName:      nName,
+		signatureTimestamp: sts,
+		jsCode:             jsCode,
+		playerURL:          playerPath,
+		compiled:           compiled,
+		playerJS:           playerJS,
 	}, playerPath, nil
 }
 
@@ -153,12 +161,13 @@ func NewCipherFromCache(cache *CipherCache) *Cipher {
 	compiled, _ := goja.Compile("cipher", cache.JSCode, false)
 
 	return &Cipher{
-		sigFunctionName: cache.SigFunction,
-		sigParam:        cache.SigParam,
-		nFunctionName:   cache.NFunction,
-		jsCode:          cache.JSCode,
-		playerURL:       cache.PlayerURL,
-		compiled:        compiled,
+		sigFunctionName:    cache.SigFunction,
+		sigParam:           cache.SigParam,
+		nFunctionName:      cache.NFunction,
+		signatureTimestamp: cache.SignatureTimestamp,
+		jsCode:             cache.JSCode,
+		playerURL:          cache.PlayerURL,
+		compiled:           compiled,
 	}
 }
 
@@ -166,14 +175,15 @@ func NewCipherFromCache(cache *CipherCache) *Cipher {
 func (c *Cipher) ToCache() *CipherCache {
 	now := time.Now()
 	return &CipherCache{
-		Version:     currentCacheVersion,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(cacheTTL),
-		PlayerURL:   c.playerURL,
-		SigFunction: c.sigFunctionName,
-		SigParam:    c.sigParam,
-		NFunction:   c.nFunctionName,
-		JSCode:      c.jsCode,
+		Version:            currentCacheVersion,
+		CreatedAt:          now,
+		ExpiresAt:          now.Add(cacheTTL),
+		PlayerURL:          c.playerURL,
+		SigFunction:        c.sigFunctionName,
+		SigParam:           c.sigParam,
+		NFunction:          c.nFunctionName,
+		SignatureTimestamp: c.signatureTimestamp,
+		JSCode:             c.jsCode,
 	}
 }
 
@@ -350,7 +360,7 @@ func extractDefinitionSimple(js string, name string) string {
 // extractStatement extracts a complete statement starting at idx
 func extractStatement(js string, idx int) string {
 	pos := idx
-	depth := 0     // Track {} depth
+	depth := 0      // Track {} depth
 	parenDepth := 0 // Track () depth
 	inString := byte(0)
 
@@ -573,6 +583,28 @@ func findNFunctionName(js []byte) string {
 	}
 
 	return ""
+}
+
+// findSignatureTimestamp extracts the signatureTimestamp (STS) from player.js
+// This is required for the player API to return premium formats
+func findSignatureTimestamp(js []byte) int {
+	// Pattern: signatureTimestamp:12345 or "signatureTimestamp":12345
+	pattern := regexp.MustCompile(`["\']?signatureTimestamp["\']?\s*[=:]\s*(\d+)`)
+	match := pattern.FindSubmatch(js)
+	if len(match) >= 2 {
+		sts, _ := strconv.Atoi(string(match[1]))
+		return sts
+	}
+
+	// Fallback: look for sts= pattern
+	pattern2 := regexp.MustCompile(`\bsts\s*=\s*(\d{4,6})\b`)
+	match = pattern2.FindSubmatch(js)
+	if len(match) >= 2 {
+		sts, _ := strconv.Atoi(string(match[1]))
+		return sts
+	}
+
+	return 0
 }
 
 func isValidIdentifier(s string) bool {

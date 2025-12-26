@@ -42,6 +42,8 @@ type Extractor struct {
 	cacheManager  *CacheManager // file-based persistent cache
 	cipherRetried atomic.Bool   // track if we've already retried with fresh cipher
 	visitorData   string        // required since Jan 2025 for all API requests
+	sessionIndex  string        // X-Goog-AuthUser header
+	delegatedSID  string        // X-Goog-PageId header
 	profile       bool          // enable profiling
 	timings       Timings       // profiling timers
 	fetchSubs     bool          // whether to include subtitles in output
@@ -207,7 +209,12 @@ func (e *Extractor) cacheVisitorData() {
 }
 
 // musicVisitorDataRegex extracts visitorData from music.youtube.com HTML
-var musicVisitorDataRegex = regexp.MustCompile(`"visitorData"\s*:\s*"([^"]+)"`)
+var (
+	musicVisitorDataRegex = regexp.MustCompile(`"visitorData"\s*:\s*"([^"]+)"`)
+	sessionIndexRegex     = regexp.MustCompile(`"SESSION_INDEX"\s*:\s*"([^"]+)"`)
+	delegatedSIDRegex     = regexp.MustCompile(`"DELEGATED_SESSION_ID"\s*:\s*"([^"]+)"`)
+	datasyncIDRegex       = regexp.MustCompile(`"DATASYNC_ID"\s*:\s*"([^"]+)"`)
+)
 
 // fetchMusicVisitorData gets visitorData from music.youtube.com page
 func (e *Extractor) fetchMusicVisitorData(videoID string) error {
@@ -234,6 +241,28 @@ func (e *Extractor) fetchMusicVisitorData(videoID string) error {
 	matches := musicVisitorDataRegex.FindSubmatch(body)
 	if len(matches) >= 2 {
 		e.visitorData = string(matches[1])
+	}
+
+	// Extract Session Index (X-Goog-AuthUser)
+	matches = sessionIndexRegex.FindSubmatch(body)
+	if len(matches) >= 2 {
+		e.sessionIndex = string(matches[1])
+	}
+
+	// Extract Delegated Session ID (X-Goog-PageId)
+	// Try DELEGATED_SESSION_ID first
+	matches = delegatedSIDRegex.FindSubmatch(body)
+	if len(matches) >= 2 {
+		e.delegatedSID = string(matches[1])
+	} else {
+		// Fallback: try parsing DATASYNC_ID (format: delegated||user)
+		matches = datasyncIDRegex.FindSubmatch(body)
+		if len(matches) >= 2 {
+			parts := strings.Split(string(matches[1]), "||")
+			if len(parts) >= 2 && parts[0] != "" {
+				e.delegatedSID = parts[0]
+			}
+		}
 	}
 
 	return nil
@@ -291,7 +320,16 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 		// Non-fatal, continue without it
 	}
 
-	// Call innertube API (now with visitorData ready)
+	// Wait for cipher to get signatureTimestamp (required for premium formats)
+	cipherRes := <-cipherCh
+	if e.profile {
+		e.timings.CipherInitMs = time.Since(cipherPrewarmStart).Milliseconds()
+	}
+	if cipherRes.err == nil {
+		e.cipher = cipherRes.cipher
+	}
+
+	// Call innertube API (now with visitorData and signatureTimestamp ready)
 	var apiStart time.Time
 	if e.profile {
 		apiStart = time.Now()
@@ -302,15 +340,6 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 	}
 	if e.profile {
 		e.timings.PlayerAPIMs = time.Since(apiStart).Milliseconds()
-	}
-
-	// Wait for cipher pre-warm to complete
-	cipherRes := <-cipherCh
-	if e.profile {
-		e.timings.CipherInitMs = time.Since(cipherPrewarmStart).Milliseconds()
-	}
-	if cipherRes.err == nil {
-		e.cipher = cipherRes.cipher
 	}
 
 	// Check playability
@@ -471,6 +500,12 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 		client.VisitorData = e.visitorData
 	}
 
+	// Get signatureTimestamp from cipher if available (required for premium audio)
+	var sts int
+	if e.cipher != nil {
+		sts = e.cipher.SignatureTimestamp()
+	}
+
 	reqBody := InnertubeRequest{
 		VideoID: videoID,
 		Context: InnertubeContext{
@@ -480,7 +515,8 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 		RacyCheckOK:    true,
 		PlaybackContext: &PlaybackContext{
 			ContentPlaybackContext: ContentPlaybackContext{
-				HTML5Preference: "HTML5_PREF_WANTS",
+				HTML5Preference:    "HTML5_PREF_WANTS",
+				SignatureTimestamp: sts,
 			},
 		},
 	}
@@ -489,7 +525,6 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	// Build request
 	apiURL := fmt.Sprintf("%s?key=%s&prettyPrint=false", e.config.APIEndpoint, e.config.APIKey)
 	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(jsonBody))
@@ -514,6 +549,21 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 		req.Header.Set("Authorization", sapisidhash)
 		req.Header.Set("X-Origin", e.config.Origin)
 		req.Header.Set("Cookie", BuildCookieHeader(e.cookies))
+
+		// Add session headers if available
+		// NOTE: X-Goog-AuthUser is needed for logged-in state
+		// NOTE: X-Goog-PageId is OMITTED - it causes premium formats to be hidden
+		//       when using a Brand Account that doesn't have its own Premium subscription
+		if e.sessionIndex != "" {
+			req.Header.Set("X-Goog-AuthUser", e.sessionIndex)
+		}
+		// REMOVED: X-Goog-PageId - breaks premium audio (itag 141)
+		req.Header.Set("X-Youtube-Bootstrap-Logged-In", "true")
+	}
+
+	// Add visitor ID header if available (required for authenticated requests)
+	if e.visitorData != "" {
+		req.Header.Set("X-Goog-Visitor-Id", e.visitorData)
 	}
 
 	// Make request
@@ -772,7 +822,7 @@ func (e *Extractor) decryptWithRetry(videoID, sig string) (string, error) {
 		return e.cipher.DecryptSignature(sig)
 	}
 
-	return "", err
+	return result, nil
 }
 
 // unthrottle applies the n-parameter transformation to bypass throttling

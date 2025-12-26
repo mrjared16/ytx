@@ -469,6 +469,16 @@ yt-dlp -f 141 -g "https://music.youtube.com/watch?v=VIDEO_ID"  # Should work
 ./ytx music VIDEO_ID | jq -r '.url' | xargs curl -sI | head -1  # If 403, broken
 ```
 
+### Diagnose Tool
+
+Use the built-in diagnostic tool for side-by-side comparison:
+
+```bash
+go run cmd/diagnose/main.go VIDEO_ID
+```
+
+This checks cookie status, compares ytx vs yt-dlp, and verifies URLs work.
+
 See [DEVELOPMENT.md](DEVELOPMENT.md#when-youtube-breaks-things) for debugging guide.
 
 ### yt-dlp Reference

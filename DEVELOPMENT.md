@@ -140,6 +140,28 @@ echo "yt-dlp n: $YTDLP_N"
 # If different -> n-function is wrong (most common issue)
 ```
 
+### Root Cause: Missing signatureTimestamp (Dec 2025 Incident)
+
+**Symptom:** ytx returns itag=140 (128kbps) instead of itag=141 (256kbps) even with Premium.
+
+**Debugging approach:** Build isolated POCs to test each function in the extraction pipeline:
+```
+F0: HTML → visitorData
+F1: player.js → signatureTimestamp
+F2: API(visitorData, STS) → itag list  ← Problem was here
+F3: DecryptSignature(s) → sig
+F4: TransformN(n) → n'
+```
+
+**Root cause:** The `signatureTimestamp` field was missing from the API request body.
+
+**Fix:** 
+1. Extract STS from player.js: `findSignatureTimestamp()` in `pkg/cipher.go`
+2. Include in API request: `SignatureTimestamp` field in `ContentPlaybackContext`
+3. Wait for cipher before API call (cipher contains STS)
+
+**Files changed:** `pkg/types.go`, `pkg/cipher.go`, `pkg/cache.go`, `pkg/extractor.go`
+
 ### Root Cause: Decoy Functions (Dec 2024 Incident)
 
 YouTube adds **decoy wrapper functions** to break regex-based scrapers:
@@ -199,11 +221,43 @@ Update `pkg/constants.go`:
 ClientVersion = "1.20251216.01.00"
 ```
 
-### Verify Cookie Status
+### Diagnose Tool
+
+When extraction breaks, use the built-in diagnostic tool to compare ytx vs yt-dlp:
 
 ```bash
-./verify_cookie.sh ~/.config/ytx/cookies.txt
-# Returns: premium, non-premium, or non-auth
+go run cmd/diagnose/main.go VIDEO_ID
+```
+
+This tool:
+1. Checks cookie/premium status
+2. Runs yt-dlp as baseline
+3. Runs ytx extraction
+4. Tests API directly with signatureTimestamp
+5. Verifies both URLs return HTTP 200
+
+Example output:
+```
+[0] Cookie status:
+    PREMIUM ✓ (authenticated with YouTube Premium)
+
+[1] yt-dlp baseline (format 141):
+    itag=141, n=KhRv-G0hELcWgw, sig=AJfQdSswRAIgcktRP4BM...
+
+[2] ytx extraction:
+    itag=141, bitrate=258412
+    n=lfv_DeEHzIQxmA, sig=AJfQdSswRAIgCBF-drC3...
+
+[3] Direct API test (with signatureTimestamp):
+    signatureTimestamp: 20438
+    Audio itags: 140 141 249 250 251 774 ✓
+
+[4] URL verification:
+    yt-dlp URL: HTTP 200
+    ytx URL:    HTTP 200
+
+DIAGNOSIS:
+  Both return itag 141 - extraction working
 ```
 
 ### Clear Cache and Retry
