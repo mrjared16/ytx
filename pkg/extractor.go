@@ -49,6 +49,7 @@ type Extractor struct {
 	fetchSubs     bool          // whether to include subtitles in output
 	subLangs      []string      // subtitle languages to fetch (nil = default, empty = all)
 	maxHeight     int           // max video height (0 = no limit)
+	audioFormat   AudioFormat   // preferred audio format (default: AudioFormatWebm)
 }
 
 // defaultSubtitleLangs are fetched when --subs is used without --sub-langs
@@ -117,6 +118,18 @@ func (e *Extractor) SetFetchSubtitles(langs []string) {
 // Set to 0 to disable limit (default behavior).
 func (e *Extractor) SetMaxHeight(height int) {
 	e.maxHeight = height
+}
+
+func (e *Extractor) SetPreferWebm(enabled bool) {
+	if enabled {
+		e.audioFormat = AudioFormatWebm
+	} else {
+		e.audioFormat = AudioFormatM4A
+	}
+}
+
+func (e *Extractor) SetAudioFormat(format AudioFormat) {
+	e.audioFormat = format
 }
 
 // fetchVisitorData gets visitorData from YouTube using WEB client (required since Jan 2025)
@@ -606,8 +619,15 @@ func (e *Extractor) findBestAudioStream(formats []Format) *Format {
 		return nil
 	}
 
+	var priorityItags []int
+	if itags, ok := AudioFormatPriority[e.audioFormat]; ok {
+		priorityItags = itags
+	} else {
+		priorityItags = AudioFormatPriority[AudioFormatWebm]
+	}
+
 	// Try to find premium itags first
-	for _, targetItag := range PremiumAudioItags {
+	for _, targetItag := range priorityItags {
 		for i := range audioFormats {
 			if audioFormats[i].Itag == targetItag {
 				return &audioFormats[i]

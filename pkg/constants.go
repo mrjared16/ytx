@@ -20,7 +20,21 @@ const (
 	PlayerJSURLBase = "https://www.youtube.com"
 )
 
-// Premium audio itags - prioritized order
+// AudioFormat represents preferred audio container format
+type AudioFormat int
+
+const (
+	AudioFormatWebm AudioFormat = iota // default: 774 (webm/opus) first
+	AudioFormatM4A                     // 141 (m4a/aac) first
+)
+
+// AudioFormatPriority maps format preference to itag priority order
+var AudioFormatPriority = map[AudioFormat][]int{
+	AudioFormatWebm: {774, 141, 140, 251},
+	AudioFormatM4A:  {141, 774, 140, 251},
+}
+
+// PremiumAudioItags - legacy, use AudioFormatPriority instead
 var PremiumAudioItags = []int{
 	141, // 256kbps AAC
 	774, // 256kbps AAC (alternative)
