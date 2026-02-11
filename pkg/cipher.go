@@ -7,33 +7,33 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/dop251/goja"
+	"github.com/buke/quickjs-go"
 	"github.com/dop251/goja/ast"
 	"github.com/dop251/goja/parser"
 )
 
-// Cipher handles YouTube signature decryption using goja
+// Cipher handles YouTube signature decryption using QuickJS
 //
 // DESIGN (10x engineer approach):
 // 1. Use goja/parser to parse JS into AST (already a dependency)
 // 2. Walk AST to find function and dependencies
 // 3. Extract source text for self-contained code
-// 4. Pre-compile JS program once, reuse for all decryptions
 //
 // For n-function: Use kkdai's approach - extract raw function body and ExportTo
 type Cipher struct {
 	sigFunctionName    string
 	sigParam           int
 	nFunctionName      string
-	signatureTimestamp int           // STS from player.js, needed for API requests
-	jsCode             string        // Self-contained JS with function + dependencies
-	playerURL          string        // Player JS URL (for cache versioning)
-	compiled           *goja.Program // Pre-compiled JS program for fast execution
-	playerJS           []byte        // Full player JS for n-function extraction
+	signatureTimestamp int    // STS from player.js, needed for API requests
+	jsCode             string // Self-contained JS with function + dependencies
+	playerURL          string // Player JS URL (for cache versioning)
+	playerJS           []byte // Full player JS for n-function extraction
 }
 
 // NFunctionName returns the n-function name (for debugging)
@@ -47,6 +47,16 @@ func (c *Cipher) SignatureTimestamp() int { return c.signatureTimestamp }
 
 // Base.js URL pattern
 var basejsPattern = regexp.MustCompile(`/s/player/[\w-]+/[\w./-]+/base\.js`)
+
+var extractDefinitionPatternTemplates = []string{
+	`(?m)(^|[;{}])\s*((?:var|let|const)\s+%s\s*=)`,
+	`(?m)(^|[;{}])\s*(function\s+%s\s*\()`,
+	`(?m)(^|[;{}])\s*(%s\s*=\s*function\b)`,
+	`(?m)(^|[;{}])\s*(%s\s*=\s*[\[{])`,
+	`(?m)(^|[;{}])\s*(%s\s*=)`,
+}
+
+var extractDefinitionPatternCache sync.Map
 
 // NewCipherWithCachedPath creates a new cipher, optionally using a cached base.js path
 // If cachedPath is provided and valid, skips the embed page fetch (~150ms savings)
@@ -71,6 +81,8 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 		engineName = "bun"
 	case EngineNode:
 		engineName = "node"
+	case EngineQuickJS:
+		engineName = ""
 	case EngineAuto:
 		// Auto mode: try bun first
 		engineName = "bun"
@@ -137,12 +149,6 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	// Extract signatureTimestamp (STS) from player.js
 	sts := findSignatureTimestamp(playerJS)
 
-	// Pre-compile the JS program for faster execution
-	compiled, err := goja.Compile("cipher", jsCode, false)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to compile cipher JS: %w", err)
-	}
-
 	return &Cipher{
 		sigFunctionName:    sigName,
 		sigParam:           sigParam,
@@ -150,16 +156,12 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 		signatureTimestamp: sts,
 		jsCode:             jsCode,
 		playerURL:          playerPath,
-		compiled:           compiled,
 		playerJS:           playerJS,
 	}, playerPath, nil
 }
 
 // NewCipherFromCache reconstructs a Cipher from cached data
 func NewCipherFromCache(cache *CipherCache) *Cipher {
-	// Pre-compile the JS program (ignore errors, will fail at runtime if invalid)
-	compiled, _ := goja.Compile("cipher", cache.JSCode, false)
-
 	return &Cipher{
 		sigFunctionName:    cache.SigFunction,
 		sigParam:           cache.SigParam,
@@ -167,7 +169,6 @@ func NewCipherFromCache(cache *CipherCache) *Cipher {
 		signatureTimestamp: cache.SignatureTimestamp,
 		jsCode:             cache.JSCode,
 		playerURL:          cache.PlayerURL,
-		compiled:           compiled,
 	}
 }
 
@@ -187,77 +188,306 @@ func (c *Cipher) ToCache() *CipherCache {
 	}
 }
 
-// extractWithAST uses goja's parser to extract a function and its dependencies
-func extractWithAST(jsCode string, funcName string) (string, error) {
-	// Parse the JavaScript
-	program, err := parser.ParseFile(nil, "", jsCode, 0)
-	if err != nil {
-		return "", fmt.Errorf("parse error: %w", err)
+// segment represents a top-level statement in player.js.
+type segment struct {
+	start     int
+	end       int
+	deps      []string
+	depsReady bool
+	stmt      ast.Statement
+}
+
+// definitionIndex maps names to segments.
+type definitionIndex struct {
+	segments  []*segment
+	nameToSeg map[string]int
+}
+
+func buildDefinitionIndex(program *ast.Program, jsCode string) *definitionIndex {
+	_ = jsCode
+	base := int(program.File.Base())
+	idx := &definitionIndex{
+		segments:  make([]*segment, 0, 256),
+		nameToSeg: make(map[string]int, 256),
 	}
 
-	// Find the function assignment and collect dependencies
-	var funcStart, funcEnd int
-	deps := make(map[string]bool)
+	for _, stmt := range collectIndexRoots(program) {
+		start := int(stmt.Idx0()) - base
+		end := int(stmt.Idx1()) - base
 
-	// Walk the AST to find our function
-	for _, stmt := range program.Body {
-		if exprStmt, ok := stmt.(*ast.ExpressionStatement); ok {
-			if assignExpr, ok := exprStmt.Expression.(*ast.AssignExpression); ok {
-				if ident, ok := assignExpr.Left.(*ast.Identifier); ok {
-					if ident.Name.String() == funcName {
-						funcStart = int(stmt.Idx0()) - 1
-						funcEnd = int(stmt.Idx1())
+		switch s := stmt.(type) {
+		case *ast.VariableStatement:
+			seg := &segment{start: start, end: end, stmt: s}
+			segID := len(idx.segments)
+			idx.segments = append(idx.segments, seg)
 
-						// Find dependencies in the function body
-						collectIdentifiers(assignExpr.Right, deps)
-					}
+			for _, decl := range s.List {
+				if decl == nil {
+					continue
 				}
+				if name := extractBindingIdentifierName(decl.Target); name != "" {
+					idx.nameToSeg[name] = segID
+				}
+			}
+
+		case *ast.FunctionDeclaration:
+			if s.Function == nil {
+				continue
+			}
+			seg := &segment{start: start, end: end, stmt: s}
+			segID := len(idx.segments)
+			idx.segments = append(idx.segments, seg)
+			if s.Function.Name != nil {
+				idx.nameToSeg[s.Function.Name.Name.String()] = segID
+			}
+
+		case *ast.ExpressionStatement:
+			handleExpressionStatement(s, start, end, idx)
+		}
+	}
+
+	return idx
+}
+
+func collectIndexRoots(program *ast.Program) []ast.Statement {
+	roots := make([]ast.Statement, 0, len(program.Body)+512)
+	roots = append(roots, program.Body...)
+
+	for _, stmt := range program.Body {
+		exprStmt, ok := stmt.(*ast.ExpressionStatement)
+		if !ok {
+			continue
+		}
+		if body := unwrapIIFEBody(exprStmt.Expression); body != nil {
+			roots = append(roots, body.List...)
+		}
+	}
+
+	return roots
+}
+
+func unwrapIIFEBody(expr ast.Expression) *ast.BlockStatement {
+	switch e := expr.(type) {
+	case *ast.CallExpression:
+		switch callee := e.Callee.(type) {
+		case *ast.FunctionLiteral:
+			return callee.Body
+		case *ast.DotExpression:
+			if fn, ok := callee.Left.(*ast.FunctionLiteral); ok {
+				return fn.Body
+			}
+		case *ast.BracketExpression:
+			if fn, ok := callee.Left.(*ast.FunctionLiteral); ok {
+				return fn.Body
+			}
+		}
+
+	case *ast.SequenceExpression:
+		for _, seqExpr := range e.Sequence {
+			if body := unwrapIIFEBody(seqExpr); body != nil {
+				return body
+			}
+		}
+
+	case *ast.AssignExpression:
+		return unwrapIIFEBody(e.Right)
+
+	case *ast.UnaryExpression:
+		return unwrapIIFEBody(e.Operand)
+
+	case *ast.ConditionalExpression:
+		if body := unwrapIIFEBody(e.Consequent); body != nil {
+			return body
+		}
+		return unwrapIIFEBody(e.Alternate)
+	}
+
+	return nil
+}
+
+func handleExpressionStatement(stmt *ast.ExpressionStatement, start int, end int, idx *definitionIndex) {
+	switch e := stmt.Expression.(type) {
+	case *ast.AssignExpression:
+		if ident, ok := e.Left.(*ast.Identifier); ok {
+			seg := &segment{start: start, end: end, stmt: stmt}
+			segID := len(idx.segments)
+			idx.segments = append(idx.segments, seg)
+			idx.nameToSeg[ident.Name.String()] = segID
+		}
+
+	case *ast.SequenceExpression:
+		seg := &segment{start: start, end: end, stmt: stmt}
+		segID := len(idx.segments)
+		idx.segments = append(idx.segments, seg)
+
+		for _, seqExpr := range e.Sequence {
+			assign, ok := seqExpr.(*ast.AssignExpression)
+			if !ok {
+				continue
+			}
+			if ident, ok := assign.Left.(*ast.Identifier); ok {
+				idx.nameToSeg[ident.Name.String()] = segID
+			}
+		}
+	}
+}
+
+func segmentDependencies(seg *segment) []string {
+	if seg == nil {
+		return nil
+	}
+	if seg.depsReady {
+		return seg.deps
+	}
+
+	deps := make(map[string]bool)
+	switch s := seg.stmt.(type) {
+	case *ast.VariableStatement:
+		for _, decl := range s.List {
+			if decl == nil || decl.Initializer == nil {
+				continue
+			}
+			collectIdentifiers(decl.Initializer, deps)
+		}
+
+	case *ast.FunctionDeclaration:
+		if s.Function != nil {
+			collectIdentifiers(s.Function.Body, deps)
+		}
+
+	case *ast.ExpressionStatement:
+		switch e := s.Expression.(type) {
+		case *ast.AssignExpression:
+			collectIdentifiers(e.Right, deps)
+		case *ast.SequenceExpression:
+			for _, seqExpr := range e.Sequence {
+				assign, ok := seqExpr.(*ast.AssignExpression)
+				if !ok {
+					continue
+				}
+				collectIdentifiers(assign.Right, deps)
 			}
 		}
 	}
 
-	if funcStart == 0 && funcEnd == 0 {
-		return "", fmt.Errorf("function %s not found in AST", funcName)
+	seg.deps = sortedKeys(deps)
+	seg.depsReady = true
+	return seg.deps
+}
+
+func resolveDependencyClosure(funcName string, idx *definitionIndex, builtins map[string]bool) []int {
+	seenSegs := make(map[int]bool)
+	result := make([]int, 0, 64)
+
+	queue := []string{funcName}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+
+		segID, ok := idx.nameToSeg[name]
+		if !ok || seenSegs[segID] || builtins[name] {
+			continue
+		}
+		seenSegs[segID] = true
+		result = append(result, segID)
+
+		for _, dep := range segmentDependencies(idx.segments[segID]) {
+			if _, inIndex := idx.nameToSeg[dep]; inIndex && !builtins[dep] {
+				queue = append(queue, dep)
+			}
+		}
 	}
 
-	// Remove the function name itself from deps
-	delete(deps, funcName)
+	sort.Slice(result, func(i int, j int) bool {
+		return idx.segments[result[i]].start < idx.segments[result[j]].start
+	})
 
-	// Filter out JavaScript built-ins that don't need extraction
-	builtins := map[string]bool{
+	return result
+}
+
+func emitCodeFromIndex(segIDs []int, idx *definitionIndex, jsCode string) string {
+	var buf strings.Builder
+	buf.Grow(len(segIDs) * 200)
+
+	for _, segID := range segIDs {
+		if segID < 0 || segID >= len(idx.segments) {
+			continue
+		}
+		seg := idx.segments[segID]
+		if seg.start < 0 || seg.end > len(jsCode) || seg.start >= seg.end {
+			continue
+		}
+		buf.WriteString(jsCode[seg.start:seg.end])
+		buf.WriteString(";\n")
+	}
+
+	return buf.String()
+}
+
+// extractWithAST uses goja parser to extract a function and its dependencies.
+func extractWithAST(jsCode string, funcName string) (string, error) {
+	program, err := parser.ParseFile(nil, "", jsCode, 0)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse JS: %w", err)
+	}
+
+	idx := buildDefinitionIndex(program, jsCode)
+
+	if _, ok := idx.nameToSeg[funcName]; !ok {
+		if code := extractDefinitionSimple(jsCode, funcName); code != "" {
+			return code, nil
+		}
+		return "", fmt.Errorf("function %s not found", funcName)
+	}
+
+	builtins := defaultJSBuiltins()
+	segIDs := resolveDependencyClosure(funcName, idx, builtins)
+	if len(segIDs) == 0 {
+		return "", fmt.Errorf("no code extracted for %s", funcName)
+	}
+
+	code := emitCodeFromIndex(segIDs, idx, jsCode)
+	if code == "" {
+		return "", fmt.Errorf("no code extracted for %s", funcName)
+	}
+
+	return code, nil
+}
+
+func defaultJSBuiltins() map[string]bool {
+	return map[string]bool{
 		"String": true, "Array": true, "Object": true, "Math": true,
 		"parseInt": true, "parseFloat": true, "isNaN": true, "isFinite": true,
 		"encodeURIComponent": true, "decodeURIComponent": true,
 		"encodeURI": true, "decodeURI": true,
 		"JSON": true, "console": true, "undefined": true, "null": true,
 		"true": true, "false": true, "NaN": true, "Infinity": true,
-		"a": true, "b": true, "c": true, "d": true, // Common param names
+		"Date": true, "RegExp": true, "Error": true,
+		"a": true, "b": true, "c": true, "d": true, "e": true, "f": true,
+		"g": true, "h": true, "i": true, "j": true,
 	}
-
-	// Build the output
-	var result strings.Builder
-
-	// Extract ALL discovered dependencies (self-healing approach)
-	for dep := range deps {
-		if builtins[dep] {
-			continue
-		}
-		depCode := extractDefinitionSimple(jsCode, dep)
-		if depCode != "" {
-			result.WriteString(depCode)
-			result.WriteString("\n")
-		}
-	}
-
-	// Add the main function
-	if funcEnd <= len(jsCode) {
-		result.WriteString(jsCode[funcStart:funcEnd])
-	}
-
-	return result.String(), nil
 }
 
-// collectIdentifiers walks an AST node and collects all identifiers
+func sortedKeys[K ~string](m map[K]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, string(k))
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func extractBindingIdentifierName(target ast.BindingTarget) string {
+	if target == nil {
+		return ""
+	}
+	if ident, ok := target.(*ast.Identifier); ok {
+		return ident.Name.String()
+	}
+	return ""
+}
+
+// collectIdentifiers walks an AST node and collects all identifiers.
 func collectIdentifiers(node ast.Node, deps map[string]bool) {
 	if node == nil {
 		return
@@ -266,6 +496,10 @@ func collectIdentifiers(node ast.Node, deps map[string]bool) {
 	switch n := node.(type) {
 	case *ast.Identifier:
 		deps[n.Name.String()] = true
+	case *ast.FunctionDeclaration:
+		if n.Function != nil {
+			collectIdentifiers(n.Function, deps)
+		}
 	case *ast.FunctionLiteral:
 		for _, stmt := range n.Body.List {
 			collectIdentifiers(stmt, deps)
@@ -338,30 +572,54 @@ func collectIdentifiers(node ast.Node, deps map[string]bool) {
 	}
 }
 
-// extractDefinitionSimple extracts a variable/function definition using string parsing
-func extractDefinitionSimple(js string, name string) string {
-	// Try: var name='...'.split(';')
-	patterns := []string{
-		"var " + name + "=",
-		name + "=function",
-		"var " + name + "={",
+func extractDefinitionPatterns(name string) []*regexp.Regexp {
+	if cached, ok := extractDefinitionPatternCache.Load(name); ok {
+		return cached.([]*regexp.Regexp)
 	}
 
+	nameQ := regexp.QuoteMeta(name)
+	patterns := make([]*regexp.Regexp, len(extractDefinitionPatternTemplates))
+	for i, template := range extractDefinitionPatternTemplates {
+		patterns[i] = regexp.MustCompile(fmt.Sprintf(template, nameQ))
+	}
+
+	actual, _ := extractDefinitionPatternCache.LoadOrStore(name, patterns)
+	return actual.([]*regexp.Regexp)
+}
+
+// extractDefinitionSimple extracts a variable/function definition using string parsing.
+func extractDefinitionSimple(js string, name string) string {
+	patterns := extractDefinitionPatterns(name)
+
+	best := -1
 	for _, pattern := range patterns {
-		idx := strings.Index(js, pattern)
-		if idx >= 0 {
-			return extractStatement(js, idx)
+		indices := pattern.FindAllStringSubmatchIndex(js, -1)
+		for _, idx := range indices {
+			if len(idx) < 6 {
+				continue
+			}
+			start := idx[4]
+			if start < 0 {
+				continue
+			}
+			if best == -1 || start < best {
+				best = start
+			}
 		}
+	}
+
+	if best >= 0 {
+		return extractStatement(js, best)
 	}
 
 	return ""
 }
 
-// extractStatement extracts a complete statement starting at idx
+// extractStatement extracts a complete statement starting at idx.
 func extractStatement(js string, idx int) string {
 	pos := idx
-	depth := 0      // Track {} depth
-	parenDepth := 0 // Track () depth
+	depth := 0
+	parenDepth := 0
 	inString := byte(0)
 
 	for pos < len(js) {
@@ -436,21 +694,107 @@ func extractSimple(js []byte, funcName string) (string, error) {
 }
 
 // DecryptSignature decrypts the signature
-func (c *Cipher) DecryptSignature(sig string) (string, error) {
-	vm := goja.New()
+const browserStubsJS = `
+var _yt_player = {};
+var _exposed = {};
 
-	// Use pre-compiled program if available (faster), fallback to RunString
-	if c.compiled != nil {
-		_, err := vm.RunProgram(c.compiled)
-		if err != nil {
-			return "", fmt.Errorf("failed to load JS: %w", err)
-		}
-	} else {
-		_, err := vm.RunString(c.jsCode)
-		if err != nil {
-			return "", fmt.Errorf("failed to load JS: %w", err)
-		}
+// Make 'this' (the global object) behave like 'window'
+this.window = this;
+this.self = this;
+this.globalThis = this;
+this.top = this;
+this.parent = this;
+this.t = this;
+
+// Attach browser properties to the global object
+this.location = { href: 'https://www.youtube.com/' };
+this.document = {
+    getElementsByTagName: function() { return []; },
+    getElementById: function() { return null; },
+    createElement: function(tag) { 
+        return { 
+            style: {}, 
+            tagName: tag.toUpperCase(), 
+            appendChild: function() {}, 
+            setAttribute: function() {}, 
+            getAttribute: function() { return null; } 
+        }; 
+    },
+    createTextNode: function() { return {}; },
+    documentElement: { style: {} },
+    body: { appendChild: function() {} },
+    head: { appendChild: function() {} },
+    cookie: '',
+    domain: 'youtube.com'
+};
+this.navigator = { userAgent: 'Mozilla/5.0', platform: 'Win32', language: 'en-US', languages: ['en-US'] };
+this.console = { log: function() {}, warn: function() {}, error: function() {}, info: function() {}, debug: function() {} };
+
+function setTimeout(fn) { try { fn(); } catch(e) {} return 0; }
+function setInterval() { return 0; }
+function clearTimeout() {}
+function clearInterval() {}
+function requestAnimationFrame(fn) { try { fn(0); } catch(e) {} return 0; }
+function cancelAnimationFrame() {}
+
+function XMLHttpRequest() {
+    this.readyState = 0; this.status = 0; this.responseText = '';
+    this.open = function() { this.readyState = 1; };
+    this.send = function() { this.readyState = 4; this.status = 200; };
+    this.setRequestHeader = function() {};
+    this.getResponseHeader = function() { return null; };
+}
+
+function fetch() { 
+    return Promise.resolve({ 
+        ok: true, 
+        status: 200, 
+        json: function() { return Promise.resolve({}); }, 
+        text: function() { return Promise.resolve(''); } 
+    }); 
+}
+
+this.localStorage = { getItem: function() { return null; }, setItem: function() {}, removeItem: function() {}, clear: function() {} };
+this.sessionStorage = { getItem: function() { return null; }, setItem: function() {}, removeItem: function() {}, clear: function() {} };
+this.performance = { now: function() { return Date.now(); }, timing: { navigationStart: Date.now() } };
+this.history = { pushState: function() {}, replaceState: function() {} };
+this.screen = { width: 1920, height: 1080 };
+this.innerWidth = 1920; 
+this.innerHeight = 1080; 
+this.devicePixelRatio = 1;
+this.crypto = { 
+    getRandomValues: function(arr) { 
+        for (var i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256); 
+        return arr; 
+    } 
+};
+`
+
+func (c *Cipher) DecryptSignature(sig string) (string, error) {
+	rt := quickjs.NewRuntime(
+		quickjs.WithMemoryLimit(256*1024*1024),
+		quickjs.WithMaxStackSize(1024*1024),
+	)
+	defer rt.Close()
+	ctx := rt.NewContext()
+	defer ctx.Close()
+
+	// Inject browser stubs first (needed for signature function)
+	stubsVal := ctx.Eval(browserStubsJS, quickjs.EvalFlagGlobal(true))
+	if ctx.HasException() {
+		exc := ctx.Exception()
+		stubsVal.Free()
+		return "", fmt.Errorf("failed to inject browser stubs: %v", exc)
 	}
+	stubsVal.Free()
+
+	val := ctx.Eval(c.jsCode, quickjs.EvalFlagGlobal(true))
+	if ctx.HasException() {
+		exc := ctx.Exception()
+		val.Free()
+		return "", fmt.Errorf("failed to load JS: %v", exc)
+	}
+	val.Free()
 
 	// Call the function
 	var callCode string
@@ -460,16 +804,21 @@ func (c *Cipher) DecryptSignature(sig string) (string, error) {
 		callCode = fmt.Sprintf("%s('%s')", c.sigFunctionName, escapeJSString(sig))
 	}
 
-	result, err := vm.RunString(callCode)
-	if err != nil {
-		return "", fmt.Errorf("failed to call %s: %w", c.sigFunctionName, err)
+	result := ctx.Eval(callCode, quickjs.EvalFlagGlobal(true))
+	if ctx.HasException() {
+		exc := ctx.Exception()
+		result.Free()
+		return "", fmt.Errorf("failed to call %s: %v", c.sigFunctionName, exc)
 	}
 
-	if result == nil || goja.IsUndefined(result) || goja.IsNull(result) {
+	if result.IsUndefined() || result.IsNull() {
+		result.Free()
 		return "", errors.New("sig function returned null/undefined")
 	}
 
-	return result.String(), nil
+	resultStr := result.String()
+	result.Free()
+	return resultStr, nil
 }
 
 // TransformN transforms the n-parameter using the configured JS engine
