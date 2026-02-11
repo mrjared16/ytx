@@ -148,7 +148,7 @@ build:
 .PHONY: build-release
 build-release:
 	@echo "Building $(BINARY_NAME) (release)..."
-	CGO_ENABLED=0 go build \
+	CGO_ENABLED=1 go build \
 		-trimpath \
 		-ldflags "$(LDFLAGS)" \
 		-o $(BINARY_NAME) \

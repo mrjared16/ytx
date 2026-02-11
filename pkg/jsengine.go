@@ -11,9 +11,10 @@ import (
 type EngineType string
 
 const (
-	EngineAuto EngineType = "auto" // Auto-detect: Bun → Node
-	EngineBun  EngineType = "bun"  // Force Bun
-	EngineNode EngineType = "node" // Force Node.js
+	EngineAuto    EngineType = "auto"
+	EngineQuickJS EngineType = "quickjs"
+	EngineBun     EngineType = "bun"
+	EngineNode    EngineType = "node"
 )
 
 // JSEngine is the interface for JavaScript execution engines
@@ -53,12 +54,14 @@ func ParseEngineType(s string) (EngineType, error) {
 	switch s {
 	case "auto", "":
 		return EngineAuto, nil
+	case "quickjs":
+		return EngineQuickJS, nil
 	case "bun":
 		return EngineBun, nil
 	case "node":
 		return EngineNode, nil
 	default:
-		return EngineAuto, fmt.Errorf("unknown engine type: %s (use: auto, bun, node)", s)
+		return EngineAuto, fmt.Errorf("unknown engine type: %s (use: auto, quickjs, bun, node)", s)
 	}
 }
 
@@ -101,6 +104,8 @@ func CloseCachedEngine() {
 // Tries to use pre-spawned process first for faster initialization
 func NewJSEngine(engineType EngineType, playerJS []byte, nFuncName string) (JSEngine, error) {
 	switch engineType {
+	case EngineQuickJS:
+		return NewQuickJSRunner(playerJS, nFuncName)
 	case EngineBun:
 		// Try pre-spawned runner first
 		if runner, err := GetPreSpawnedRunner("bun", playerJS, nFuncName); err != nil {
@@ -124,8 +129,6 @@ func NewJSEngine(engineType EngineType, playerJS []byte, nFuncName string) (JSEn
 	}
 }
 
-// newAutoEngine tries engines in priority order: Bun → Node
-// Uses pre-spawned runner if available for faster initialization
 func newAutoEngine(playerJS []byte, nFuncName string) (JSEngine, error) {
 	// Try Bun first (with pre-spawn support)
 	if bunPath, err := exec.LookPath("bun"); err == nil && bunPath != "" {
@@ -153,7 +156,11 @@ func newAutoEngine(playerJS []byte, nFuncName string) (JSEngine, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("no JS runtime available: install Bun or Node.js")
+	if engine, err := NewQuickJSRunner(playerJS, nFuncName); err == nil {
+		return engine, nil
+	}
+
+	return nil, fmt.Errorf("no JS runtime available")
 }
 
 // ValidateNTransformResult checks if the n-transform result is valid
