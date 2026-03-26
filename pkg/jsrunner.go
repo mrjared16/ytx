@@ -95,7 +95,7 @@ func PreSpawnJSProcess(engine string) error {
 
 // GetPreSpawnedRunner returns a pre-spawned runner if available, loading the function
 // Returns nil if no pre-spawned runner exists for this engine
-func GetPreSpawnedRunner(engine string, playerJS []byte, funcName string) (*SubprocessRunner, error) {
+func GetPreSpawnedRunner(engine string, runtimeJS []byte, funcName string) (*SubprocessRunner, error) {
 	preSpawnedMu.Lock()
 	defer preSpawnedMu.Unlock()
 
@@ -110,13 +110,13 @@ func GetPreSpawnedRunner(engine string, playerJS []byte, funcName string) (*Subp
 	// Write player.js and load function
 	tmpDir := os.TempDir()
 	playerJSPath := filepath.Join(tmpDir, tempPlayerFile)
-	if err := os.WriteFile(playerJSPath, playerJS, 0644); err != nil {
+	if err := os.WriteFile(playerJSPath, runtimeJS, 0644); err != nil {
 		runner.Close()
 		return nil, fmt.Errorf("failed to write player.js: %w", err)
 	}
 
 	runner.funcName = funcName
-	if err := runner.loadFunctionFromFile(playerJSPath, funcName); err != nil {
+	if err := runner.loadFunctionFromFile(playerJSPath, funcName, true); err != nil {
 		runner.Close()
 		return nil, err
 	}
@@ -137,7 +137,7 @@ type SubprocessRunner struct {
 }
 
 // NewSubprocessRunner creates a new subprocess-based JS runner
-func NewSubprocessRunner(engine string, playerJS []byte, funcName string) (*SubprocessRunner, error) {
+func NewSubprocessRunner(engine string, runtimeJS []byte, funcName string) (*SubprocessRunner, error) {
 	var jsPath string
 	var err error
 
@@ -169,7 +169,7 @@ func NewSubprocessRunner(engine string, playerJS []byte, funcName string) (*Subp
 
 	// Write player.js to temp file (faster than sending 1.5MB over IPC)
 	playerJSPath := filepath.Join(tmpDir, tempPlayerFile)
-	if err := os.WriteFile(playerJSPath, playerJS, 0644); err != nil {
+	if err := os.WriteFile(playerJSPath, runtimeJS, 0644); err != nil {
 		return nil, fmt.Errorf("failed to write player.js: %w", err)
 	}
 
@@ -196,7 +196,7 @@ func NewSubprocessRunner(engine string, playerJS []byte, funcName string) (*Subp
 	}
 
 	// Load the function using file path (faster than sending content)
-	if err := runner.loadFunctionFromFile(playerJSPath, funcName); err != nil {
+	if err := runner.loadFunctionFromFile(playerJSPath, funcName, true); err != nil {
 		runner.Close()
 		return nil, err
 	}
@@ -205,14 +205,15 @@ func NewSubprocessRunner(engine string, playerJS []byte, funcName string) (*Subp
 }
 
 // loadFunctionFromFile loads a function from player.js file path
-func (r *SubprocessRunner) loadFunctionFromFile(playerJSPath, funcName string) error {
+func (r *SubprocessRunner) loadFunctionFromFile(playerJSPath, funcName string, prepared bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	msg := map[string]interface{}{
-		"type": "load_file",
-		"path": playerJSPath,
-		"fun":  funcName,
+		"type":     "load_file",
+		"path":     playerJSPath,
+		"fun":      funcName,
+		"prepared": prepared,
 	}
 
 	if err := r.stdin.Encode(msg); err != nil {

@@ -80,11 +80,12 @@ function createBrowserContext() {
 let context = null;
 let nFunc = null;
 
-function loadFunction(code, funcName) {
+function loadFunction(code, funcName, prepared = false) {
     try {
         context = createBrowserContext();
-        const exposed = `_exposed['${funcName}']=${funcName};})(_yt_player);`;
-        const modifiedCode = code.replace(/\}\)\(_yt_player\);\s*$/, exposed);
+        const modifiedCode = prepared
+            ? code
+            : code.replace(/\}\)\(_yt_player\);\s*$/, `_exposed['${funcName}']=${funcName};})(_yt_player);`);
         runInContext(modifiedCode, context, { timeout: 30000 });
 
         if (!context._exposed[funcName]) {
@@ -98,10 +99,10 @@ function loadFunction(code, funcName) {
 }
 
 // Load function from file path (faster than receiving 1.5MB over IPC)
-function loadFunctionFromFile(filePath, funcName) {
+function loadFunctionFromFile(filePath, funcName, prepared = false) {
     try {
         const code = readFileSync(filePath, 'utf-8');
-        return loadFunction(code, funcName);
+        return loadFunction(code, funcName, prepared);
     } catch (err) {
         return JSON.stringify({ error: `Failed to read file: ${err.message}` });
     }
@@ -146,9 +147,9 @@ rl.on('line', (line) => {
         const data = JSON.parse(line);
         let result;
         if (data.type === 'load') {
-            result = loadFunction(data.code, data.fun);
+            result = loadFunction(data.code, data.fun, Boolean(data.prepared));
         } else if (data.type === 'load_file') {
-            result = loadFunctionFromFile(data.path, data.fun);
+            result = loadFunctionFromFile(data.path, data.fun, Boolean(data.prepared));
         } else if (data.type === 'call') {
             result = callFunction(data.args || []);
         } else if (data.type === 'batch') {

@@ -67,25 +67,31 @@ func ParseEngineType(s string) (EngineType, error) {
 
 // Global cached engine
 var (
-	cachedEngine   JSEngine
+	cachedEngines  = map[string]JSEngine{}
+	lastEngineName string
 	cachedEngineMu sync.Mutex
 )
 
 // GetCachedEngine returns a cached JS engine or creates a new one
-func GetCachedEngine(playerJS []byte, nFuncName string) (JSEngine, error) {
+func GetCachedEngine(cacheKey string, runtimeJS []byte, nFuncName string) (JSEngine, error) {
 	cachedEngineMu.Lock()
 	defer cachedEngineMu.Unlock()
 
-	if cachedEngine != nil {
-		return cachedEngine, nil
+	if cacheKey == "" {
+		cacheKey = nFuncName
 	}
 
-	engine, err := NewJSEngine(GetEngineType(), playerJS, nFuncName)
+	if engine, ok := cachedEngines[cacheKey]; ok {
+		return engine, nil
+	}
+
+	engine, err := NewJSEngine(GetEngineType(), runtimeJS, nFuncName)
 	if err != nil {
 		return nil, err
 	}
 
-	cachedEngine = engine
+	cachedEngines[cacheKey] = engine
+	lastEngineName = engine.Name()
 	return engine, nil
 }
 
@@ -94,10 +100,19 @@ func CloseCachedEngine() {
 	cachedEngineMu.Lock()
 	defer cachedEngineMu.Unlock()
 
-	if cachedEngine != nil {
-		cachedEngine.Close()
-		cachedEngine = nil
+	for key, engine := range cachedEngines {
+		if engine != nil {
+			engine.Close()
+		}
+		delete(cachedEngines, key)
 	}
+	lastEngineName = ""
+}
+
+func CachedEngineName() string {
+	cachedEngineMu.Lock()
+	defer cachedEngineMu.Unlock()
+	return lastEngineName
 }
 
 // NewJSEngine creates a new JS engine based on the engine type

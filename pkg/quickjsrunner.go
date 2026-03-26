@@ -3,7 +3,6 @@ package ytx
 import (
 	"encoding/base64"
 	"fmt"
-	"regexp"
 	"sync"
 	"time"
 
@@ -12,9 +11,6 @@ import (
 
 // Compile-time interface check
 var _ JSEngine = (*QuickJSRunner)(nil)
-
-// iifeEndPattern matches the closing })(_yt_player); at the end of player.js
-var iifeEndPattern = regexp.MustCompile(`\}\)\(_yt_player\);\s*$`)
 
 // QuickJSRunner executes n-parameter transforms via embedded QuickJS, implementing JSEngine.
 type QuickJSRunner struct {
@@ -111,12 +107,8 @@ func (r *QuickJSRunner) injectAtobBtoa() error {
 }
 
 func (r *QuickJSRunner) loadPlayerJS(playerJS []byte, funcName string) error {
-	code := string(playerJS)
-
-	exposed := fmt.Sprintf("_exposed['%s']=%s;})(_yt_player);", funcName, funcName)
-	modifiedCode := iifeEndPattern.ReplaceAllString(code, exposed)
-
-	val := r.ctx.Eval(modifiedCode, quickjs.EvalFlagGlobal(true))
+	_ = funcName
+	val := r.ctx.Eval(string(playerJS), quickjs.EvalFlagGlobal(true))
 	if r.ctx.HasException() {
 		exc := r.ctx.Exception()
 		val.Free()
