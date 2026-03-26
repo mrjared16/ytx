@@ -306,6 +306,17 @@ cache-warm: build-fast
 	@echo "Cache warmed:"
 	@ls -lh $(CACHE_DIR)/ 2>/dev/null || echo "  Error warming cache"
 
+## cache-refresh: Force refresh current player.js/cipher cache and print fingerprint
+.PHONY: cache-refresh
+cache-refresh: build-fast
+	@echo "Refreshing cache for $(TEST_VIDEO)..."
+	@./$(BINARY_NAME) cache refresh $(TEST_VIDEO)
+
+## cache-show: Print cached player metadata/fingerprint
+.PHONY: cache-show
+cache-show: build-fast
+	@./$(BINARY_NAME) cache info
+
 # =============================================================================
 # ANALYSIS & DEBUGGING
 # =============================================================================

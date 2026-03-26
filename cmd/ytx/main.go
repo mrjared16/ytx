@@ -21,6 +21,8 @@ Usage:
     ytx music VIDEO_ID [options]           Extract 256kbps audio URL
     ytx music --bulk ID1,ID2,... [options] Bulk extract (NDJSON output)
     ytx cache purge                        Clear all cached data
+    ytx cache info                         Show cached player metadata
+    ytx cache refresh VIDEO_ID             Refresh player.js/cipher cache now
 
 Modes:
     video   Fast extraction using ANDROID_VR client (no auth needed)
@@ -30,7 +32,9 @@ Modes:
             Requires Premium account cookies
 
     cache   Cache management commands
-            purge - Remove all cached cipher and player.js data
+            purge   - Remove all cached cipher and player.js data
+            info    - Show cached player path/fingerprint metadata
+            refresh - Re-fetch player.js/cipher cache for a video ID
 
 Options:
     --subs              Include subtitles in output (video mode only)
@@ -55,6 +59,8 @@ Examples:
     ytx video hbl2Cuw75oE --sub-langs ja,ko
     ytx music hbl2Cuw75oE --cookies ~/cookies.txt
     ytx cache purge
+    ytx cache info
+    ytx cache refresh dQw4w9WgXcQ
 `
 
 func main() {
@@ -306,7 +312,7 @@ func contains(s string, substrs ...string) bool {
 
 func handleCacheCommand() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: ytx cache purge")
+		fmt.Fprintln(os.Stderr, "Usage: ytx cache purge|info|refresh VIDEO_ID")
 		os.Exit(1)
 	}
 
@@ -318,9 +324,34 @@ func handleCacheCommand() {
 		}
 		cacheDir, _ := ytxpkg.GetCacheDir()
 		fmt.Printf("Cache purged: %s\n", cacheDir)
+	case "info":
+		info, err := ytxpkg.GetCacheInfo()
+		if err != nil {
+			printError("CACHE_ERROR", err.Error(), "")
+			os.Exit(1)
+		}
+		output, _ := json.Marshal(info)
+		fmt.Println(string(output))
+	case "refresh":
+		if len(os.Args) < 4 {
+			printError("MISSING_VIDEO_ID", "Usage: ytx cache refresh VIDEO_ID", "")
+			os.Exit(1)
+		}
+		videoID := ytxpkg.ExtractVideoID(os.Args[3])
+		info, warnings, err := ytxpkg.RefreshPlayerCache(videoID)
+		if err != nil {
+			printError("CACHE_ERROR", err.Error(), "")
+			os.Exit(1)
+		}
+		payload := map[string]any{"cache": info}
+		if len(warnings) > 0 {
+			payload["warnings"] = warnings
+		}
+		output, _ := json.Marshal(payload)
+		fmt.Println(string(output))
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown cache command: %s\n", os.Args[2])
-		fmt.Fprintln(os.Stderr, "Usage: ytx cache purge")
+		fmt.Fprintln(os.Stderr, "Usage: ytx cache purge|info|refresh VIDEO_ID")
 		os.Exit(1)
 	}
 }

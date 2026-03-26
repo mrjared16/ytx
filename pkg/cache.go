@@ -3,6 +3,7 @@ package ytx
 import (
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,10 +21,12 @@ type CipherCache struct {
 	Version            int       `json:"version"`
 	CreatedAt          time.Time `json:"created_at"`
 	ExpiresAt          time.Time `json:"expires_at"`
-	PlayerURL          string    `json:"player_url"`  // e.g., /s/player/xxx/base.js
+	PlayerURL          string    `json:"player_url"` // e.g., /s/player/xxx/base.js
+	PlayerFingerprint  string    `json:"player_fingerprint,omitempty"`
 	BaseJSPath         string    `json:"basejs_path"` // Cached base.js path for fast refresh
 	SigFunction        string    `json:"sig_function"`
 	SigParam           int       `json:"sig_param"`
+	SigUsesURLWrapper  bool      `json:"sig_uses_url_wrapper,omitempty"`
 	NFunction          string    `json:"n_function"`
 	SignatureTimestamp int       `json:"signature_timestamp"` // STS for API requests
 	JSCode             string    `json:"js_code"`
@@ -32,6 +35,23 @@ type CipherCache struct {
 // CacheManager handles persistent cipher caching
 type CacheManager struct {
 	cacheDir string
+}
+
+type CacheInfo struct {
+	CacheDir           string    `json:"cache_dir"`
+	CachePath          string    `json:"cache_path"`
+	PlayerCachePath    string    `json:"player_cache_path"`
+	Valid              bool      `json:"valid"`
+	PlayerURL          string    `json:"player_url,omitempty"`
+	BaseJSPath         string    `json:"basejs_path,omitempty"`
+	PlayerFingerprint  string    `json:"player_fingerprint,omitempty"`
+	SigFunction        string    `json:"sig_function,omitempty"`
+	NFunction          string    `json:"n_function,omitempty"`
+	SignatureTimestamp int       `json:"signature_timestamp,omitempty"`
+	HasPlayerJS        bool      `json:"has_player_js"`
+	HasExtractedSig    bool      `json:"has_extracted_sig"`
+	CreatedAt          time.Time `json:"created_at,omitempty"`
+	ExpiresAt          time.Time `json:"expires_at,omitempty"`
 }
 
 // NewCacheManager creates a cache manager using XDG cache directory
@@ -103,7 +123,7 @@ func (cm *CacheManager) Invalidate() error {
 
 // currentCacheVersion is the current cache format version
 // Increment when cache structure changes to invalidate old caches
-const currentCacheVersion = 2
+const currentCacheVersion = 5
 
 // IsValid checks if a cache entry is still valid (not expired and correct version)
 func (cm *CacheManager) IsValid(cache *CipherCache) bool {
@@ -159,7 +179,6 @@ func (cm *CacheManager) LoadPlayerJS() ([]byte, error) {
 	return io.ReadAll(gzr)
 }
 
-// Purge removes all cache files (cipher.json and player.js.gz)
 func (cm *CacheManager) Purge() error {
 	var lastErr error
 
@@ -197,4 +216,76 @@ func GetCacheDir() (string, error) {
 		return "", err
 	}
 	return cm.CacheDir(), nil
+}
+
+func GetCacheInfo() (*CacheInfo, error) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		return nil, err
+	}
+
+	info := &CacheInfo{
+		CacheDir:        cm.CacheDir(),
+		CachePath:       cm.CachePath(),
+		PlayerCachePath: cm.PlayerCachePath(),
+	}
+
+	cache, err := cm.Load()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return info, nil
+		}
+		return nil, err
+	}
+
+	info.Valid = cm.IsValid(cache)
+	info.PlayerURL = cache.PlayerURL
+	info.BaseJSPath = cache.BaseJSPath
+	info.PlayerFingerprint = cache.PlayerFingerprint
+	info.SigFunction = cache.SigFunction
+	info.NFunction = cache.NFunction
+	info.SignatureTimestamp = cache.SignatureTimestamp
+	info.HasExtractedSig = cache.JSCode != ""
+	info.CreatedAt = cache.CreatedAt
+	info.ExpiresAt = cache.ExpiresAt
+	if _, err := os.Stat(cm.PlayerCachePath()); err == nil {
+		info.HasPlayerJS = true
+	}
+
+	return info, nil
+}
+
+func RefreshPlayerCache(videoID string) (*CacheInfo, []string, error) {
+	if len(videoID) != 11 {
+		return nil, nil, fmt.Errorf("invalid video ID: %s", videoID)
+	}
+
+	CloseCachedEngine()
+	cipherCache.Lock()
+	cipherCache.cipher = nil
+	cipherCache.expiry = time.Time{}
+	cipherCache.Unlock()
+
+	ext, err := NewExtractor(ModeVideo, "")
+	if err != nil {
+		return nil, nil, err
+	}
+	if ext.cacheManager == nil {
+		return nil, nil, fmt.Errorf("cache manager unavailable")
+	}
+	_ = ext.cacheManager.Purge()
+
+	cipher, err := ext.fetchAndCacheCipher(videoID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cipher.ensureSignatureReady(); err == nil {
+		ext.cipher = cipher
+		ext.persistCipherArtifacts()
+	}
+	info, err := GetCacheInfo()
+	if err != nil {
+		return nil, cipher.Warnings(), err
+	}
+	return info, cipher.Warnings(), nil
 }
