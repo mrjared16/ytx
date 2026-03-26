@@ -103,6 +103,13 @@ BINARY_NAME := ytx
 PKG := github.com/mrjared16/ytx
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
+LOCAL_GOOS := $(shell go env GOOS)
+LOCAL_GOARCH := $(shell go env GOARCH)
+ifeq ($(LOCAL_GOOS),windows)
+RELEASE_EXT := .exe
+else
+RELEASE_EXT :=
+endif
 
 # Build flags for optimization
 # -s: Omit symbol table (smaller binary, ~15% reduction)
@@ -144,7 +151,7 @@ build:
 ##   WHY: Smaller binary, faster execution, no debug overhead
 ##   -trimpath: Removes local file paths from binary (reproducible builds)
 ##   -ldflags "-s -w": Strips symbols and debug info
-##   CGO_ENABLED=0: Pure Go binary, no C dependencies
+##   CGO_ENABLED=1: Required for embedded QuickJS support
 .PHONY: build-release
 build-release:
 	@echo "Building $(BINARY_NAME) (release)..."
@@ -401,15 +408,11 @@ uninstall:
 # RELEASE
 # =============================================================================
 
-## release: Build release binaries for all platforms
+## release: Build release binary for current local platform
 .PHONY: release
 release: clean
 	@mkdir -p release
-	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o release/$(BINARY_NAME)-linux-amd64 ./cmd/ytx
-	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o release/$(BINARY_NAME)-linux-arm64 ./cmd/ytx
-	GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o release/$(BINARY_NAME)-darwin-amd64 ./cmd/ytx
-	GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o release/$(BINARY_NAME)-darwin-arm64 ./cmd/ytx
-	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o release/$(BINARY_NAME)-windows-amd64.exe ./cmd/ytx
+	CGO_ENABLED=1 GOOS=$(LOCAL_GOOS) GOARCH=$(LOCAL_GOARCH) go build -trimpath -ldflags "$(LDFLAGS)" -o release/$(BINARY_NAME)-$(LOCAL_GOOS)-$(LOCAL_GOARCH)$(RELEASE_EXT) ./cmd/ytx
 	@ls -lh release/
 
 # =============================================================================
