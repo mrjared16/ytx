@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"regexp"
@@ -29,11 +30,39 @@ import (
 type Cipher struct {
 	sigFunctionName    string
 	sigParam           int
+	sigUsesURLWrapper  bool
 	nFunctionName      string
 	signatureTimestamp int    // STS from player.js, needed for API requests
 	jsCode             string // Self-contained JS with function + dependencies
+	nRuntimeJS         []byte // Prepared player runtime with exposed n-function
 	playerURL          string // Player JS URL (for cache versioning)
+	playerFingerprint  string
 	playerJS           []byte // Full player JS for n-function extraction
+	warnings           []string
+	lazyMu             sync.Mutex
+
+	// Cached QuickJS wrapper runtime — reused for both sig and n calls.
+	// Instead of creating a fresh runtime per call (~540ms each for 2.7MB eval),
+	// we bootstrap once and call the wrapper function multiple times.
+	wrapperRT     *quickjs.Runtime
+	wrapperCtx    *quickjs.Context
+	wrapperReady  bool
+	wrapperJSCode string // the jsCode used to bootstrap this context
+}
+
+// Close releases cached QuickJS resources. Call when the Cipher is no longer needed.
+func (c *Cipher) Close() {
+	c.lazyMu.Lock()
+	defer c.lazyMu.Unlock()
+	if c.wrapperCtx != nil {
+		c.wrapperCtx.Close()
+		c.wrapperCtx = nil
+	}
+	if c.wrapperRT != nil {
+		c.wrapperRT.Close()
+		c.wrapperRT = nil
+	}
+	c.wrapperReady = false
 }
 
 // NFunctionName returns the n-function name (for debugging)
@@ -44,6 +73,17 @@ func (c *Cipher) PlayerJSLen() int { return len(c.playerJS) }
 
 // SignatureTimestamp returns the STS value needed for API requests
 func (c *Cipher) SignatureTimestamp() int { return c.signatureTimestamp }
+
+func (c *Cipher) PlayerFingerprint() string { return c.playerFingerprint }
+
+func (c *Cipher) Warnings() []string {
+	if len(c.warnings) == 0 {
+		return nil
+	}
+	out := make([]string, len(c.warnings))
+	copy(out, c.warnings)
+	return out
+}
 
 // Base.js URL pattern
 var basejsPattern = regexp.MustCompile(`/s/player/[\w-]+/[\w./-]+/base\.js`)
@@ -56,7 +96,58 @@ var extractDefinitionPatternTemplates = []string{
 	`(?m)(^|[;{}])\s*(%s\s*=)`,
 }
 
+type sigFunctionPattern struct {
+	regex    *regexp.Regexp
+	sigIdx   int
+	paramIdx int
+}
+
+var sigFunctionPatterns = []sigFunctionPattern{
+	{
+		regex:    regexp.MustCompile(`(?:\b|[^a-zA-Z0-9_$])([a-zA-Z0-9_$]{2,})\s*=\s*function\(\s*a\s*\)\s*{\s*a\s*=\s*a\.split\(\s*""\s*\)(?:;[a-zA-Z0-9_$]{2}\.[a-zA-Z0-9_$]{2}\(a,\d+\))?`),
+		sigIdx:   1,
+		paramIdx: 0,
+	},
+	{
+		regex:    regexp.MustCompile(`\b[a-zA-Z0-9_$]+\s*&&\s*\(\s*[a-zA-Z0-9_$]+\s*=\s*([a-zA-Z0-9_$]{2,})\(\s*(?:(\d+)\s*,\s*)?decodeURIComponent\(\s*[a-zA-Z0-9_$]+\s*\)\s*\)`),
+		sigIdx:   1,
+		paramIdx: 2,
+	},
+	{
+		regex:    regexp.MustCompile(`\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(`),
+		sigIdx:   1,
+		paramIdx: 0,
+	},
+	{
+		regex:    regexp.MustCompile(`\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+\s*,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(`),
+		sigIdx:   1,
+		paramIdx: 0,
+	},
+	{
+		regex:    regexp.MustCompile(`\bm=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(h\.s\)\)`),
+		sigIdx:   1,
+		paramIdx: 0,
+	},
+	{
+		regex:    regexp.MustCompile(`["']signature["']\s*,\s*([a-zA-Z0-9$]+)\(`),
+		sigIdx:   1,
+		paramIdx: 0,
+	},
+	{
+		regex:    regexp.MustCompile(`\.sig\|\|([a-zA-Z0-9$]+)\(`),
+		sigIdx:   1,
+		paramIdx: 0,
+	},
+	{
+		regex:    regexp.MustCompile(`\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*([a-zA-Z0-9$]+)\(`),
+		sigIdx:   1,
+		paramIdx: 0,
+	},
+}
+
 var extractDefinitionPatternCache sync.Map
+
+var nRuntimeExposePattern = regexp.MustCompile(`\}\)\(_yt_player\);\s*$`)
 
 // NewCipherWithCachedPath creates a new cipher, optionally using a cached base.js path
 // If cachedPath is provided and valid, skips the embed page fetch (~150ms savings)
@@ -65,13 +156,10 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	var playerPath string
 	var playerJS []byte
 	var err error
+	warnings := make([]string, 0, 2)
 
-	// For player.js, prefer the provided baseURL (for connection reuse with music.youtube.com)
-	// But for embed page, always use youtube.com (music.youtube.com/embed doesn't work)
-	playerBaseURL := baseURL
-	if playerBaseURL == "" {
-		playerBaseURL = PlayerJSURLBase
-	}
+	_ = baseURL
+	playerBaseURL := PlayerJSURLBase
 
 	// Determine engine type for pre-spawning
 	engineType := GetEngineType()
@@ -101,62 +189,64 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 		playerJS, err = httpGetBytes(httpClient, playerURL)
 		if err == nil {
 			playerPath = cachedPath
+		} else {
+			warnings = append(warnings, fmt.Sprintf("cached player path %s failed, falling back to discovery: %v", cachedPath, err))
 		}
 		// If cached path fails, fall through to embed page fetch
 	}
 
-	// Fallback: fetch embed page to find current base.js URL
-	// Always use youtube.com for embed page (music.youtube.com/embed doesn't work)
 	if playerPath == "" {
-		embedURL := fmt.Sprintf("%s/embed/%s?hl=en", PlayerJSURLBase, videoID)
-		embedBody, err := httpGetBytes(httpClient, embedURL)
+		playerPath, playerJS, err = fetchPlayerJS(videoID, httpClient, playerBaseURL)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to fetch embed page: %w", err)
-		}
-
-		playerPath = basejsPattern.FindString(string(embedBody))
-		if playerPath == "" {
-			return nil, "", errors.New("unable to find base.js URL in embed page")
-		}
-
-		// Use playerBaseURL for the actual player.js fetch (connection reuse)
-		playerURL := playerBaseURL + playerPath
-		playerJS, err = httpGetBytes(httpClient, playerURL)
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to fetch player JS: %w", err)
+			return nil, "", err
 		}
 	}
 
-	// Find signature function name and param
 	sigName, sigParam, err := findSigFunctionName(playerJS)
+	sigUsesURLWrapper := false
 	if err != nil {
-		return nil, "", err
+		if cachedPath != "" && playerPath == cachedPath {
+			playerPath, playerJS, err = fetchPlayerJS(videoID, httpClient, playerBaseURL)
+			if err != nil {
+				return nil, "", err
+			}
+			sigName, sigParam, err = findSigFunctionName(playerJS)
+		}
 	}
-
-	// Extract sig function and dependencies using AST
-	jsCode, err := extractWithAST(string(playerJS), sigName)
 	if err != nil {
-		// Fallback to simple extraction if AST fails
-		jsCode, err = extractSimple(playerJS, sigName)
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to extract sig function: %w", err)
+		if wrapperName := findURLTransformFunctionName(playerJS); wrapperName != "" {
+			sigName = wrapperName
+			sigParam = 0
+			sigUsesURLWrapper = true
+			err = nil
 		}
 	}
 
 	// Find n-function name (we don't need the body, playerJS is used directly)
 	nName := findNFunctionName(playerJS)
+	if sigName == "" && nName == "" {
+		if err != nil {
+			return nil, "", err
+		}
+		return nil, "", errors.New("failed to detect signature and n transform functions")
+	}
 
 	// Extract signatureTimestamp (STS) from player.js
 	sts := findSignatureTimestamp(playerJS)
+	fingerprint := computePlayerFingerprint(playerJS)
+	nRuntimeJS := buildNTransformRuntime(playerJS, nName)
 
 	return &Cipher{
 		sigFunctionName:    sigName,
 		sigParam:           sigParam,
+		sigUsesURLWrapper:  sigUsesURLWrapper,
 		nFunctionName:      nName,
 		signatureTimestamp: sts,
-		jsCode:             jsCode,
+		nRuntimeJS:         nRuntimeJS,
 		playerURL:          playerPath,
+		playerFingerprint:  fingerprint,
 		playerJS:           playerJS,
+		warnings:           warnings,
 	}, playerPath, nil
 }
 
@@ -165,10 +255,12 @@ func NewCipherFromCache(cache *CipherCache) *Cipher {
 	return &Cipher{
 		sigFunctionName:    cache.SigFunction,
 		sigParam:           cache.SigParam,
+		sigUsesURLWrapper:  cache.SigUsesURLWrapper,
 		nFunctionName:      cache.NFunction,
 		signatureTimestamp: cache.SignatureTimestamp,
 		jsCode:             cache.JSCode,
 		playerURL:          cache.PlayerURL,
+		playerFingerprint:  cache.PlayerFingerprint,
 	}
 }
 
@@ -180,12 +272,52 @@ func (c *Cipher) ToCache() *CipherCache {
 		CreatedAt:          now,
 		ExpiresAt:          now.Add(cacheTTL),
 		PlayerURL:          c.playerURL,
+		PlayerFingerprint:  c.playerFingerprint,
 		SigFunction:        c.sigFunctionName,
 		SigParam:           c.sigParam,
+		SigUsesURLWrapper:  c.sigUsesURLWrapper,
 		NFunction:          c.nFunctionName,
 		SignatureTimestamp: c.signatureTimestamp,
 		JSCode:             c.jsCode,
 	}
+}
+
+func (c *Cipher) ensureSignatureReady() error {
+	if c.sigFunctionName == "" {
+		return errors.New("signature decryption function unavailable in current player JS")
+	}
+	if c.jsCode != "" {
+		return nil
+	}
+
+	c.lazyMu.Lock()
+	defer c.lazyMu.Unlock()
+
+	if c.jsCode != "" {
+		return nil
+	}
+	if len(c.playerJS) == 0 {
+		return errors.New("no player.js available for signature decryption")
+	}
+
+	if c.sigUsesURLWrapper {
+		c.jsCode = buildWrapperRuntimeJS(string(c.playerJS), c.sigFunctionName)
+		if c.jsCode == "" {
+			c.jsCode = string(c.playerJS)
+		}
+		return nil
+	}
+
+	jsCode, err := extractWithAST(string(c.playerJS), c.sigFunctionName)
+	if err != nil {
+		jsCode, err = extractSimple(c.playerJS, c.sigFunctionName)
+		if err != nil {
+			return fmt.Errorf("failed to extract sig function: %w", err)
+		}
+	}
+
+	c.jsCode = jsCode
+	return nil
 }
 
 // segment represents a top-level statement in player.js.
@@ -424,6 +556,49 @@ func emitCodeFromIndex(segIDs []int, idx *definitionIndex, jsCode string) string
 	return buf.String()
 }
 
+func buildWrapperRuntimeJS(jsCode, functionName string) string {
+	if jsCode == "" || functionName == "" {
+		return ""
+	}
+
+	quotedName := regexp.QuoteMeta(functionName)
+	replacements := []struct {
+		pattern *regexp.Regexp
+		replace string
+	}{
+		{
+			pattern: regexp.MustCompile(`\bvar\s+` + quotedName + `\s*=\s*function\s*\(`),
+			replace: `var ` + functionName + `=globalThis["` + functionName + `"]=function(`,
+		},
+		{
+			pattern: regexp.MustCompile(`\blet\s+` + quotedName + `\s*=\s*function\s*\(`),
+			replace: `let ` + functionName + `=globalThis["` + functionName + `"]=function(`,
+		},
+		{
+			pattern: regexp.MustCompile(`\bconst\s+` + quotedName + `\s*=\s*function\s*\(`),
+			replace: `const ` + functionName + `=globalThis["` + functionName + `"]=function(`,
+		},
+		{
+			pattern: regexp.MustCompile(`\b` + quotedName + `\s*=\s*function\s*\(`),
+			replace: `globalThis["` + functionName + `"]=` + functionName + `=function(`,
+		},
+		{
+			pattern: regexp.MustCompile(`function\s+` + quotedName + `\s*\(`),
+			replace: `globalThis["` + functionName + `"]=function ` + functionName + `(`,
+		},
+	}
+
+	for _, candidate := range replacements {
+		loc := candidate.pattern.FindStringIndex(jsCode)
+		if loc == nil {
+			continue
+		}
+		return jsCode[:loc[0]] + candidate.replace + jsCode[loc[1]:]
+	}
+
+	return ""
+}
+
 // extractWithAST uses goja parser to extract a function and its dependencies.
 func extractWithAST(jsCode string, funcName string) (string, error) {
 	program, err := parser.ParseFile(nil, "", jsCode, 0)
@@ -463,8 +638,6 @@ func defaultJSBuiltins() map[string]bool {
 		"JSON": true, "console": true, "undefined": true, "null": true,
 		"true": true, "false": true, "NaN": true, "Infinity": true,
 		"Date": true, "RegExp": true, "Error": true,
-		"a": true, "b": true, "c": true, "d": true, "e": true, "f": true,
-		"g": true, "h": true, "i": true, "j": true,
 	}
 }
 
@@ -707,9 +880,22 @@ this.parent = this;
 this.t = this;
 
 // Attach browser properties to the global object
-this.location = { href: 'https://www.youtube.com/' };
+this.location = {
+    hash: '',
+    host: 'www.youtube.com',
+    hostname: 'www.youtube.com',
+    href: 'https://www.youtube.com/watch?v=ytx',
+    origin: 'https://www.youtube.com',
+    password: '',
+    pathname: '/watch',
+    port: '',
+    protocol: 'https:',
+    search: '?v=ytx',
+    username: ''
+};
 this.document = {
     getElementsByTagName: function() { return []; },
+    querySelector: function() { return null; },
     getElementById: function() { return null; },
     createElement: function(tag) { 
         return { 
@@ -724,11 +910,65 @@ this.document = {
     documentElement: { style: {} },
     body: { appendChild: function() {} },
     head: { appendChild: function() {} },
+    scripts: [{ src: 'https://www.youtube.com/s/player/placeholder/base.js' }],
+    currentScript: { src: 'https://www.youtube.com/s/player/placeholder/base.js' },
     cookie: '',
-    domain: 'youtube.com'
+    domain: 'youtube.com',
+    location: this.location
 };
 this.navigator = { userAgent: 'Mozilla/5.0', platform: 'Win32', language: 'en-US', languages: ['en-US'] };
 this.console = { log: function() {}, warn: function() {}, error: function() {}, info: function() {}, debug: function() {} };
+
+var g = this.g || {};
+this.g = g;
+g.qJ = function(url) {
+    var raw = typeof url === 'string' ? url : '';
+    this.base = raw.split('?')[0] || '';
+    this.params = {};
+    var query = '';
+    var qIdx = raw.indexOf('?');
+    if (qIdx >= 0 && qIdx + 1 < raw.length) {
+        query = raw.slice(qIdx + 1);
+    }
+    if (query) {
+        var pairs = query.split('&');
+        for (var i = 0; i < pairs.length; i++) {
+            if (!pairs[i]) continue;
+            var eq = pairs[i].indexOf('=');
+            if (eq < 0) {
+                this.params[pairs[i]] = '';
+            } else {
+                this.params[pairs[i].slice(0, eq)] = pairs[i].slice(eq + 1);
+            }
+        }
+    }
+};
+g.qJ.prototype.set = function(k, v) {
+    this.params[String(k)] = v == null ? '' : String(v);
+    return this;
+};
+g.qJ.prototype.get = function(k) {
+    var key = String(k);
+    return Object.prototype.hasOwnProperty.call(this.params, key) ? this.params[key] : null;
+};
+g.qJ.prototype.clone = function() {
+    return new g.qJ(this.toString());
+};
+g.qJ.prototype.toString = function() {
+    var out = [];
+    for (var key in this.params) {
+        if (Object.prototype.hasOwnProperty.call(this.params, key)) {
+            out.push(key + '=' + this.params[key]);
+        }
+    }
+    return out.length ? this.base + '?' + out.join('&') : this.base;
+};
+var __qjMethodNames = ['append','update','setParam','add','put','setValue','setQuery'];
+for (var __i = 0; __i < __qjMethodNames.length; __i++) {
+    (function(name){
+        g.qJ.prototype[name] = function(k, v) { return this.set(k, v); };
+    })(__qjMethodNames[__i]);
+}
 
 function setTimeout(fn) { try { fn(); } catch(e) {} return 0; }
 function setInterval() { return 0; }
@@ -771,9 +1011,29 @@ this.crypto = {
 `
 
 func (c *Cipher) DecryptSignature(sig string) (string, error) {
+	if err := c.ensureSignatureReady(); err != nil {
+		return "", err
+	}
+
+	if c.sigUsesURLWrapper {
+		codes := c.wrapperCodeCandidates()
+		var lastErr error
+		for _, wrapperCode := range codes {
+			decrypted, err := c.transformWithURLWrapper(wrapperCode, c.sigFunctionName, sig, "s")
+			if err == nil {
+				return decrypted, nil
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return "", lastErr
+		}
+		return "", errors.New("url wrapper function unavailable in current player JS")
+	}
+
 	rt := quickjs.NewRuntime(
 		quickjs.WithMemoryLimit(256*1024*1024),
-		quickjs.WithMaxStackSize(1024*1024),
+		quickjs.WithMaxStackSize(8*1024*1024),
 	)
 	defer rt.Close()
 	ctx := rt.NewContext()
@@ -836,21 +1096,258 @@ func (c *Cipher) DecryptSignature(sig string) (string, error) {
 // - goja (ES5.1) fails with "ReferenceError: MP is not defined" and lacks ES2020+ support
 func (c *Cipher) TransformN(n string) (string, error) {
 	if c.nFunctionName == "" {
+		if c.sigUsesURLWrapper {
+			var lastErr error
+			for _, wrapperCode := range c.wrapperCodeCandidates() {
+				transformed, wrapperErr := c.transformWithURLWrapper(wrapperCode, c.sigFunctionName, n, "n")
+				if wrapperErr == nil && transformed != "" && transformed != n {
+					return transformed, nil
+				}
+				if wrapperErr != nil {
+					lastErr = wrapperErr
+				}
+			}
+			if len(n) > 1 {
+				return n[1:], nil
+			}
+			return n, lastErr
+		}
 		return n, nil
 	}
 
 	// Need full player.js for the JS runtime
-	if len(c.playerJS) == 0 {
+	if len(c.nRuntimeJS) == 0 {
+		c.nRuntimeJS = buildNTransformRuntime(c.playerJS, c.nFunctionName)
+	}
+	if len(c.nRuntimeJS) == 0 {
 		return n, fmt.Errorf("no player.js available for n-transform")
 	}
 
 	// Use cached engine for efficiency (engine type set via SetEngineType)
-	engine, err := GetCachedEngine(c.playerJS, c.nFunctionName)
+	engine, err := GetCachedEngine(c.engineCacheKey(), c.nRuntimeJS, c.nFunctionName)
 	if err != nil {
+		wrapperName := ""
+		wrapperCodes := []string{}
+		if c.sigUsesURLWrapper && c.sigFunctionName != "" {
+			wrapperName = c.sigFunctionName
+			wrapperCodes = c.wrapperCodeCandidates()
+		} else if candidate := findURLTransformFunctionName(c.playerJS); candidate != "" {
+			wrapperName = candidate
+			wrapperCodes = []string{string(c.playerJS)}
+		}
+
+		if wrapperName != "" {
+			for _, wrapperCode := range wrapperCodes {
+				if wrapperCode == "" {
+					continue
+				}
+				transformed, wrapperErr := c.transformWithURLWrapper(wrapperCode, wrapperName, n, "n")
+				if wrapperErr == nil {
+					return transformed, nil
+				}
+			}
+		}
+
 		return n, err
 	}
 
 	return engine.TransformN(n)
+}
+
+func (c *Cipher) wrapperCodeCandidates() []string {
+	candidates := make([]string, 0, 2)
+	seen := map[string]struct{}{}
+	add := func(code string) {
+		if code == "" {
+			return
+		}
+		if _, ok := seen[code]; ok {
+			return
+		}
+		seen[code] = struct{}{}
+		candidates = append(candidates, code)
+	}
+
+	add(c.jsCode)
+	if len(c.playerJS) > 0 {
+		add(string(c.playerJS))
+	}
+
+	return candidates
+}
+
+// ensureWrapperContext bootstraps a QuickJS runtime with the given jsCode,
+// caching it for reuse across multiple wrapper calls (sig + n).
+// This avoids the ~540ms cost of eval'ing 2.7MB player.js on each call.
+func (c *Cipher) ensureWrapperContext(jsCode string) (*quickjs.Context, error) {
+	// Fast path: context already bootstrapped with the same code
+	if c.wrapperReady && c.wrapperJSCode == jsCode && c.wrapperCtx != nil {
+		return c.wrapperCtx, nil
+	}
+
+	// Close any stale context
+	if c.wrapperCtx != nil {
+		c.wrapperCtx.Close()
+		c.wrapperCtx = nil
+	}
+	if c.wrapperRT != nil {
+		c.wrapperRT.Close()
+		c.wrapperRT = nil
+	}
+	c.wrapperReady = false
+
+	rt := quickjs.NewRuntime(
+		quickjs.WithMemoryLimit(256*1024*1024),
+		quickjs.WithMaxStackSize(8*1024*1024),
+	)
+	ctx := rt.NewContext()
+
+	stubsVal := ctx.Eval(browserStubsJS, quickjs.EvalFlagGlobal(true))
+	if ctx.HasException() {
+		exc := ctx.Exception()
+		stubsVal.Free()
+		ctx.Close()
+		rt.Close()
+		return nil, fmt.Errorf("failed to inject browser stubs: %v", exc)
+	}
+	stubsVal.Free()
+
+	val := ctx.Eval(jsCode, quickjs.EvalFlagGlobal(true))
+	if ctx.HasException() {
+		exc := ctx.Exception()
+		val.Free()
+		ctx.Close()
+		rt.Close()
+		return nil, fmt.Errorf("failed to load JS: %v", exc)
+	}
+	val.Free()
+
+	c.wrapperRT = rt
+	c.wrapperCtx = ctx
+	c.wrapperReady = true
+	c.wrapperJSCode = jsCode
+	return ctx, nil
+}
+
+func (c *Cipher) transformWithURLWrapper(jsCode, functionName, value, field string) (string, error) {
+	if functionName == "" || jsCode == "" {
+		return "", errors.New("url wrapper function unavailable in current player JS")
+	}
+
+	var script string
+	escapedName := escapeJSString(functionName)
+	escapedValue := escapeJSString(value)
+	if field == "s" {
+		script = fmt.Sprintf(`(function(){
+if(typeof g==='undefined'){var g={};}
+if(typeof g.qJ!=='function'){
+  if(typeof qJ==='function'){g.qJ=qJ;}
+  else if(typeof globalThis.qJ==='function'){g.qJ=globalThis.qJ;}
+}
+var __fn=null;
+try{
+  if(typeof %s==='function'){
+    __fn=%s;
+  }
+}catch(e){}
+if(typeof globalThis['%s']==='function'){
+  __fn=globalThis['%s'];
+}else{
+  for(var __gk in globalThis){
+    try{
+      var __gv=globalThis[__gk];
+      if(__gv&&typeof __gv==='object'&&typeof __gv['%s']==='function'){
+        __fn=__gv['%s'];
+        break;
+      }
+    }catch(e){}
+  }
+}
+if(typeof __fn!=='function')throw new Error('wrapper function not found: %s');
+var __u=__fn('https://www.youtube.com/watch?v=ytx','s',encodeURIComponent('%s'));
+if(!__u||typeof __u.get!=='function')return '';
+var __p=Object.getPrototypeOf(__u)||{};
+var __keys=Object.keys(__p).concat(Object.getOwnPropertyNames(__p));
+for(var __i=0;__i<__keys.length;__i++){
+  var __k=__keys[__i];
+  if(__k==='constructor'||__k==='set'||__k==='get'||__k==='clone')continue;
+  try{if(typeof __u[__k]==='function'){__u[__k]();break;}}catch(e){}
+}
+var __s=__u.get('s');
+return __s?decodeURIComponent(__s):'';
+})()`, functionName, functionName, escapedName, escapedName, escapedName, escapedName, escapedName, escapedValue)
+	} else {
+		script = fmt.Sprintf(`(function(){
+if(typeof g==='undefined'){var g={};}
+if(typeof g.qJ!=='function'){
+  if(typeof qJ==='function'){g.qJ=qJ;}
+  else if(typeof globalThis.qJ==='function'){g.qJ=globalThis.qJ;}
+}
+var __fn=null;
+try{
+  if(typeof %s==='function'){
+    __fn=%s;
+  }
+}catch(e){}
+if(typeof globalThis['%s']==='function'){
+  __fn=globalThis['%s'];
+}else{
+  for(var __gk in globalThis){
+    try{
+      var __gv=globalThis[__gk];
+      if(__gv&&typeof __gv==='object'&&typeof __gv['%s']==='function'){
+        __fn=__gv['%s'];
+        break;
+      }
+    }catch(e){}
+  }
+}
+if(typeof __fn!=='function')return '%s';
+var __u=__fn('https://www.youtube.com/watch?v=ytx','s',undefined);
+if(!__u||typeof __u.set!=='function'||typeof __u.get!=='function')return '%s';
+__u.set('n','%s');
+var __p=Object.getPrototypeOf(__u)||{};
+var __keys=Object.keys(__p).concat(Object.getOwnPropertyNames(__p));
+for(var __i=0;__i<__keys.length;__i++){
+  var __k=__keys[__i];
+  if(__k==='constructor'||__k==='set'||__k==='get'||__k==='clone')continue;
+  try{if(typeof __u[__k]==='function'){__u[__k]();break;}}catch(e){}
+}
+var __n=__u.get('n');
+return __n||'%s';
+})()`, functionName, functionName, escapedName, escapedName, escapedName, escapedName, escapedValue, escapedValue, escapedValue, escapedValue)
+	}
+
+	c.lazyMu.Lock()
+	defer c.lazyMu.Unlock()
+	ctx, err := c.ensureWrapperContext(jsCode)
+	if err != nil {
+		return "", err
+	}
+
+	result := ctx.Eval(script, quickjs.EvalFlagGlobal(true))
+	if ctx.HasException() {
+		exc := ctx.Exception()
+		result.Free()
+		// Context may be corrupted, invalidate it
+		c.wrapperReady = false
+		return "", fmt.Errorf("failed to call url wrapper %s: %v", functionName, exc)
+	}
+
+	if result.IsUndefined() || result.IsNull() {
+		result.Free()
+		if field == "n" {
+			return value, nil
+		}
+		return "", errors.New("url wrapper returned null/undefined")
+	}
+
+	resultStr := result.String()
+	result.Free()
+	if field == "n" && resultStr == "" {
+		return value, nil
+	}
+	return resultStr, nil
 }
 
 // TransformNBatch transforms multiple n-parameters in a single IPC call
@@ -863,7 +1360,10 @@ func (c *Cipher) TransformNBatch(nValues []string) ([]string, error) {
 		return nValues, fmt.Errorf("no player.js available for n-transform")
 	}
 
-	engine, err := GetCachedEngine(c.playerJS, c.nFunctionName)
+	if len(c.nRuntimeJS) == 0 {
+		c.nRuntimeJS = buildNTransformRuntime(c.playerJS, c.nFunctionName)
+	}
+	engine, err := GetCachedEngine(c.engineCacheKey(), c.nRuntimeJS, c.nFunctionName)
 	if err != nil {
 		return nValues, err
 	}
@@ -873,6 +1373,28 @@ func (c *Cipher) TransformNBatch(nValues []string) ([]string, error) {
 
 // findSigFunctionName finds the signature function name and optional param
 func findSigFunctionName(js []byte) (string, int, error) {
+	for _, p := range sigFunctionPatterns {
+		m := p.regex.FindSubmatch(js)
+		if len(m) <= p.sigIdx {
+			continue
+		}
+
+		funcName := strings.TrimSpace(string(m[p.sigIdx]))
+		if !isValidIdentifier(funcName) {
+			continue
+		}
+
+		param := 0
+		if p.paramIdx > 0 && len(m) > p.paramIdx {
+			numStr := strings.TrimSpace(string(m[p.paramIdx]))
+			if isNumericStr(numStr) {
+				param, _ = strconv.Atoi(numStr)
+			}
+		}
+
+		return funcName, param, nil
+	}
+
 	marker := []byte(",decodeURIComponent(")
 	idx := bytes.Index(js, marker)
 
@@ -911,27 +1433,118 @@ func findSigFunctionName(js []byte) (string, int, error) {
 	return "", 0, errors.New("could not find signature function name")
 }
 
-// findNFunctionName finds the n-parameter function name
-func findNFunctionName(js []byte) string {
-	// Pattern from pytubefix: exactly 3-char variable and function names
-	pattern := regexp.MustCompile(`var\s+[a-zA-Z0-9$_]{3}\s*=\s*\[([a-zA-Z0-9$_]{3})\]`)
-	match := pattern.FindSubmatch(js)
-	if len(match) >= 2 {
-		return string(match[1])
+func findURLTransformFunctionName(js []byte) string {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
+		regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
+		regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
+		regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
 	}
 
-	// Fallback pattern for older player.js versions
-	pattern2 := regexp.MustCompile(`\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]{1,3})\[(\d+)\](.+)\|\|([a-zA-Z0-9]{1,3})`)
-	match = pattern2.FindSubmatch(js)
-	if len(match) >= 5 {
-		idx, _ := strconv.Atoi(string(match[2]))
-		if idx == 0 {
-			return string(match[4])
+	invalidPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`\.call\(this\)`),
+		regexp.MustCompile(`\.policy\s*=`),
+	}
+
+	for _, p := range patterns {
+		matches := p.FindAllSubmatchIndex(js, -1)
+		for _, idx := range matches {
+			if len(idx) < 4 {
+				continue
+			}
+			fullMatch := js[idx[0]:idx[1]]
+			name := strings.TrimSpace(string(js[idx[2]:idx[3]]))
+
+			// Skip invalid constructor matches (like Xo)
+			invalid := false
+			for _, invalidP := range invalidPatterns {
+				if invalidP.Match(fullMatch) {
+					invalid = true
+					break
+				}
+			}
+			if invalid {
+				continue
+			}
+
+			if isValidIdentifier(name) {
+				return name
+			}
 		}
-		return string(match[1])
 	}
 
 	return ""
+}
+
+// findNFunctionName finds the n-parameter function name
+func findNFunctionName(js []byte) string {
+	indexPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`\.get\("n"\)\)&&\(b=([a-zA-Z0-9$_]+)\[(\d+)\]`),
+		regexp.MustCompile(`([a-zA-Z0-9$_]+)\[(\d+)\]\(\s*[a-zA-Z0-9$_]+\.get\("n"\)\s*\)`),
+	}
+
+	for _, p := range indexPatterns {
+		matches := p.FindAllSubmatch(js, -1)
+		for _, m := range matches {
+			if len(m) < 3 {
+				continue
+			}
+			arrName := string(m[1])
+			idx, err := strconv.Atoi(string(m[2]))
+			if err != nil {
+				continue
+			}
+			if fn := resolveArrayFunctionName(js, arrName, idx); fn != "" {
+				return fn
+			}
+		}
+	}
+
+	directPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`\bb\s*=\s*([a-zA-Z0-9$_]+)(?:\.call\([^,]+,\s*|\()\s*[a-zA-Z0-9$_]+\.get\("n"\)`),
+	}
+	for _, p := range directPatterns {
+		m := p.FindSubmatch(js)
+		if len(m) < 2 {
+			continue
+		}
+		name := string(m[1])
+		if isValidIdentifier(name) {
+			return name
+		}
+	}
+
+	legacyPattern := regexp.MustCompile(`var\s+[a-zA-Z0-9$_]{2,}\s*=\s*\[([a-zA-Z0-9$_]{2,})\]`)
+	legacy := legacyPattern.FindSubmatch(js)
+	if len(legacy) >= 2 && isValidIdentifier(string(legacy[1])) {
+		return string(legacy[1])
+	}
+
+	return ""
+}
+
+func resolveArrayFunctionName(js []byte, arrName string, idx int) string {
+	if idx < 0 {
+		return ""
+	}
+
+	arrayPattern := regexp.MustCompile(fmt.Sprintf(`(?:var|let|const)\s+%s\s*=\s*\[([^\]]+)\]`, regexp.QuoteMeta(arrName)))
+	match := arrayPattern.FindSubmatch(js)
+	if len(match) < 2 {
+		return ""
+	}
+
+	elements := strings.Split(string(match[1]), ",")
+	if idx >= len(elements) {
+		return ""
+	}
+
+	candidate := strings.TrimSpace(elements[idx])
+	candidate = strings.Trim(candidate, "'\"")
+	if !isValidIdentifier(candidate) {
+		return ""
+	}
+	return candidate
 }
 
 // findSignatureTimestamp extracts the signatureTimestamp (STS) from player.js
@@ -957,9 +1570,15 @@ func findSignatureTimestamp(js []byte) int {
 }
 
 func isValidIdentifier(s string) bool {
-	if len(s) < 1 || len(s) > 10 {
+	if len(s) < 1 || len(s) > 64 {
 		return false
 	}
+
+	switch s {
+	case "function", "return", "var", "let", "const", "if", "for", "while", "do", "switch", "case", "default", "new", "this", "class", "extends", "try", "catch", "finally", "throw", "typeof", "void", "delete", "in", "instanceof", "null", "true", "false", "undefined":
+		return false
+	}
+
 	for i, c := range s {
 		if i == 0 {
 			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$') {
@@ -1006,4 +1625,134 @@ func httpGetBytes(client *http.Client, url string) ([]byte, error) {
 	}
 
 	return io.ReadAll(resp.Body)
+}
+
+func (c *Cipher) engineCacheKey() string {
+	if c.playerURL == "" {
+		return c.playerFingerprint
+	}
+	if c.playerFingerprint == "" {
+		return c.playerURL
+	}
+	return c.playerURL + "#" + c.playerFingerprint
+}
+
+func computePlayerFingerprint(playerJS []byte) string {
+	if len(playerJS) == 0 {
+		return ""
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strconv.Itoa(len(playerJS))))
+	_, _ = h.Write([]byte{0})
+	sample := func(chunk []byte) {
+		if len(chunk) == 0 {
+			return
+		}
+		_, _ = h.Write(chunk)
+		_, _ = h.Write([]byte{0})
+	}
+	const edge = 2048
+	sample(playerJS[:min(len(playerJS), edge)])
+	if len(playerJS) > edge*2 {
+		mid := len(playerJS) / 2
+		start := max(0, mid-edge/2)
+		end := min(len(playerJS), start+edge)
+		sample(playerJS[start:end])
+	}
+	if len(playerJS) > edge {
+		sample(playerJS[max(0, len(playerJS)-edge):])
+	}
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+func buildNTransformRuntime(playerJS []byte, funcName string) []byte {
+	if len(playerJS) == 0 || funcName == "" {
+		return nil
+	}
+	code := string(playerJS)
+	exposed := fmt.Sprintf("_exposed['%s']=%s;})(_yt_player);", funcName, funcName)
+	modified := nRuntimeExposePattern.ReplaceAllString(code, exposed)
+	if modified == code {
+		return nil
+	}
+	return []byte(modified)
+}
+
+func fetchPlayerJS(videoID string, httpClient *http.Client, playerBaseURL string) (string, []byte, error) {
+	pageURLs := []string{
+		fmt.Sprintf("%s/embed/%s?hl=en", PlayerJSURLBase, videoID),
+		fmt.Sprintf("%s/watch?v=%s", PlayerJSURLBase, videoID),
+	}
+
+	var lastErr error
+	for _, pageURL := range pageURLs {
+		body, err := httpGetBytes(httpClient, pageURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		playerPath := preferredPlayerPathFromPage(body)
+		if playerPath == "" {
+			lastErr = fmt.Errorf("unable to find base.js URL in %s", pageURL)
+			continue
+		}
+
+		playerJS, err := httpGetBytes(httpClient, playerBaseURL+playerPath)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to fetch player JS from %s: %w", pageURL, err)
+			continue
+		}
+
+		return playerPath, playerJS, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("unable to fetch player JS")
+	}
+
+	return "", nil, lastErr
+}
+
+func preferredPlayerPathFromPage(body []byte) string {
+	matches := basejsPattern.FindAllString(string(body), -1)
+	if len(matches) == 0 {
+		return ""
+	}
+
+	seen := make(map[string]struct{}, len(matches))
+	paths := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if _, ok := seen[match]; ok {
+			continue
+		}
+		seen[match] = struct{}{}
+		paths = append(paths, match)
+	}
+
+	best := paths[0]
+	bestScore := playerPathPreferenceScore(best)
+	for _, path := range paths[1:] {
+		score := playerPathPreferenceScore(path)
+		if score > bestScore || (score == bestScore && len(path) < len(best)) {
+			best = path
+			bestScore = score
+		}
+	}
+
+	return best
+}
+
+func playerPathPreferenceScore(path string) int {
+	score := 100
+	if strings.Contains(path, "player_embed") {
+		score += 50
+	}
+	if strings.Contains(path, "/embed") {
+		score -= 10
+	}
+	if strings.Contains(path, "player_ias") {
+		score -= 50
+	}
+	return score
 }

@@ -6,7 +6,7 @@ package ytx
 const (
 	// Client identification for YouTube Music Web
 	ClientName    = "WEB_REMIX"
-	ClientVersion = "1.20251216.01.00" // Check music.youtube.com network tab for current version
+	ClientVersion = "1.20260114.03.00" // Check music.youtube.com network tab for current version
 	ClientKey     = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
 
 	// API endpoint
@@ -45,7 +45,7 @@ var PremiumAudioItags = []int{
 // === WEB CLIENT (for fetching visitorData) ===
 const (
 	WEBClientName    = "WEB"
-	WEBClientVersion = "2.20241126.01.00"
+	WEBClientVersion = "2.20260114.08.00"
 	WEBAPIEndpoint   = "https://www.youtube.com/youtubei/v1/player"
 	WEBAPIKey        = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 	WEBUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
