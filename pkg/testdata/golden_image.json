@@ -1,5 +1,5 @@
 {
-  "generated_at": "2025-12-20T19:56:39+07:00",
+  "generated_at": "2026-03-26T20:05:19+07:00",
   "version": 2,
   "results": [
     {
@@ -10,13 +10,13 @@
       "quality_label": "1920x1080",
       "http_status": 200,
       "timings": {
-        "total_extract": "402.443605ms",
-        "url_validation": "21.268228ms",
-        "visitor_data_ms": 272,
-        "player_api_ms": 129,
-        "total_ms": 402
+        "total_extract": "641.582453ms",
+        "url_validation": "1.65859185s",
+        "visitor_data_ms": 280,
+        "player_api_ms": 361,
+        "total_ms": 641
       },
-      "total_duration": "423.748162ms"
+      "total_duration": "2.300208784s"
     },
     {
       "mode": "music",
@@ -27,14 +27,15 @@
       "http_status": 200,
       "n_transformed": true,
       "timings": {
-        "total_extract": "957.487324ms",
-        "url_validation": "7.860022ms",
-        "player_api_ms": 256,
-        "cipher_init_ms": 950,
-        "n_transform_ms": 3,
-        "total_ms": 957
+        "total_extract": "2.338137123s",
+        "url_validation": "584.97771ms",
+        "visitor_data_ms": 438,
+        "player_api_ms": 273,
+        "cipher_init_ms": 37,
+        "n_transform_ms": 1,
+        "total_ms": 2338
       },
-      "total_duration": "965.431247ms"
+      "total_duration": "2.92318995s"
     }
   ]
 }
