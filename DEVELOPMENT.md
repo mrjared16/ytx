@@ -10,9 +10,10 @@ ytx/
 │   ├── client.go      # Client configuration factory (ANDROID_VR vs WEB_MUSIC)
 │   ├── extractor.go   # Core extraction logic (API calls, stream selection)
 │   ├── bulk.go        # Optimized bulk extraction with batch n-transform
-│   ├── cipher.go      # Signature decryption (music mode only)
+│   ├── cipher.go      # Signature/n-transform via QuickJS (wrapper mode)
 │   ├── jsengine.go    # JS engine interface (Bun/Node)
 │   ├── jsrunner.go    # Subprocess-based JS runner (Bun/Node)
+│   ├── quickjsrunner.go # QuickJS-based runner (in-process, no subprocess)
 │   ├── nrunner.mjs    # Node/Bun script for n-transform
 │   ├── auth.go        # SAPISIDHASH authentication for premium access
 │   ├── constants.go   # Client constants, API endpoints, itag priorities
@@ -50,12 +51,16 @@ go build -o ytx ./cmd/ytx
 
 ### Performance Optimizations (Latest)
 
-1. **Pre-warm JS engine during cipher fetch** - Starts Bun subprocess while API call is in flight
-2. **Cache base.js URL path** - Skips embed page fetch on warm starts (~150ms savings)
-3. **Send player.js via file path** - Writes to temp file instead of 1.5MB IPC transfer
-4. **Batch n-transform in bulk mode** - Single IPC call for all n-parameters
-5. **HTTP/2 connection pooling** - Reuses connections for bulk requests
-6. **Global visitorData cache** - 30-minute TTL, shared across extractions
+1. **QuickJS context reuse** — Eval 2.7MB player.js once, reuse for both sig and n calls (~540ms → 2ms per n-transform)
+2. **Two-phase cipher init** — Signal STS early so API call starts before cipher finishes heavy work
+3. **Pre-warm JS engine during cipher fetch** — Starts Bun subprocess while API call is in flight
+4. **Cache base.js URL path** — Skips embed page fetch on warm starts (~150ms savings)
+5. **Send player.js via file path** — Writes to temp file instead of 1.5MB IPC transfer
+6. **Batch n-transform in bulk mode** — Single IPC call for all n-parameters
+7. **HTTP/2 connection pooling** — Reuses connections for bulk requests
+8. **Global visitorData cache** — 30-minute TTL, shared across extractions
+
+See `docs/music-extraction-pipeline.md` for architecture details and optimization roadmap.
 
 ### Profiling
 
@@ -108,12 +113,12 @@ UPDATE_GOLDEN=1 go test -v ./pkg/... -run TestExtractorRegression
 
 ## Performance Benchmarks
 
-| Operation | Cold Start | Warm Start |
-|-----------|------------|------------|
-| Video mode | ~400ms | ~400ms |
-| Music mode | ~900ms | ~400ms |
-| Bulk 5 tracks | ~700ms | ~500ms |
-| n-transform | ~5ms | ~1ms |
+| Operation | Cold Start | Warm (disk) | Warm (memory) |
+|-----------|------------|-------------|---------------|
+| Video mode | ~400ms | ~400ms | ~400ms |
+| Music mode | ~3200ms | ~600-1000ms | ~450ms |
+| Bulk 5 tracks | ~700ms | ~500ms | ~500ms |
+| n-transform (per call) | ~500ms (bootstrap) | ~2ms | ~2ms |
 
 ### Throughput (Bulk Mode)
 - **7+ videos/sec** with warm cache
@@ -269,9 +274,10 @@ rm ~/.cache/ytx/cipher.json
 
 ## Dependencies
 
-- `github.com/dop251/goja` - Pure Go JavaScript interpreter (signature decryption)
+- `github.com/buke/quickjs-go` - QuickJS runtime for wrapper-mode sig/n (ES2020+ required)
+- `github.com/dop251/goja` - Pure Go JavaScript interpreter (legacy sig extraction, AST parsing)
 - `github.com/dop251/goja/parser` - JS AST parsing
 
-### External (for n-transform)
-- `bun` - Preferred JS runtime (faster than Node)
+### External (for n-transform, fallback)
+- `bun` - Preferred JS runtime (fastest subprocess)
 - `node` - Fallback JS runtime
