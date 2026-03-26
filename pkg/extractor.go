@@ -26,30 +26,36 @@ var cipherCache struct {
 // Global visitorData cache (valid for ~30 minutes)
 var visitorDataCache struct {
 	sync.RWMutex
-	data   string
-	expiry time.Time
+	data         string
+	sessionIndex string
+	delegatedSID string
+	isAuth       bool
+	expiry       time.Time
 }
 
 const visitorDataTTL = 30 * time.Minute
 
 // Extractor handles YouTube stream extraction
 type Extractor struct {
-	config        ClientConfig
-	cookies       []*http.Cookie
-	httpClient    *http.Client
-	sapisid       string
-	cipher        *Cipher       // lazy initialized, only for music mode
-	cacheManager  *CacheManager // file-based persistent cache
-	cipherRetried atomic.Bool   // track if we've already retried with fresh cipher
-	visitorData   string        // required since Jan 2025 for all API requests
-	sessionIndex  string        // X-Goog-AuthUser header
-	delegatedSID  string        // X-Goog-PageId header
-	profile       bool          // enable profiling
-	timings       Timings       // profiling timers
-	fetchSubs     bool          // whether to include subtitles in output
-	subLangs      []string      // subtitle languages to fetch (nil = default, empty = all)
-	maxHeight     int           // max video height (0 = no limit)
-	audioFormat   AudioFormat   // preferred audio format (default: AudioFormatWebm)
+	config           ClientConfig
+	cookies          []*http.Cookie
+	httpClient       *http.Client
+	sapisid          string
+	cipher           *Cipher // lazy initialized, only for music mode
+	cipherMu         sync.Mutex
+	cacheManager     *CacheManager // file-based persistent cache
+	cipherRetried    atomic.Bool   // track if we've already retried with fresh cipher
+	visitorData      string        // required since Jan 2025 for all API requests
+	sessionIndex     string        // X-Goog-AuthUser header
+	delegatedSID     string        // X-Goog-PageId header
+	profile          bool          // enable profiling
+	timings          Timings       // profiling timers
+	fetchSubs        bool          // whether to include subtitles in output
+	subLangs         []string      // subtitle languages to fetch (nil = default, empty = all)
+	maxHeight        int           // max video height (0 = no limit)
+	audioFormat      AudioFormat   // preferred audio format (default: AudioFormatWebm)
+	earlySTSOverride int           // STS from early cipher signal (for API overlap)
+	warnings         []string
 }
 
 // defaultSubtitleLangs are fetched when --subs is used without --sub-langs
@@ -96,6 +102,7 @@ func NewExtractor(mode ClientMode, cookieFile string) (*Extractor, error) {
 			return nil, fmt.Errorf("SAPISID cookie not found - ensure you're logged in")
 		}
 		ext.sapisid = sapisid
+
 	}
 
 	return ext, nil
@@ -137,19 +144,26 @@ func (e *Extractor) SetAudioFormat(format AudioFormat) {
 func (e *Extractor) fetchVisitorData(videoID string) error {
 	// Check instance cache first
 	if e.visitorData != "" {
-		return nil
+		if !e.config.NeedsCookies || e.sessionIndex != "" || e.delegatedSID != "" {
+			return nil
+		}
 	}
 
-	// Check global cache (for bulk operations)
+	// Check global cache (for bulk operations and cross-extractor reuse)
 	visitorDataCache.RLock()
 	if visitorDataCache.data != "" && time.Now().Before(visitorDataCache.expiry) {
 		e.visitorData = visitorDataCache.data
+		e.sessionIndex = visitorDataCache.sessionIndex
+		e.delegatedSID = visitorDataCache.delegatedSID
+		isAuth := visitorDataCache.isAuth
 		visitorDataCache.RUnlock()
-		return nil
+		if !e.config.NeedsCookies || isAuth {
+			return nil
+		}
+	} else {
+		visitorDataCache.RUnlock()
 	}
-	visitorDataCache.RUnlock()
 
-	// For music mode, get visitorData from music.youtube.com page
 	if e.config.NeedsCookies {
 		if err := e.fetchMusicVisitorData(videoID); err != nil {
 			return err
@@ -217,6 +231,9 @@ func (e *Extractor) cacheVisitorData() {
 	}
 	visitorDataCache.Lock()
 	visitorDataCache.data = e.visitorData
+	visitorDataCache.sessionIndex = e.sessionIndex
+	visitorDataCache.delegatedSID = e.delegatedSID
+	visitorDataCache.isAuth = e.config.NeedsCookies
 	visitorDataCache.expiry = time.Now().Add(visitorDataTTL)
 	visitorDataCache.Unlock()
 }
@@ -283,6 +300,8 @@ func (e *Extractor) fetchMusicVisitorData(videoID string) error {
 
 // Extract gets the best audio stream URL for a video
 func (e *Extractor) Extract(videoID string) (*Result, error) {
+	e.warnings = nil
+	e.cipherRetried.Store(false) // Allow one retry per extraction
 	var totalStart time.Time
 	if e.profile {
 		totalStart = time.Now()
@@ -295,18 +314,14 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 		err error
 	}
 	type cipherResult struct {
-		cipher *Cipher
-		err    error
+		cipher    *Cipher
+		err       error
+		prewarmMs int64
 	}
 
 	visitorCh := make(chan visitorResult, 1)
 	cipherCh := make(chan cipherResult, 1)
-
-	var visitorStart, cipherPrewarmStart time.Time
-	if e.profile {
-		visitorStart = time.Now()
-		cipherPrewarmStart = time.Now()
-	}
+	stsCh := make(chan int, 1) // early STS for API overlap
 
 	// Fetch visitorData in parallel
 	go func() {
@@ -314,45 +329,90 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 		visitorCh <- visitorResult{err: err}
 	}()
 
-	// Pre-warm cipher cache AND JS engine in parallel (if not already cached)
+	// Pre-fetch cipher with early STS signaling.
+	// STS is signaled as soon as player.js is downloaded so the API call can start
+	// before the full cipher init (pattern detection, wrapper runtime build) completes.
 	go func() {
-		cipher, err := e.getCachedCipher(videoID)
-		// Pre-warm JS engine while API call is in flight (saves ~150ms)
-		if err == nil && len(cipher.playerJS) > 0 && cipher.nFunctionName != "" {
-			_, _ = GetCachedEngine(cipher.playerJS, cipher.nFunctionName)
+		var prewarmStart time.Time
+		if e.profile {
+			prewarmStart = time.Now()
 		}
-		cipherCh <- cipherResult{cipher: cipher, err: err}
+		cipher, err := e.getCachedCipher(videoID)
+		prewarmMs := int64(0)
+		if e.profile {
+			prewarmMs = time.Since(prewarmStart).Milliseconds()
+		}
+		if err == nil && cipher != nil {
+			// Signal STS as soon as cipher is available (even from cache)
+			select {
+			case stsCh <- cipher.SignatureTimestamp():
+			default:
+			}
+
+			// (Removed QuickJS pre-warm here to avoid CGO OS-thread affinity corruption)
+			// ensureSignatureReady() populates jsCode (lazy init)
+			_ = cipher.ensureSignatureReady()
+		} else {
+			select {
+			case stsCh <- 0:
+			default:
+			}
+		}
+		cipherCh <- cipherResult{cipher: cipher, err: err, prewarmMs: prewarmMs}
 	}()
 
 	// Wait for visitorData (required for API call)
+	var visitorWaitStart time.Time
+	if e.profile {
+		visitorWaitStart = time.Now()
+	}
 	visitorRes := <-visitorCh
 	if e.profile {
-		e.timings.VisitorDataMs = time.Since(visitorStart).Milliseconds()
+		e.timings.VisitorDataMs = time.Since(visitorWaitStart).Milliseconds()
 	}
 	if visitorRes.err != nil {
 		// Non-fatal, continue without it
 	}
 
-	// Wait for cipher to get signatureTimestamp (required for premium formats)
-	cipherRes := <-cipherCh
+	// Wait for STS only (not full cipher) — allows API call to start sooner
+	var stsWaitStart time.Time
 	if e.profile {
-		e.timings.CipherInitMs = time.Since(cipherPrewarmStart).Milliseconds()
+		stsWaitStart = time.Now()
 	}
-	if cipherRes.err == nil {
-		e.cipher = cipherRes.cipher
+	sts := <-stsCh
+	if e.profile {
+		e.timings.STSWaitMs = time.Since(stsWaitStart).Milliseconds()
 	}
 
-	// Call innertube API (now with visitorData and signatureTimestamp ready)
+	// Call innertube API with STS (cipher may still be finishing heavy init)
 	var apiStart time.Time
 	if e.profile {
 		apiStart = time.Now()
 	}
+	e.earlySTSOverride = sts
 	playerResp, err := e.callPlayerAPI(videoID)
+	e.earlySTSOverride = 0
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
 	}
 	if e.profile {
 		e.timings.PlayerAPIMs = time.Since(apiStart).Milliseconds()
+	}
+
+	// NOW wait for full cipher (needed for sig/n decryption)
+	var cipherWaitStart time.Time
+	if e.profile {
+		cipherWaitStart = time.Now()
+	}
+	cipherRes := <-cipherCh
+	if e.profile {
+		e.timings.CipherInitMs = time.Since(cipherWaitStart).Milliseconds()
+		e.timings.CipherPrewarmMs = cipherRes.prewarmMs
+	}
+	if cipherRes.err == nil {
+		e.cipherMu.Lock()
+		e.cipher = cipherRes.cipher
+		e.cipherMu.Unlock()
 	}
 
 	// Check playability
@@ -381,14 +441,11 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 		MimeType: stream.MimeType,
 		Title:    playerResp.VideoDetails.Title,
 		Author:   playerResp.VideoDetails.Author,
+		Warnings: e.warningsForResult(),
 	}
 
 	if e.profile {
-		e.timings.TotalMs = time.Since(totalStart).Milliseconds()
-		// Get JS engine name if available
-		if cachedEngine != nil {
-			e.timings.JSEngine = cachedEngine.Name()
-		}
+		e.finalizeProfile(totalStart)
 		result.Timings = &e.timings
 	}
 
@@ -397,6 +454,7 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 
 // ExtractVideo gets video and audio stream URLs (for MPV playback)
 func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
+	e.warnings = nil
 	var totalStart time.Time
 	if e.profile {
 		totalStart = time.Now()
@@ -459,6 +517,7 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 		Height:    video.Height,
 		Title:     playerResp.VideoDetails.Title,
 		Author:    playerResp.VideoDetails.Author,
+		Warnings:  e.warningsForResult(),
 	}
 
 	// Extract subtitles if requested (from same response - zero extra latency)
@@ -471,11 +530,27 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 	}
 
 	if e.profile {
-		e.timings.TotalMs = time.Since(totalStart).Milliseconds()
+		e.finalizeProfile(totalStart)
 		result.Timings = &e.timings
 	}
 
 	return result, nil
+}
+
+func (e *Extractor) finalizeProfile(totalStart time.Time) {
+	e.timings.TotalMs = time.Since(totalStart).Milliseconds()
+	profiled := e.timings.VisitorDataMs +
+		e.timings.STSWaitMs +
+		e.timings.PlayerAPIMs +
+		e.timings.CipherInitMs +
+		e.timings.SigDecryptMs +
+		e.timings.NTransformMs
+	if e.timings.TotalMs > profiled {
+		e.timings.OtherMs = e.timings.TotalMs - profiled
+	}
+	if engineName := CachedEngineName(); engineName != "" {
+		e.timings.JSEngine = engineName
+	}
 }
 
 // callPlayerAPI makes the innertube player API call
@@ -513,9 +588,11 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 		client.VisitorData = e.visitorData
 	}
 
-	// Get signatureTimestamp from cipher if available (required for premium audio)
+	// Get signatureTimestamp from cipher or early override (required for premium audio)
 	var sts int
-	if e.cipher != nil {
+	if e.earlySTSOverride > 0 {
+		sts = e.earlySTSOverride
+	} else if e.cipher != nil {
 		sts = e.cipher.SignatureTimestamp()
 	}
 
@@ -626,21 +703,32 @@ func (e *Extractor) findBestAudioStream(formats []Format) *Format {
 		priorityItags = AudioFormatPriority[AudioFormatWebm]
 	}
 
-	// Try to find premium itags first
-	for _, targetItag := range priorityItags {
-		for i := range audioFormats {
-			if audioFormats[i].Itag == targetItag {
-				return &audioFormats[i]
+	selectPreferred := func(candidates []Format) *Format {
+		for _, targetItag := range priorityItags {
+			for i := range candidates {
+				if candidates[i].Itag == targetItag {
+					return &candidates[i]
+				}
 			}
 		}
+
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].Bitrate > candidates[j].Bitrate
+		})
+		return &candidates[0]
 	}
 
-	// Fallback: sort by bitrate and return highest
-	sort.Slice(audioFormats, func(i, j int) bool {
-		return audioFormats[i].Bitrate > audioFormats[j].Bitrate
-	})
+	var directURLFormats []Format
+	for _, f := range audioFormats {
+		if f.URL != "" {
+			directURLFormats = append(directURLFormats, f)
+		}
+	}
+	if len(directURLFormats) > 0 {
+		return selectPreferred(directURLFormats)
+	}
 
-	return &audioFormats[0]
+	return selectPreferred(audioFormats)
 }
 
 // findBestVideoStream finds the highest quality video stream within maxHeight limit
@@ -710,6 +798,26 @@ func (e *Extractor) getCachedCipher(videoID string) (*Cipher, error) {
 	return e.fetchAndCacheCipher(videoID)
 }
 
+func (e *Extractor) ensureCipher(videoID string) (*Cipher, error) {
+	if e.cipher != nil {
+		return e.cipher, nil
+	}
+
+	e.cipherMu.Lock()
+	defer e.cipherMu.Unlock()
+
+	if e.cipher != nil {
+		return e.cipher, nil
+	}
+
+	cipher, err := e.getCachedCipher(videoID)
+	if err != nil {
+		return nil, err
+	}
+	e.cipher = cipher
+	return cipher, nil
+}
+
 // fetchAndCacheCipher fetches a new cipher and saves to both caches
 func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 	cipherCache.Lock()
@@ -722,9 +830,13 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 
 	// Try to use cached base.js path (saves ~150ms by skipping embed page)
 	var cachedPath string
+	var previousCache *CipherCache
 	if e.cacheManager != nil {
-		if cache, err := e.cacheManager.Load(); err == nil && cache.BaseJSPath != "" {
-			cachedPath = cache.BaseJSPath
+		if cache, err := e.cacheManager.Load(); err == nil {
+			previousCache = cache
+		}
+		if previousCache != nil && previousCache.BaseJSPath != "" {
+			cachedPath = previousCache.BaseJSPath
 		}
 	}
 
@@ -734,6 +846,24 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 	cipher, playerPath, err := NewCipherWithCachedPath(videoID, e.httpClient, cachedPath, e.config.Origin)
 	if err != nil {
 		return nil, err
+	}
+	if previousCache != nil {
+		if previousCache.PlayerFingerprint != "" && cipher.playerFingerprint != "" && previousCache.PlayerFingerprint != cipher.playerFingerprint {
+			cipher.warnings = append(cipher.warnings,
+				fmt.Sprintf("player fingerprint changed from %s to %s; cached player may have been outdated", previousCache.PlayerFingerprint, cipher.playerFingerprint))
+		}
+		if previousCache.BaseJSPath != "" && previousCache.BaseJSPath != playerPath {
+			cipher.warnings = append(cipher.warnings,
+				fmt.Sprintf("player path changed from %s to %s; cache refreshed via slow path", previousCache.BaseJSPath, playerPath))
+		}
+	}
+	e.absorbCipherWarnings(cipher)
+	if cipher.sigFunctionName != "" {
+		if err := cipher.ensureSignatureReady(); err != nil {
+			cipher.warnings = append(cipher.warnings,
+				fmt.Sprintf("failed to precompute signature runtime during cache warmup: %v", err))
+			e.absorbCipherWarnings(cipher)
+		}
 	}
 
 	// Save to in-memory cache
@@ -757,6 +887,9 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 // invalidateCipherCache clears both in-memory and file caches
 func (e *Extractor) invalidateCipherCache() {
 	cipherCache.Lock()
+	if cipherCache.cipher != nil {
+		cipherCache.cipher.Close()
+	}
 	cipherCache.cipher = nil
 	cipherCache.expiry = time.Time{}
 	cipherCache.Unlock()
@@ -770,7 +903,11 @@ func (e *Extractor) invalidateCipherCache() {
 func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error) {
 	// If URL is directly available (pre-signed), use it
 	if stream.URL != "" {
-		return e.unthrottle(videoID, stream.URL)
+		streamURL, err := e.unthrottle(videoID, stream.URL)
+		if err != nil {
+			return "", err
+		}
+		return streamURL, nil
 	}
 
 	// Otherwise, decrypt the signature cipher
@@ -790,19 +927,41 @@ func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error)
 	if sigParam == "" {
 		sigParam = "sig"
 	}
+	if baseURL == "" {
+		return "", fmt.Errorf("signature cipher missing base URL")
+	}
+
+	if sig == "" {
+		streamURL, err := e.unthrottle(videoID, baseURL)
+		if err != nil {
+			return "", err
+		}
+		return streamURL, nil
+	}
 
 	// Initialize cipher if needed (using cache)
-	if e.cipher == nil {
-		e.cipher, err = e.getCachedCipher(videoID)
-		if err != nil {
-			return "", fmt.Errorf("failed to initialize cipher: %w", err)
-		}
+	if _, err := e.ensureCipher(videoID); err != nil {
+		return "", fmt.Errorf("failed to initialize cipher: %w", err)
 	}
 
 	// Decrypt signature with fail-forward retry
+	var sigDecryptStart time.Time
+	if e.profile {
+		sigDecryptStart = time.Now()
+	}
 	decryptedSig, err := e.decryptWithRetry(videoID, sig)
+	if e.profile {
+		e.timings.SigDecryptMs += time.Since(sigDecryptStart).Milliseconds()
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to decrypt signature: %w", err)
+	}
+	// Only persist cache if the first-try succeeded.
+	// If a retry happened, the retry cipher may be from a different player variant
+	// (e.g. player_ias from /watch instead of player_embed from /embed).
+	// Persisting that would poison the disk cache for the next CLI invocation.
+	if !e.cipherRetried.Load() {
+		e.persistCipherArtifacts()
 	}
 
 	// Add decrypted signature to URL
@@ -816,7 +975,54 @@ func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error)
 	parsedURL.RawQuery = query.Encode()
 
 	// Apply n-parameter transformation (throttle bypass)
-	return e.unthrottle(videoID, parsedURL.String())
+	streamURL, err := e.unthrottle(videoID, parsedURL.String())
+	if err != nil {
+		return "", err
+	}
+
+	return streamURL, nil
+}
+
+func (e *Extractor) warningsForResult() []string {
+	if len(e.warnings) == 0 {
+		return nil
+	}
+	out := make([]string, len(e.warnings))
+	copy(out, e.warnings)
+	return out
+}
+
+func (e *Extractor) absorbCipherWarnings(cipher *Cipher) {
+	if cipher == nil {
+		return
+	}
+	for _, warning := range cipher.Warnings() {
+		duplicate := false
+		for _, existing := range e.warnings {
+			if existing == warning {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			e.warnings = append(e.warnings, warning)
+		}
+	}
+}
+
+func (e *Extractor) persistCipherArtifacts() {
+	if e.cacheManager == nil || e.cipher == nil || len(e.cipher.playerJS) == 0 || e.cipher.jsCode == "" {
+		return
+	}
+	cacheData := e.cipher.ToCache()
+	cacheData.BaseJSPath = e.cipher.playerURL
+	_ = e.cacheManager.Save(cacheData)
+	_ = e.cacheManager.SavePlayerJS(e.cipher.playerJS)
+	cipherCache.Lock()
+	defer cipherCache.Unlock()
+	if time.Now().Before(cipherCache.expiry) {
+		cipherCache.cipher = e.cipher
+	}
 }
 
 // decryptWithRetry attempts decryption, retrying once with fresh cipher if it fails
@@ -827,19 +1033,25 @@ func (e *Extractor) decryptWithRetry(videoID, sig string) (string, error) {
 	}
 
 	// Fail-forward: retry once with fresh cipher (atomic to prevent races)
+	e.warnings = append(e.warnings, fmt.Sprintf("sig decrypt failed (will retry): %v [fn=%s jsCodeLen=%d playerJSLen=%d]",
+		err, e.cipher.sigFunctionName, len(e.cipher.jsCode), len(e.cipher.playerJS)))
 	if !e.cipherRetried.Swap(true) {
 		e.invalidateCipherCache()
+		e.cipherMu.Lock()
 		e.cipher = nil
+		e.cipherMu.Unlock()
 
 		// Fetch fresh cipher
 		newCipher, fetchErr := e.getCachedCipher(videoID)
 		if fetchErr != nil {
 			return "", fmt.Errorf("retry failed: %w", fetchErr)
 		}
+		e.cipherMu.Lock()
 		e.cipher = newCipher
+		e.cipherMu.Unlock()
 
 		// Retry decryption
-		return e.cipher.DecryptSignature(sig)
+		return newCipher.DecryptSignature(sig)
 	}
 
 	return result, nil
@@ -859,19 +1071,9 @@ func (e *Extractor) unthrottle(videoID, streamURL string) (string, error) {
 		return streamURL, nil
 	}
 
-	// Initialize cipher if needed (using cache)
-	var cipherStart time.Time
-	if e.profile && e.cipher == nil {
-		cipherStart = time.Now()
-	}
-	if e.cipher == nil {
-		e.cipher, err = e.getCachedCipher(videoID)
-		if err != nil {
-			return "", fmt.Errorf("failed to initialize cipher: %w", err)
-		}
-		if e.profile {
-			e.timings.CipherInitMs = time.Since(cipherStart).Milliseconds()
-		}
+	cipher, err := e.ensureCipher(videoID)
+	if err != nil {
+		return streamURL, nil
 	}
 
 	// Transform n-parameter
@@ -879,9 +1081,9 @@ func (e *Extractor) unthrottle(videoID, streamURL string) (string, error) {
 	if e.profile {
 		transformStart = time.Now()
 	}
-	transformedN, err := e.cipher.TransformN(nParam)
+	transformedN, err := cipher.TransformN(nParam)
 	if e.profile {
-		e.timings.NTransformMs = time.Since(transformStart).Milliseconds()
+		e.timings.NTransformMs += time.Since(transformStart).Milliseconds()
 	}
 	if err != nil {
 		// Log but don't fail - some videos work without n transform

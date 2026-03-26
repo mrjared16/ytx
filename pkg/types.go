@@ -15,19 +15,19 @@ type InnertubeContext struct {
 }
 
 type InnertubeClient struct {
-	HL                string `json:"hl"`
-	GL                string `json:"gl"`
-	ClientName        string `json:"clientName"`
-	ClientVersion     string `json:"clientVersion"`
-	UserAgent         string `json:"userAgent,omitempty"`
-	TimeZone          string `json:"timeZone"`
-	UTCOffset         int    `json:"utcOffsetMinutes"`
-	DeviceMake        string `json:"deviceMake,omitempty"`
-	DeviceModel       string `json:"deviceModel,omitempty"`
-	Platform          string `json:"platform,omitempty"`
-	OSName            string `json:"osName,omitempty"`
-	OSVersion         string `json:"osVersion,omitempty"`
-	VisitorData       string `json:"visitorData,omitempty"`
+	HL            string `json:"hl"`
+	GL            string `json:"gl"`
+	ClientName    string `json:"clientName"`
+	ClientVersion string `json:"clientVersion"`
+	UserAgent     string `json:"userAgent,omitempty"`
+	TimeZone      string `json:"timeZone"`
+	UTCOffset     int    `json:"utcOffsetMinutes"`
+	DeviceMake    string `json:"deviceMake,omitempty"`
+	DeviceModel   string `json:"deviceModel,omitempty"`
+	Platform      string `json:"platform,omitempty"`
+	OSName        string `json:"osName,omitempty"`
+	OSVersion     string `json:"osVersion,omitempty"`
+	VisitorData   string `json:"visitorData,omitempty"`
 }
 
 type PlaybackContext struct {
@@ -42,11 +42,11 @@ type ContentPlaybackContext struct {
 // === INNERTUBE RESPONSE ===
 
 type PlayerResponse struct {
-	ResponseContext   ResponseContext    `json:"responseContext"`
-	PlayabilityStatus PlayabilityStatus  `json:"playabilityStatus"`
-	StreamingData     StreamingData      `json:"streamingData"`
-	VideoDetails      VideoDetails       `json:"videoDetails"`
-	Captions          *CaptionsRenderer  `json:"captions,omitempty"`
+	ResponseContext   ResponseContext   `json:"responseContext"`
+	PlayabilityStatus PlayabilityStatus `json:"playabilityStatus"`
+	StreamingData     StreamingData     `json:"streamingData"`
+	VideoDetails      VideoDetails      `json:"videoDetails"`
+	Captions          *CaptionsRenderer `json:"captions,omitempty"`
 }
 
 type ResponseContext struct {
@@ -125,12 +125,16 @@ type Subtitle struct {
 
 // Timings captures duration of each stage for profiling
 type Timings struct {
-	VisitorDataMs int64  `json:"visitor_data_ms,omitempty"`
-	PlayerAPIMs   int64  `json:"player_api_ms,omitempty"`
-	CipherInitMs  int64  `json:"cipher_init_ms,omitempty"`
-	NTransformMs  int64  `json:"n_transform_ms,omitempty"`
-	TotalMs       int64  `json:"total_ms,omitempty"`
-	JSEngine      string `json:"js_engine,omitempty"`
+	VisitorDataMs   int64  `json:"visitor_data_ms,omitempty"`
+	STSWaitMs       int64  `json:"sts_wait_ms,omitempty"`
+	PlayerAPIMs     int64  `json:"player_api_ms,omitempty"`
+	CipherInitMs    int64  `json:"cipher_init_ms,omitempty"`
+	CipherPrewarmMs int64  `json:"cipher_prewarm_ms,omitempty"`
+	SigDecryptMs    int64  `json:"sig_decrypt_ms,omitempty"`
+	NTransformMs    int64  `json:"n_transform_ms,omitempty"`
+	OtherMs         int64  `json:"other_ms,omitempty"`
+	TotalMs         int64  `json:"total_ms,omitempty"`
+	JSEngine        string `json:"js_engine,omitempty"`
 }
 
 type Result struct {
@@ -140,6 +144,7 @@ type Result struct {
 	MimeType string   `json:"mimeType,omitempty"`
 	Title    string   `json:"title,omitempty"`
 	Author   string   `json:"author,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
 	Timings  *Timings `json:"timings,omitempty"`
 }
 
@@ -188,6 +193,7 @@ type VideoResult struct {
 	Title     string     `json:"title"`
 	Author    string     `json:"author"`
 	Subtitles []Subtitle `json:"subtitles,omitempty"`
+	Warnings  []string   `json:"warnings,omitempty"`
 	Timings   *Timings   `json:"timings,omitempty"`
 }
 

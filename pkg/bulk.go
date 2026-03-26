@@ -50,13 +50,13 @@ func (e *Extractor) BulkExtract(videoIDs []string) {
 
 // intermediateResult holds partial extraction results before n-transform
 type intermediateResult struct {
-	videoID    string
-	streamURL  string // URL before n-transform
-	nParam     string // n-parameter to transform
-	itag       int
-	bitrate    int
-	title      string
-	err        error
+	videoID   string
+	streamURL string // URL before n-transform
+	nParam    string // n-parameter to transform
+	itag      int
+	bitrate   int
+	title     string
+	err       error
 }
 
 // processBatchOptimized handles a batch with optimized batch n-transform
@@ -210,15 +210,13 @@ func (e *Extractor) getStreamURLRaw(videoID string, stream *Format) (string, err
 	}
 
 	// Initialize cipher if needed
-	if e.cipher == nil {
-		e.cipher, err = e.getCachedCipher(videoID)
-		if err != nil {
-			return "", err
-		}
+	cipher, err := e.ensureCipher(videoID)
+	if err != nil {
+		return "", err
 	}
 
 	// Decrypt signature
-	decryptedSig, err := e.cipher.DecryptSignature(sig)
+	decryptedSig, err := cipher.DecryptSignature(sig)
 	if err != nil {
 		return "", err
 	}

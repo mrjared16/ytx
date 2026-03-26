@@ -3,11 +3,13 @@ package ytx
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -38,11 +40,15 @@ type TimingMetrics struct {
 	TotalExtract  string `json:"total_extract"`
 	URLValidation string `json:"url_validation,omitempty"`
 	// Profiled timings in milliseconds
-	VisitorDataMs int64 `json:"visitor_data_ms,omitempty"`
-	PlayerAPIMs   int64 `json:"player_api_ms,omitempty"`
-	CipherInitMs  int64 `json:"cipher_init_ms,omitempty"`
-	NTransformMs  int64 `json:"n_transform_ms,omitempty"`
-	TotalMs       int64 `json:"total_ms,omitempty"`
+	VisitorDataMs   int64 `json:"visitor_data_ms,omitempty"`
+	STSWaitMs       int64 `json:"sts_wait_ms,omitempty"`
+	PlayerAPIMs     int64 `json:"player_api_ms,omitempty"`
+	CipherInitMs    int64 `json:"cipher_init_ms,omitempty"`
+	CipherPrewarmMs int64 `json:"cipher_prewarm_ms,omitempty"`
+	SigDecryptMs    int64 `json:"sig_decrypt_ms,omitempty"`
+	NTransformMs    int64 `json:"n_transform_ms,omitempty"`
+	OtherMs         int64 `json:"other_ms,omitempty"`
+	TotalMs         int64 `json:"total_ms,omitempty"`
 }
 
 // GoldenImage represents the expected baseline for regression testing
@@ -382,8 +388,16 @@ func logResult(t *testing.T, r TestResult) {
 		status, r.Mode, r.VideoID, r.Itag, r.HTTPStatus, r.TotalDuration)
 
 	if r.Timings.TotalMs > 0 {
-		t.Logf("  Profiled: visitor=%dms, api=%dms, cipher=%dms, n-transform=%dms, total=%dms",
-			r.Timings.VisitorDataMs, r.Timings.PlayerAPIMs, r.Timings.CipherInitMs, r.Timings.NTransformMs, r.Timings.TotalMs)
+		t.Logf("  Profiled: visitor=%dms, sts-wait=%dms, api=%dms, cipher-wait=%dms, cipher-prewarm=%dms, sig=%dms, n-transform=%dms, other=%dms, total=%dms",
+			r.Timings.VisitorDataMs,
+			r.Timings.STSWaitMs,
+			r.Timings.PlayerAPIMs,
+			r.Timings.CipherInitMs,
+			r.Timings.CipherPrewarmMs,
+			r.Timings.SigDecryptMs,
+			r.Timings.NTransformMs,
+			r.Timings.OtherMs,
+			r.Timings.TotalMs)
 	}
 
 	if r.Error != "" {
@@ -511,6 +525,146 @@ func TestCacheIsolation(t *testing.T) {
 	t.Logf("Cache isolation verified: system cache unchanged")
 }
 
+func TestFetchVisitorDataUsesGlobalCacheForMusicMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	cookieFile := filepath.Join(tmpDir, "cookies.txt")
+	cookieData := ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\ttest-sapisid\n"
+	if err := os.WriteFile(cookieFile, []byte(cookieData), 0644); err != nil {
+		t.Fatalf("failed to write cookie file: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeMusic, cookieFile)
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+
+	visitorDataCache.Lock()
+	visitorDataCache.data = "VISITOR_CACHE"
+	visitorDataCache.sessionIndex = "7"
+	visitorDataCache.delegatedSID = "DELEGATED_CACHE"
+	visitorDataCache.isAuth = true
+	visitorDataCache.expiry = time.Now().Add(visitorDataTTL)
+	visitorDataCache.Unlock()
+	defer func() {
+		visitorDataCache.Lock()
+		visitorDataCache.data = ""
+		visitorDataCache.sessionIndex = ""
+		visitorDataCache.delegatedSID = ""
+		visitorDataCache.isAuth = false
+		visitorDataCache.expiry = time.Time{}
+		visitorDataCache.Unlock()
+	}()
+
+	requests := 0
+	ext.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			return nil, fmt.Errorf("unexpected network request: %s", req.URL.String())
+		}),
+	}
+
+	if err := ext.fetchVisitorData("dQw4w9WgXcQ"); err != nil {
+		t.Fatalf("fetchVisitorData returned error: %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("expected cached visitor data to avoid network, got %d requests", requests)
+	}
+	if ext.visitorData != "VISITOR_CACHE" {
+		t.Fatalf("unexpected visitorData: got %q", ext.visitorData)
+	}
+	if ext.sessionIndex != "7" {
+		t.Fatalf("unexpected sessionIndex: got %q", ext.sessionIndex)
+	}
+	if ext.delegatedSID != "DELEGATED_CACHE" {
+		t.Fatalf("unexpected delegatedSID: got %q", ext.delegatedSID)
+	}
+}
+
+func TestExtractProfileTimingsAddUpToTotal(t *testing.T) {
+	tmpDir := t.TempDir()
+	cookieFile := filepath.Join(tmpDir, "cookies.txt")
+	cookieData := ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\ttest-sapisid\n"
+	if err := os.WriteFile(cookieFile, []byte(cookieData), 0644); err != nil {
+		t.Fatalf("write cookies: %v", err)
+	}
+
+	visitorDataCache.Lock()
+	visitorDataCache.data = ""
+	visitorDataCache.sessionIndex = ""
+	visitorDataCache.delegatedSID = ""
+	visitorDataCache.isAuth = false
+	visitorDataCache.expiry = time.Time{}
+	visitorDataCache.Unlock()
+	defer func() {
+		visitorDataCache.Lock()
+		visitorDataCache.data = ""
+		visitorDataCache.sessionIndex = ""
+		visitorDataCache.delegatedSID = ""
+		visitorDataCache.isAuth = false
+		visitorDataCache.expiry = time.Time{}
+		visitorDataCache.Unlock()
+		CloseCachedEngine()
+	}()
+
+	ext, err := NewExtractor(ModeMusic, cookieFile)
+	if err != nil {
+		t.Fatalf("NewExtractor returned error: %v", err)
+	}
+	ext.profile = true
+	ext.cacheManager = &CacheManager{cacheDir: filepath.Join(tmpDir, "cache")}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	ext.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Helper()
+			switch {
+			case req.Method == http.MethodGet && req.URL.Host == "music.youtube.com" && req.URL.Path == "/watch":
+				time.Sleep(10 * time.Millisecond)
+				html := `<!doctype html><html>"visitorData":"VISITOR_TEST","SESSION_INDEX":"0","DELEGATED_SESSION_ID":"DELEGATED_TEST"</html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/watch":
+				time.Sleep(10 * time.Millisecond)
+				html := `<!doctype html><html><script src="/s/player/watch123/player_ias.vflset/en_US/base.js"></script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/s/player/watch123/player_ias.vflset/en_US/base.js":
+				time.Sleep(10 * time.Millisecond)
+				playerJS := `var signatureTimestamp=12345;x&&(x=AbC(decodeURIComponent(x)));function AbC(a){a=a.split("");a.reverse();return a.join("")}`
+				return jsonHTTPResponse(http.StatusOK, playerJS), nil
+			case req.Method == http.MethodPost && req.URL.Host == "music.youtube.com" && req.URL.Path == "/youtubei/v1/player":
+				time.Sleep(10 * time.Millisecond)
+				signatureCipher := "url=https%3A%2F%2Fstream.test%2Fvideoplayback%3Ffoo%3Dbar&s=abc&sp=sig"
+				responseBody := `{"responseContext":{"visitorData":"VISITOR_TEST"},"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{"itag":141,"signatureCipher":"` + signatureCipher + `","mimeType":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":256000,"quality":"tiny"}]},"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"test","lengthSeconds":"1","author":"author","shortDescription":""}}`
+				return jsonHTTPResponse(http.StatusOK, responseBody), nil
+			}
+
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.String())
+		}),
+	}
+
+	result, err := ext.Extract("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("Extract returned error: %v", err)
+	}
+	if result.Timings == nil {
+		t.Fatal("expected timings in profiled result")
+	}
+
+	sum := result.Timings.VisitorDataMs +
+		result.Timings.STSWaitMs +
+		result.Timings.PlayerAPIMs +
+		result.Timings.CipherInitMs +
+		result.Timings.SigDecryptMs +
+		result.Timings.NTransformMs +
+		result.Timings.OtherMs
+	if sum != result.Timings.TotalMs {
+		t.Fatalf("expected profiled stages to add up to total: sum=%d total=%d timings=%+v", sum, result.Timings.TotalMs, *result.Timings)
+	}
+	if result.Timings.CipherPrewarmMs == 0 {
+		t.Fatal("expected cipher prewarm timing to be recorded")
+	}
+}
+
 // BenchmarkNTransform benchmarks the n-transform performance
 func BenchmarkNTransform(b *testing.B) {
 	tmpDir := b.TempDir()
@@ -581,7 +735,6 @@ func TestMusicModeWithCookies(t *testing.T) {
 	if _, err := os.Stat(defaultCookiePath); os.IsNotExist(err) {
 		t.Skip("Cookie file not found, skipping music mode test")
 	}
-
 	tmpDir := t.TempDir()
 	cacheDir := filepath.Join(tmpDir, "cache")
 	os.MkdirAll(cacheDir, 0755)
@@ -619,4 +772,404 @@ func TestMusicModeWithCookies(t *testing.T) {
 
 	// Cleanup
 	CloseCachedEngine()
+}
+
+func TestMusicModeUsesDocumentedCipherPathWithoutPOT(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	cookieFile := filepath.Join(tmpDir, "cookies.txt")
+	cookieData := ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\ttest-sapisid\n"
+	if err := os.WriteFile(cookieFile, []byte(cookieData), 0644); err != nil {
+		t.Fatalf("failed to write cookie file: %v", err)
+	}
+
+	markerPath := filepath.Join(tmpDir, "yt-dlp-invoked")
+	fakeBinDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(fakeBinDir, 0755); err != nil {
+		t.Fatalf("failed to create fake bin dir: %v", err)
+	}
+	fakeYtDlp := filepath.Join(fakeBinDir, "yt-dlp")
+	script := fmt.Sprintf("#!/bin/sh\nprintf invoked > %q\nexit 42\n", markerPath)
+	if err := os.WriteFile(fakeYtDlp, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake yt-dlp: %v", err)
+	}
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ext, err := NewExtractor(ModeMusic, cookieFile)
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	var mu sync.Mutex
+	playerBodyPoToken := ""
+	playerBodySTS := 0
+	playerEmbedCalled := false
+	playerJSCalled := false
+
+	ext.httpClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Host == "music.youtube.com" && req.URL.Path == "/watch":
+				html := `<!doctype html><html><script>
+"visitorData":"VISITOR_TEST",
+"SESSION_INDEX":"0",
+"DELEGATED_SESSION_ID":"DELEGATED_TEST",
+window.ytAtR = "{\"bgChallenge\":{\"interpreterUrl\":{\"privateDoNotAccessOrElseTrustedResourceUrlWrappedValue\":\"//challenge.test/interpreter.js\"},\"interpreterHash\":\"HASH_TEST\",\"program\":\"PROGRAM_TEST\",\"globalName\":\"BG_TEST\",\"clientExperimentsStateBlob\":\"BLOB_TEST\"}}";
+</script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/embed/dQw4w9WgXcQ":
+				mu.Lock()
+				playerEmbedCalled = true
+				mu.Unlock()
+				html := `<!doctype html><html><script src="/s/player/test123/player_ias.vflset/en_US/base.js"></script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/s/player/test123/player_ias.vflset/en_US/base.js":
+				mu.Lock()
+				playerJSCalled = true
+				mu.Unlock()
+				playerJS := `var signatureTimestamp=12345;x&&(x=AbC(decodeURIComponent(x)));function AbC(a){a=a.split("");a.reverse();return a.join("")}`
+				return jsonHTTPResponse(http.StatusOK, playerJS), nil
+
+			case req.Method == http.MethodPost && req.URL.Host == "music.youtube.com" && req.URL.Path == "/youtubei/v1/player":
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					return nil, err
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(body, &payload); err != nil {
+					return nil, err
+				}
+
+				mu.Lock()
+				if sid, ok := payload["serviceIntegrityDimensions"].(map[string]any); ok {
+					if token, ok := sid["poToken"].(string); ok {
+						playerBodyPoToken = token
+					}
+				}
+				if playbackContext, ok := payload["playbackContext"].(map[string]any); ok {
+					if contentPlaybackContext, ok := playbackContext["contentPlaybackContext"].(map[string]any); ok {
+						switch sts := contentPlaybackContext["signatureTimestamp"].(type) {
+						case float64:
+							playerBodySTS = int(sts)
+						}
+					}
+				}
+				mu.Unlock()
+
+				signatureCipher := "url=https%3A%2F%2Fstream.test%2Fvideoplayback%3Ffoo%3Dbar&s=abc&sp=sig"
+				responseBody := `{
+"responseContext":{"visitorData":"VISITOR_TEST"},
+"playabilityStatus":{"status":"OK"},
+"streamingData":{"adaptiveFormats":[{"itag":141,"signatureCipher":"` + signatureCipher + `","mimeType":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":256000,"quality":"tiny"}]},
+"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"test","lengthSeconds":"1","author":"author","shortDescription":""}
+}`
+				return jsonHTTPResponse(http.StatusOK, responseBody), nil
+			}
+
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.String())
+		}),
+	}
+
+	result, err := ext.Extract("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("extraction failed: %v", err)
+	}
+
+	if !strings.Contains(result.URL, "sig=cba") {
+		t.Fatalf("expected decrypted signature in stream URL, got %q", result.URL)
+	}
+	if strings.Contains(result.URL, "pot=") {
+		t.Fatalf("expected documented path without pot query parameter, got %q", result.URL)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !playerEmbedCalled {
+		t.Fatal("expected player embed page to be fetched for base.js discovery")
+	}
+	if !playerJSCalled {
+		t.Fatal("expected player JS to be fetched for documented cipher path")
+	}
+	if playerBodyPoToken != "" {
+		t.Fatalf("did not expect serviceIntegrityDimensions.poToken on documented path, got %q", playerBodyPoToken)
+	}
+	if playerBodySTS != 12345 {
+		t.Fatalf("expected signatureTimestamp from base.js in player request, got %d", playerBodySTS)
+	}
+
+	if _, err := os.Stat(markerPath); err == nil {
+		t.Fatal("yt-dlp fallback was invoked")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("failed to inspect yt-dlp marker: %v", err)
+	}
+
+	CloseCachedEngine()
+}
+
+func TestMusicModeDoesNotRequireChallengeOrPOTOnDocumentedPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	cookieFile := filepath.Join(tmpDir, "cookies.txt")
+	cookieData := ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\ttest-sapisid\n"
+	if err := os.WriteFile(cookieFile, []byte(cookieData), 0644); err != nil {
+		t.Fatalf("failed to write cookie file: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeMusic, cookieFile)
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	var mu sync.Mutex
+	attGetCalled := false
+	playerBodyPoToken := ""
+	playerEmbedCalled := false
+	playerJSCalled := false
+
+	ext.httpClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Host == "music.youtube.com" && req.URL.Path == "/watch":
+				html := `<!doctype html><html><script>
+"visitorData":"VISITOR_TEST",
+"SESSION_INDEX":"0",
+"DELEGATED_SESSION_ID":"DELEGATED_TEST"
+</script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/embed/dQw4w9WgXcQ":
+				mu.Lock()
+				playerEmbedCalled = true
+				mu.Unlock()
+				html := `<!doctype html><html><script src="/s/player/test123/player_ias.vflset/en_US/base.js"></script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/s/player/test123/player_ias.vflset/en_US/base.js":
+				mu.Lock()
+				playerJSCalled = true
+				mu.Unlock()
+				playerJS := `var signatureTimestamp=12345;x&&(x=AbC(decodeURIComponent(x)));function AbC(a){a=a.split("");a.reverse();return a.join("")}`
+				return jsonHTTPResponse(http.StatusOK, playerJS), nil
+
+			case req.Method == http.MethodPost && req.URL.Host == "music.youtube.com" && req.URL.Path == "/youtubei/v1/att/get":
+				mu.Lock()
+				attGetCalled = true
+				mu.Unlock()
+				return nil, fmt.Errorf("unexpected att/get request on documented path")
+
+			case req.Method == http.MethodPost && req.URL.Host == "music.youtube.com" && req.URL.Path == "/youtubei/v1/player":
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					return nil, err
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(body, &payload); err != nil {
+					return nil, err
+				}
+
+				mu.Lock()
+				if sid, ok := payload["serviceIntegrityDimensions"].(map[string]any); ok {
+					if token, ok := sid["poToken"].(string); ok {
+						playerBodyPoToken = token
+					}
+				}
+				mu.Unlock()
+
+				signatureCipher := "url=https%3A%2F%2Fstream.test%2Fvideoplayback%3Ffoo%3Dbar&s=abc&sp=sig"
+				responseBody := `{
+"responseContext":{"visitorData":"VISITOR_TEST"},
+"playabilityStatus":{"status":"OK"},
+"streamingData":{"adaptiveFormats":[{"itag":141,"signatureCipher":"` + signatureCipher + `","mimeType":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":256000,"quality":"tiny"}]},
+"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"test","lengthSeconds":"1","author":"author","shortDescription":""}
+}`
+				return jsonHTTPResponse(http.StatusOK, responseBody), nil
+			}
+
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.String())
+		}),
+	}
+
+	result, err := ext.Extract("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("extraction failed: %v", err)
+	}
+
+	if !strings.Contains(result.URL, "sig=cba") {
+		t.Fatalf("expected decrypted signature in stream URL, got %q", result.URL)
+	}
+	if strings.Contains(result.URL, "pot=") {
+		t.Fatalf("expected no pot query parameter on documented path, got %q", result.URL)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !attGetCalled {
+		// The transport turns this into a hard failure, but keep the state check explicit.
+	} else {
+		t.Fatal("did not expect /att/get fallback when challenge is absent on documented path")
+	}
+	if !playerEmbedCalled {
+		t.Fatal("expected player embed page fetch for base.js discovery")
+	}
+	if !playerJSCalled {
+		t.Fatal("expected player JS fetch for documented cipher path")
+	}
+	if playerBodyPoToken != "" {
+		t.Fatalf("did not expect serviceIntegrityDimensions.poToken on documented path, got %q", playerBodyPoToken)
+	}
+
+	CloseCachedEngine()
+}
+
+func TestExtractPersistsExtractedSigArtifactAndFingerprint(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	cookieFile := filepath.Join(tmpDir, "cookies.txt")
+	cookieData := ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\ttest-sapisid\n"
+	if err := os.WriteFile(cookieFile, []byte(cookieData), 0644); err != nil {
+		t.Fatalf("failed to write cookie file: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeMusic, cookieFile)
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	ext.httpClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Host == "music.youtube.com" && req.URL.Path == "/watch":
+				html := `<!doctype html><html><script>
+"visitorData":"VISITOR_TEST",
+"SESSION_INDEX":"0",
+"DELEGATED_SESSION_ID":"DELEGATED_TEST"
+</script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/embed/dQw4w9WgXcQ":
+				html := `<!doctype html><html><script src="/s/player/test123/player_ias.vflset/en_US/base.js"></script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/s/player/test123/player_ias.vflset/en_US/base.js":
+				playerJS := `var signatureTimestamp=12345;x&&(x=AbC(decodeURIComponent(x)));function AbC(a){a=a.split("");a.reverse();return a.join("")}`
+				return jsonHTTPResponse(http.StatusOK, playerJS), nil
+			case req.Method == http.MethodPost && req.URL.Host == "music.youtube.com" && req.URL.Path == "/youtubei/v1/player":
+				signatureCipher := "url=https%3A%2F%2Fstream.test%2Fvideoplayback%3Ffoo%3Dbar&s=abc&sp=sig"
+				responseBody := `{
+"responseContext":{"visitorData":"VISITOR_TEST"},
+"playabilityStatus":{"status":"OK"},
+"streamingData":{"adaptiveFormats":[{"itag":141,"signatureCipher":"` + signatureCipher + `","mimeType":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":256000,"quality":"tiny"}]},
+"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"test","lengthSeconds":"1","author":"author","shortDescription":""}
+}`
+				return jsonHTTPResponse(http.StatusOK, responseBody), nil
+			}
+
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.String())
+		}),
+	}
+
+	result, err := ext.Extract("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("extraction failed: %v", err)
+	}
+	if !strings.Contains(result.URL, "sig=cba") {
+		t.Fatalf("expected decrypted signature in stream URL, got %q", result.URL)
+	}
+
+	cache, err := ext.cacheManager.Load()
+	if err != nil {
+		t.Fatalf("failed to load persisted cache: %v", err)
+	}
+	if cache.JSCode == "" {
+		t.Fatal("expected extracted signature JS to be persisted after decrypt")
+	}
+	if cache.PlayerFingerprint == "" {
+		t.Fatal("expected player fingerprint to be persisted")
+	}
+	if ext.cipher == nil || cache.PlayerFingerprint != ext.cipher.PlayerFingerprint() {
+		t.Fatalf("expected persisted fingerprint to match live cipher fingerprint, got cache=%q cipher=%q", cache.PlayerFingerprint, ext.cipher.PlayerFingerprint())
+	}
+
+	CloseCachedEngine()
+}
+
+func TestGetCachedCipherPersistsPreparedSigArtifactOnInitialFetch(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeVideo, "")
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	ext.httpClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/embed/dQw4w9WgXcQ":
+				html := `<!doctype html><html><script src="/s/player/test123/player_ias.vflset/en_US/base.js"></script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/s/player/test123/player_ias.vflset/en_US/base.js":
+				playerJS := `var signatureTimestamp=12345;x&&(x=AbC(decodeURIComponent(x)));function AbC(a){a=a.split("");a.reverse();return a.join("")}`
+				return jsonHTTPResponse(http.StatusOK, playerJS), nil
+			}
+
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.String())
+		}),
+	}
+
+	if _, err := ext.getCachedCipher("dQw4w9WgXcQ"); err != nil {
+		t.Fatalf("getCachedCipher returned error: %v", err)
+	}
+
+	cache, err := ext.cacheManager.Load()
+	if err != nil {
+		t.Fatalf("failed to load persisted cache: %v", err)
+	}
+	if cache.JSCode == "" {
+		t.Fatal("expected prepared signature JS to be persisted on initial fetch")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func jsonHTTPResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
 }
