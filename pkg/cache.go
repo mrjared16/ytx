@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	cacheFileName   = "cipher.json"
-	playerCacheFile = "player.js.gz" // Compressed player.js for n-transform
-	cacheTTL        = 6 * time.Hour
+	cacheFileName     = "cipher.json"
+	playerCacheFile   = "player.js.gz" // Compressed player.js for n-transform
+	nRuntimeCacheFile = "n_runtime.js"
+	visitorCacheFile  = "visitor.json"
+	cacheTTL          = 6 * time.Hour
 )
 
 // CipherCache represents the persisted cipher data
@@ -29,7 +31,8 @@ type CipherCache struct {
 	SigUsesURLWrapper  bool      `json:"sig_uses_url_wrapper,omitempty"`
 	NFunction          string    `json:"n_function"`
 	SignatureTimestamp int       `json:"signature_timestamp"` // STS for API requests
-	JSCode             string    `json:"js_code"`
+	IsBytecode         bool      `json:"is_bytecode,omitempty"`
+	JSCode             string    `json:"js_code,omitempty"`
 }
 
 // CacheManager handles persistent cipher caching
@@ -41,6 +44,7 @@ type CacheInfo struct {
 	CacheDir           string    `json:"cache_dir"`
 	CachePath          string    `json:"cache_path"`
 	PlayerCachePath    string    `json:"player_cache_path"`
+	NRuntimeCachePath  string    `json:"n_runtime_cache_path"`
 	Valid              bool      `json:"valid"`
 	PlayerURL          string    `json:"player_url,omitempty"`
 	BaseJSPath         string    `json:"basejs_path,omitempty"`
@@ -49,6 +53,7 @@ type CacheInfo struct {
 	NFunction          string    `json:"n_function,omitempty"`
 	SignatureTimestamp int       `json:"signature_timestamp,omitempty"`
 	HasPlayerJS        bool      `json:"has_player_js"`
+	HasNRuntimeJS      bool      `json:"has_n_runtime_js"`
 	HasExtractedSig    bool      `json:"has_extracted_sig"`
 	CreatedAt          time.Time `json:"created_at,omitempty"`
 	ExpiresAt          time.Time `json:"expires_at,omitempty"`
@@ -93,23 +98,116 @@ func (cm *CacheManager) Load() (*CipherCache, error) {
 		return nil, err
 	}
 
+	// Fast load the raw bytecode/js payload avoiding JSON overhead
+	codePath := filepath.Join(cm.cacheDir, "cipher_code.bin")
+	if codeData, err := os.ReadFile(codePath); err == nil {
+		cache.JSCode = string(codeData)
+	}
+
 	return &cache, nil
 }
 
 // Save writes the cipher cache to disk
 func (cm *CacheManager) Save(cache *CipherCache) error {
+	// Strip the massive JS payload from the JSON
+	jsCode := cache.JSCode
+	cache.JSCode = ""
+
+	data, err := json.MarshalIndent(cache, "", "  ")
+
+	// Restore memory format
+	cache.JSCode = jsCode
+
+	if err != nil {
+		return err
+	}
+
+	// Write metadata atomically
+	tmpPath := cm.CachePath() + fmt.Sprintf(".%d.tmp", os.Getpid())
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpPath, cm.CachePath()); err != nil {
+		return err
+	}
+
+	// Write the massive JS payload atomically to a raw binary file
+	if jsCode != "" {
+		codePath := filepath.Join(cm.cacheDir, "cipher_code.bin")
+		tmpCodePath := codePath + fmt.Sprintf(".%d.tmp", os.Getpid())
+		if err := os.WriteFile(tmpCodePath, []byte(jsCode), 0644); err == nil {
+			_ = os.Rename(tmpCodePath, codePath)
+		}
+	}
+
+	return nil
+}
+
+// VisitorCache represents the persisted visitor data
+type VisitorCache struct {
+	Data         string    `json:"data"`
+	SessionIndex string    `json:"session_index"`
+	DelegatedSID string    `json:"delegated_sid"`
+	IsAuth       bool      `json:"is_auth"`
+	AuthKey      string    `json:"auth_key,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+func (cm *CacheManager) visitorCachePath() string {
+	return filepath.Join(cm.cacheDir, visitorCacheFile)
+}
+
+// LoadVisitorData reads the visitor cache from disk
+func (cm *CacheManager) LoadVisitorData() (*VisitorCache, error) {
+	cache, stale, err := cm.LoadVisitorDataAllowStale(0)
+	if err != nil {
+		return nil, err
+	}
+	if stale {
+		return nil, fmt.Errorf("visitor cache expired")
+	}
+	return cache, nil
+}
+
+// LoadVisitorDataAllowStale reads the visitor cache and optionally accepts
+// expired entries within a stale-while-revalidate grace period.
+func (cm *CacheManager) LoadVisitorDataAllowStale(grace time.Duration) (*VisitorCache, bool, error) {
+	data, err := os.ReadFile(cm.visitorCachePath())
+	if err != nil {
+		return nil, false, err
+	}
+
+	var cache VisitorCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		_ = os.Remove(cm.visitorCachePath())
+		return nil, false, err
+	}
+
+	now := time.Now()
+	if now.After(cache.ExpiresAt) {
+		if grace <= 0 || now.After(cache.ExpiresAt.Add(grace)) {
+			return nil, false, fmt.Errorf("visitor cache expired")
+		}
+		return &cache, true, nil
+	}
+
+	return &cache, false, nil
+}
+
+// SaveVisitorData writes the visitor cache to disk atomically
+func (cm *CacheManager) SaveVisitorData(cache *VisitorCache) error {
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	// Write atomically: write to temp file, then rename
-	tmpPath := cm.CachePath() + ".tmp"
+	tmpPath := cm.visitorCachePath() + fmt.Sprintf(".%d.tmp", os.Getpid())
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		return err
 	}
 
-	return os.Rename(tmpPath, cm.CachePath())
+	return os.Rename(tmpPath, cm.visitorCachePath())
 }
 
 // Invalidate removes the cache file
@@ -140,6 +238,11 @@ func (cm *CacheManager) IsValid(cache *CipherCache) bool {
 // PlayerCachePath returns the path to the compressed player.js cache
 func (cm *CacheManager) PlayerCachePath() string {
 	return filepath.Join(cm.cacheDir, playerCacheFile)
+}
+
+// NRuntimeCachePath returns the path to the prepared n-runtime artifact.
+func (cm *CacheManager) NRuntimeCachePath() string {
+	return filepath.Join(cm.cacheDir, nRuntimeCacheFile)
 }
 
 // SavePlayerJS saves player.js compressed with gzip
@@ -179,6 +282,23 @@ func (cm *CacheManager) LoadPlayerJS() ([]byte, error) {
 	return io.ReadAll(gzr)
 }
 
+// SaveNRuntimeJS saves the prepared n-runtime artifact.
+func (cm *CacheManager) SaveNRuntimeJS(runtimeJS []byte) error {
+	if len(runtimeJS) == 0 {
+		return nil
+	}
+	tmpPath := cm.NRuntimeCachePath() + ".tmp"
+	if err := os.WriteFile(tmpPath, runtimeJS, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, cm.NRuntimeCachePath())
+}
+
+// LoadNRuntimeJS loads the prepared n-runtime artifact.
+func (cm *CacheManager) LoadNRuntimeJS() ([]byte, error) {
+	return os.ReadFile(cm.NRuntimeCachePath())
+}
+
 func (cm *CacheManager) Purge() error {
 	var lastErr error
 
@@ -187,8 +307,18 @@ func (cm *CacheManager) Purge() error {
 		lastErr = err
 	}
 
+	// Remove isolated JS binary code cache
+	codePath := filepath.Join(cm.cacheDir, "cipher_code.bin")
+	if err := os.Remove(codePath); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
 	// Remove player.js cache
 	if err := os.Remove(cm.PlayerCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	if err := os.Remove(cm.NRuntimeCachePath()); err != nil && !os.IsNotExist(err) {
 		lastErr = err
 	}
 
@@ -225,9 +355,10 @@ func GetCacheInfo() (*CacheInfo, error) {
 	}
 
 	info := &CacheInfo{
-		CacheDir:        cm.CacheDir(),
-		CachePath:       cm.CachePath(),
-		PlayerCachePath: cm.PlayerCachePath(),
+		CacheDir:          cm.CacheDir(),
+		CachePath:         cm.CachePath(),
+		PlayerCachePath:   cm.PlayerCachePath(),
+		NRuntimeCachePath: cm.NRuntimeCachePath(),
 	}
 
 	cache, err := cm.Load()
@@ -251,6 +382,9 @@ func GetCacheInfo() (*CacheInfo, error) {
 	if _, err := os.Stat(cm.PlayerCachePath()); err == nil {
 		info.HasPlayerJS = true
 	}
+	if _, err := os.Stat(cm.NRuntimeCachePath()); err == nil {
+		info.HasNRuntimeJS = true
+	}
 
 	return info, nil
 }
@@ -261,10 +395,14 @@ func RefreshPlayerCache(videoID string) (*CacheInfo, []string, error) {
 	}
 
 	CloseCachedEngine()
-	cipherCache.Lock()
-	cipherCache.cipher = nil
-	cipherCache.expiry = time.Time{}
-	cipherCache.Unlock()
+	defaultRuntime.cipherCache.Lock()
+	if defaultRuntime.cipherCache.cipher != nil {
+		defaultRuntime.cipherCache.cipher.Close()
+	}
+	defaultRuntime.cipherCache.cipher = nil
+	defaultRuntime.cipherCache.expiry = time.Time{}
+	defaultRuntime.cipherCache.updated = time.Time{}
+	defaultRuntime.cipherCache.Unlock()
 
 	ext, err := NewExtractor(ModeVideo, "")
 	if err != nil {
