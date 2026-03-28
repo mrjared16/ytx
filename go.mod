@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/buke/quickjs-go v0.6.10
 	github.com/dop251/goja v0.0.0-20260106131823-651366fbe6e3
+	golang.org/x/sync v0.20.0
 )
 
 require (

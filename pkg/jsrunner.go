@@ -1,6 +1,7 @@
 package ytx
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,22 +21,46 @@ const (
 	tempPlayerFile = "ytx-player.js"
 )
 
-// Pre-spawned process for parallel initialization
-var (
-	preSpawnedRunner *SubprocessRunner
-	preSpawnedMu     sync.Mutex
-	preSpawnedEngine string
-)
+type jsCommand struct {
+	Type     string   `json:"type"`
+	Path     string   `json:"path,omitempty"`
+	Fun      string   `json:"fun,omitempty"`
+	Prepared bool     `json:"prepared,omitempty"`
+	Args     []string `json:"args,omitempty"`
+	Values   []string `json:"values,omitempty"`
+}
 
-// PreSpawnJSProcess starts a JS subprocess early (before player.js is downloaded)
-// This allows overlapping process startup with network I/O, saving ~100-150ms
-// Call LoadPlayerJS() later to complete initialization
-func PreSpawnJSProcess(engine string) error {
-	preSpawnedMu.Lock()
-	defer preSpawnedMu.Unlock()
+type jsStatusResponse struct {
+	Success bool   `json:"success,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type jsBatchResult struct {
+	Value string `json:"value,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+type jsBatchResponse struct {
+	Results []jsBatchResult `json:"results,omitempty"`
+	Error   string          `json:"error,omitempty"`
+}
+
+// PreSpawnJSProcess starts a JS subprocess early and pre-loads the 2.6MB player.js immediately
+// This allows overlapping the massive 200ms JS JIT-compilation with the network I/O
+func PreSpawnJSProcess(engine string, playerJS []byte, nFuncName string) error {
+	return defaultRuntime.PreSpawnJSProcess(context.Background(), engine, playerJS, nFuncName)
+}
+
+func (r *Runtime) PreSpawnJSProcess(ctx context.Context, engine string, playerJS []byte, nFuncName string) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	r.preSpawn.mu.Lock()
+	defer r.preSpawn.mu.Unlock()
 
 	// Already spawned?
-	if preSpawnedRunner != nil && preSpawnedEngine == engine {
+	if r.preSpawn.runner != nil && r.preSpawn.engine == engine {
 		return nil
 	}
 
@@ -82,13 +107,36 @@ func PreSpawnJSProcess(engine string) error {
 		return fmt.Errorf("failed to start %s: %w", engine, err)
 	}
 
-	preSpawnedRunner = &SubprocessRunner{
+	r.preSpawn.runner = &SubprocessRunner{
 		cmd:        cmd,
 		stdin:      json.NewEncoder(stdin),
 		stdout:     json.NewDecoder(stdout),
 		engineName: engine,
 	}
-	preSpawnedEngine = engine
+	r.preSpawn.engine = engine
+
+	// Eagerly write player.js and evaluate it to completely mask the 200ms JIT phase
+	if len(playerJS) > 0 {
+		tmpDir2 := os.TempDir()
+		playerJSPath := filepath.Join(tmpDir2, tempPlayerFile)
+		if err := os.WriteFile(playerJSPath, playerJS, 0644); err != nil {
+			return fmt.Errorf("failed to write player.js: %w", err)
+		}
+
+		r.preSpawn.runner.funcName = nFuncName
+		// We trigger the load_file anonymously into the channel, it will buffer the STDOUT response.
+		// GetPreSpawnedRunner will later call loadFunctionFromFile safely if needed,
+		// but since we encode it now, the daemon begins crunching immediately!
+		if err := r.preSpawn.runner.stdin.Encode(jsCommand{
+			Type:     "load_file",
+			Path:     playerJSPath,
+			Fun:      nFuncName,
+			Prepared: true,
+		}); err != nil {
+			return fmt.Errorf("failed to send preload command: %w", err)
+		}
+		r.preSpawn.runner.preloaded = true // Signal that we have already fired load_file
+	}
 
 	return nil
 }
@@ -96,16 +144,38 @@ func PreSpawnJSProcess(engine string) error {
 // GetPreSpawnedRunner returns a pre-spawned runner if available, loading the function
 // Returns nil if no pre-spawned runner exists for this engine
 func GetPreSpawnedRunner(engine string, runtimeJS []byte, funcName string) (*SubprocessRunner, error) {
-	preSpawnedMu.Lock()
-	defer preSpawnedMu.Unlock()
+	return defaultRuntime.GetPreSpawnedRunner(context.Background(), engine, runtimeJS, funcName)
+}
 
-	if preSpawnedRunner == nil || preSpawnedEngine != engine {
+func (r *Runtime) GetPreSpawnedRunner(ctx context.Context, engine string, runtimeJS []byte, funcName string) (*SubprocessRunner, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	r.preSpawn.mu.Lock()
+	defer r.preSpawn.mu.Unlock()
+
+	if r.preSpawn.runner == nil || r.preSpawn.engine != engine {
 		return nil, nil // No pre-spawned runner, caller should use NewSubprocessRunner
 	}
 
-	runner := preSpawnedRunner
-	preSpawnedRunner = nil // Claim the runner
-	preSpawnedEngine = ""
+	runner := r.preSpawn.runner
+	r.preSpawn.runner = nil // Claim the runner
+	r.preSpawn.engine = ""
+
+	// If it was already preloaded by PreSpawnJSProcess, we just need to consume the stdout ack
+	if runner.preloaded {
+		var resp jsStatusResponse
+		if err := runner.stdout.Decode(&resp); err != nil {
+			runner.Close()
+			return nil, fmt.Errorf("failed to read preloaded response: %w", err)
+		}
+		if resp.Error != "" {
+			runner.Close()
+			return nil, fmt.Errorf("js preload error: %s", resp.Error)
+		}
+		return runner, nil
+	}
 
 	// Write player.js and load function
 	tmpDir := os.TempDir()
@@ -134,6 +204,7 @@ type SubprocessRunner struct {
 	funcName   string
 	engineName string
 	closed     bool
+	preloaded  bool
 }
 
 // NewSubprocessRunner creates a new subprocess-based JS runner
@@ -209,24 +280,19 @@ func (r *SubprocessRunner) loadFunctionFromFile(playerJSPath, funcName string, p
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	msg := map[string]interface{}{
-		"type":     "load_file",
-		"path":     playerJSPath,
-		"fun":      funcName,
-		"prepared": prepared,
-	}
+	msg := jsCommand{Type: "load_file", Path: playerJSPath, Fun: funcName, Prepared: prepared}
 
 	if err := r.stdin.Encode(msg); err != nil {
 		return fmt.Errorf("failed to send load command: %w", err)
 	}
 
-	var resp map[string]interface{}
+	var resp jsStatusResponse
 	if err := r.stdout.Decode(&resp); err != nil {
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
-		return fmt.Errorf("js error: %s", errMsg)
+	if resp.Error != "" {
+		return fmt.Errorf("js error: %s", resp.Error)
 	}
 
 	return nil
@@ -241,33 +307,29 @@ func (r *SubprocessRunner) TransformN(n string) (string, error) {
 		return n, fmt.Errorf("runner is closed")
 	}
 
-	msg := map[string]interface{}{
-		"type": "call",
-		"args": []string{n},
-	}
+	msg := jsCommand{Type: "call", Args: []string{n}}
 
 	if err := r.stdin.Encode(msg); err != nil {
 		return n, fmt.Errorf("failed to send call command: %w", err)
 	}
 
-	var result interface{}
-	if err := r.stdout.Decode(&result); err != nil {
+	var raw json.RawMessage
+	if err := r.stdout.Decode(&raw); err != nil {
 		return n, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Check for error response
-	if m, ok := result.(map[string]interface{}); ok {
-		if errMsg, ok := m["error"].(string); ok && errMsg != "" {
-			return n, fmt.Errorf("js error: %s", errMsg)
-		}
+	var errResp jsStatusResponse
+	if err := json.Unmarshal(raw, &errResp); err == nil && errResp.Error != "" {
+		return n, fmt.Errorf("js error: %s", errResp.Error)
 	}
 
-	// Result should be a string
 	var transformed string
-	if s, ok := result.(string); ok {
-		transformed = s
-	} else {
-		transformed = fmt.Sprintf("%v", result)
+	if err := json.Unmarshal(raw, &transformed); err != nil {
+		var generic any
+		if err := json.Unmarshal(raw, &generic); err != nil {
+			return n, fmt.Errorf("failed to decode JS result: %w", err)
+		}
+		transformed = fmt.Sprintf("%v", generic)
 	}
 
 	// Validate result using shared function
@@ -293,50 +355,40 @@ func (r *SubprocessRunner) TransformNBatch(nValues []string) ([]string, error) {
 		return nValues, fmt.Errorf("runner is closed")
 	}
 
-	msg := map[string]interface{}{
-		"type":   "batch",
-		"values": nValues,
-	}
+	msg := jsCommand{Type: "batch", Values: nValues}
 
 	if err := r.stdin.Encode(msg); err != nil {
 		return nValues, fmt.Errorf("failed to send batch command: %w", err)
 	}
 
-	var resp map[string]interface{}
+	var resp jsBatchResponse
 	if err := r.stdout.Decode(&resp); err != nil {
 		return nValues, fmt.Errorf("failed to read batch response: %w", err)
 	}
 
 	// Check for error
-	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
-		return nValues, fmt.Errorf("js batch error: %s", errMsg)
+	if resp.Error != "" {
+		return nValues, fmt.Errorf("js batch error: %s", resp.Error)
 	}
 
-	// Parse results
-	resultsRaw, ok := resp["results"].([]interface{})
-	if !ok {
+	if resp.Results == nil {
 		return nValues, fmt.Errorf("invalid batch response format")
 	}
 
 	results := make([]string, len(nValues))
-	for i, r := range resultsRaw {
+	for i, item := range resp.Results {
 		if i >= len(nValues) {
 			break
 		}
-		if m, ok := r.(map[string]interface{}); ok {
-			if val, ok := m["value"].(string); ok {
-				// Validate each result using shared function
-				validated, err := ValidateNTransformResult(nValues[i], val)
-				if err != nil {
-					results[i] = nValues[i] // fallback to original on validation failure
-				} else {
-					results[i] = validated
-				}
-			} else {
-				results[i] = nValues[i] // fallback to original
-			}
-		} else {
+		if item.Error != "" || item.Value == "" {
 			results[i] = nValues[i]
+			continue
+		}
+		validated, err := ValidateNTransformResult(nValues[i], item.Value)
+		if err != nil {
+			results[i] = nValues[i]
+		} else {
+			results[i] = validated
 		}
 	}
 

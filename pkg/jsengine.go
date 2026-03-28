@@ -1,10 +1,10 @@
 package ytx
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
-	"sync"
 )
 
 // EngineType represents the JS engine to use for n-parameter transformation
@@ -29,24 +29,14 @@ type JSEngine interface {
 	Name() string
 }
 
-// Global engine configuration
-var (
-	globalEngineType EngineType = EngineAuto
-	engineMu         sync.RWMutex
-)
-
 // SetEngineType sets the global JS engine type
 func SetEngineType(t EngineType) {
-	engineMu.Lock()
-	defer engineMu.Unlock()
-	globalEngineType = t
+	defaultRuntime.SetEngineType(t)
 }
 
 // GetEngineType returns the current global JS engine type
 func GetEngineType() EngineType {
-	engineMu.RLock()
-	defer engineMu.RUnlock()
-	return globalEngineType
+	return defaultRuntime.GetEngineType()
 }
 
 // ParseEngineType parses a string into EngineType
@@ -65,65 +55,102 @@ func ParseEngineType(s string) (EngineType, error) {
 	}
 }
 
-// Global cached engine
-var (
-	cachedEngines  = map[string]JSEngine{}
-	lastEngineName string
-	cachedEngineMu sync.Mutex
-)
-
 // GetCachedEngine returns a cached JS engine or creates a new one
 func GetCachedEngine(cacheKey string, runtimeJS []byte, nFuncName string) (JSEngine, error) {
-	cachedEngineMu.Lock()
-	defer cachedEngineMu.Unlock()
-
-	if cacheKey == "" {
-		cacheKey = nFuncName
-	}
-
-	if engine, ok := cachedEngines[cacheKey]; ok {
-		return engine, nil
-	}
-
-	engine, err := NewJSEngine(GetEngineType(), runtimeJS, nFuncName)
-	if err != nil {
-		return nil, err
-	}
-
-	cachedEngines[cacheKey] = engine
-	lastEngineName = engine.Name()
-	return engine, nil
+	return defaultRuntime.GetCachedEngine(context.Background(), cacheKey, runtimeJS, nFuncName)
 }
 
 // CloseCachedEngine closes the cached engine
 func CloseCachedEngine() {
-	cachedEngineMu.Lock()
-	defer cachedEngineMu.Unlock()
-
-	for key, engine := range cachedEngines {
-		if engine != nil {
-			engine.Close()
-		}
-		delete(cachedEngines, key)
-	}
-	lastEngineName = ""
+	defaultRuntime.CloseCachedEngine()
 }
 
 func CachedEngineName() string {
-	cachedEngineMu.Lock()
-	defer cachedEngineMu.Unlock()
-	return lastEngineName
+	return defaultRuntime.CachedEngineName()
 }
 
 // NewJSEngine creates a new JS engine based on the engine type
 // Tries to use pre-spawned process first for faster initialization
 func NewJSEngine(engineType EngineType, playerJS []byte, nFuncName string) (JSEngine, error) {
+	return defaultRuntime.newJSEngine(context.Background(), engineType, playerJS, nFuncName)
+}
+
+func (r *Runtime) SetEngineType(t EngineType) {
+	r.engineMu.Lock()
+	defer r.engineMu.Unlock()
+	r.engineType = t
+}
+
+func (r *Runtime) GetEngineType() EngineType {
+	r.engineMu.RLock()
+	defer r.engineMu.RUnlock()
+	return r.engineType
+}
+
+func (r *Runtime) CachedEngineName() string {
+	r.engineCache.mu.Lock()
+	defer r.engineCache.mu.Unlock()
+	return r.engineCache.lastEngineName
+}
+
+func (r *Runtime) GetCachedEngine(ctx context.Context, cacheKey string, runtimeJS []byte, nFuncName string) (JSEngine, error) {
+	if cacheKey == "" {
+		cacheKey = nFuncName
+	}
+
+	r.engineCache.mu.Lock()
+	if engine, ok := r.engineCache.cachedEngines[cacheKey]; ok {
+		r.engineCache.mu.Unlock()
+		return engine, nil
+	}
+	r.engineCache.mu.Unlock()
+
+	v, err, _ := r.engineGroup.Do(cacheKey, func() (any, error) {
+		r.engineCache.mu.Lock()
+		if engine, ok := r.engineCache.cachedEngines[cacheKey]; ok {
+			r.engineCache.mu.Unlock()
+			return engine, nil
+		}
+		r.engineCache.mu.Unlock()
+
+		engine, err := r.newJSEngine(ctx, r.GetEngineType(), runtimeJS, nFuncName)
+		if err != nil {
+			return nil, err
+		}
+
+		r.engineCache.mu.Lock()
+		r.engineCache.cachedEngines[cacheKey] = engine
+		r.engineCache.lastEngineName = engine.Name()
+		r.engineCache.mu.Unlock()
+		return engine, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	engine, _ := v.(JSEngine)
+	return engine, nil
+}
+
+func (r *Runtime) CloseCachedEngine() {
+	r.engineCache.mu.Lock()
+	defer r.engineCache.mu.Unlock()
+
+	for key, engine := range r.engineCache.cachedEngines {
+		if engine != nil {
+			engine.Close()
+		}
+		delete(r.engineCache.cachedEngines, key)
+	}
+	r.engineCache.lastEngineName = ""
+}
+
+func (r *Runtime) newJSEngine(ctx context.Context, engineType EngineType, playerJS []byte, nFuncName string) (JSEngine, error) {
 	switch engineType {
 	case EngineQuickJS:
 		return NewQuickJSRunner(playerJS, nFuncName)
 	case EngineBun:
 		// Try pre-spawned runner first
-		if runner, err := GetPreSpawnedRunner("bun", playerJS, nFuncName); err != nil {
+		if runner, err := r.GetPreSpawnedRunner(ctx, "bun", playerJS, nFuncName); err != nil {
 			return nil, err
 		} else if runner != nil {
 			return runner, nil
@@ -131,24 +158,24 @@ func NewJSEngine(engineType EngineType, playerJS []byte, nFuncName string) (JSEn
 		return NewSubprocessRunner("bun", playerJS, nFuncName)
 	case EngineNode:
 		// Try pre-spawned runner first
-		if runner, err := GetPreSpawnedRunner("node", playerJS, nFuncName); err != nil {
+		if runner, err := r.GetPreSpawnedRunner(ctx, "node", playerJS, nFuncName); err != nil {
 			return nil, err
 		} else if runner != nil {
 			return runner, nil
 		}
 		return NewSubprocessRunner("node", playerJS, nFuncName)
 	case EngineAuto:
-		return newAutoEngine(playerJS, nFuncName)
+		return r.newAutoEngine(ctx, playerJS, nFuncName)
 	default:
 		return nil, fmt.Errorf("unknown engine type: %s", engineType)
 	}
 }
 
-func newAutoEngine(playerJS []byte, nFuncName string) (JSEngine, error) {
+func (r *Runtime) newAutoEngine(ctx context.Context, playerJS []byte, nFuncName string) (JSEngine, error) {
 	// Try Bun first (with pre-spawn support)
 	if bunPath, err := exec.LookPath("bun"); err == nil && bunPath != "" {
 		// Try pre-spawned runner first
-		if runner, err := GetPreSpawnedRunner("bun", playerJS, nFuncName); err != nil {
+		if runner, err := r.GetPreSpawnedRunner(ctx, "bun", playerJS, nFuncName); err != nil {
 			// Pre-spawn failed, try fresh
 		} else if runner != nil {
 			return runner, nil
@@ -161,7 +188,7 @@ func newAutoEngine(playerJS []byte, nFuncName string) (JSEngine, error) {
 	// Try Node.js (with pre-spawn support)
 	if nodePath, err := exec.LookPath("node"); err == nil && nodePath != "" {
 		// Try pre-spawned runner first
-		if runner, err := GetPreSpawnedRunner("node", playerJS, nFuncName); err != nil {
+		if runner, err := r.GetPreSpawnedRunner(ctx, "node", playerJS, nFuncName); err != nil {
 			// Pre-spawn failed, try fresh
 		} else if runner != nil {
 			return runner, nil
