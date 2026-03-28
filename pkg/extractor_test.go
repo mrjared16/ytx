@@ -17,9 +17,15 @@ import (
 // TimingToleranceMs allows for network variance in timing comparisons
 const TimingToleranceMs = 150
 
+// PerfRegressionMinBudgetMs is the minimum extra slowdown budget allowed before
+// failing strict regression checks. This keeps manual perf checks useful without
+// making normal network variance fail the suite.
+const PerfRegressionMinBudgetMs int64 = 250
+
 // TestResult captures timing and results for a single extraction
 type TestResult struct {
 	Mode          string        `json:"mode"`
+	CacheState    string        `json:"cache_state,omitempty"`
 	VideoID       string        `json:"video_id"`
 	Success       bool          `json:"success"`
 	Error         string        `json:"error,omitempty"`
@@ -99,9 +105,21 @@ func withinTolerance(actual, expected, toleranceMs int64) bool {
 	return diff <= float64(toleranceMs)
 }
 
+func perfRegressionBudget(expected int64) int64 {
+	relativeBudget := int64(math.Ceil(float64(expected) * 0.35))
+	if relativeBudget < PerfRegressionMinBudgetMs {
+		return PerfRegressionMinBudgetMs
+	}
+	return relativeBudget
+}
+
 // compareResults compares actual results against golden baseline
 func compareResults(t *testing.T, actual, expected []TestResult) {
 	t.Helper()
+	strictPerfRegression := os.Getenv("STRICT_REGRESSION") == "1"
+	if len(actual) != len(expected) {
+		t.Fatalf("result count mismatch: got %d want %d", len(actual), len(expected))
+	}
 
 	for i, exp := range expected {
 		if i >= len(actual) {
@@ -114,6 +132,9 @@ func compareResults(t *testing.T, actual, expected []TestResult) {
 		if act.Mode != exp.Mode {
 			t.Errorf("Result %d: mode mismatch: got %s, want %s", i, act.Mode, exp.Mode)
 		}
+		if act.CacheState != exp.CacheState {
+			t.Errorf("Result %d: cache_state mismatch: got %s, want %s", i, act.CacheState, exp.CacheState)
+		}
 		if act.VideoID != exp.VideoID {
 			t.Errorf("Result %d: videoID mismatch: got %s, want %s", i, act.VideoID, exp.VideoID)
 		}
@@ -123,6 +144,18 @@ func compareResults(t *testing.T, actual, expected []TestResult) {
 		if act.HTTPStatus != exp.HTTPStatus && exp.Success {
 			t.Errorf("Result %d: HTTP status mismatch: got %d, want %d", i, act.HTTPStatus, exp.HTTPStatus)
 		}
+		if act.Itag != exp.Itag && exp.Success {
+			t.Errorf("Result %d: itag mismatch: got %d, want %d", i, act.Itag, exp.Itag)
+		}
+		if act.Bitrate != exp.Bitrate && exp.Bitrate != 0 {
+			t.Errorf("Result %d: bitrate mismatch: got %d, want %d", i, act.Bitrate, exp.Bitrate)
+		}
+		if act.QualityLabel != exp.QualityLabel && exp.QualityLabel != "" {
+			t.Errorf("Result %d: quality mismatch: got %s, want %s", i, act.QualityLabel, exp.QualityLabel)
+		}
+		if act.NTransformed != exp.NTransformed && exp.Success {
+			t.Errorf("Result %d: n_transform mismatch: got %v, want %v", i, act.NTransformed, exp.NTransformed)
+		}
 
 		// Compare timings with tolerance (only if both have profiled data)
 		if exp.Timings.TotalMs > 0 && act.Timings.TotalMs > 0 {
@@ -130,6 +163,14 @@ func compareResults(t *testing.T, actual, expected []TestResult) {
 				t.Logf("Result %d: timing outside tolerance: got %dms, want %dms (tolerance: %dms)",
 					i, act.Timings.TotalMs, exp.Timings.TotalMs, TimingToleranceMs)
 				// Log as warning, not error - network variance is expected
+			}
+
+			if strictPerfRegression && act.Timings.TotalMs > exp.Timings.TotalMs {
+				budget := perfRegressionBudget(exp.Timings.TotalMs)
+				if act.Timings.TotalMs-exp.Timings.TotalMs > budget {
+					t.Errorf("Result %d: significant slowdown detected: got %dms, want <= %dms (baseline=%dms, budget=%dms)",
+						i, act.Timings.TotalMs, exp.Timings.TotalMs+budget, exp.Timings.TotalMs, budget)
+				}
 			}
 		}
 	}
@@ -147,31 +188,54 @@ func TestExtractorRegression(t *testing.T) {
 	results := make([]TestResult, 0)
 
 	for _, videoID := range testVideoIDs {
-		// Test video mode (doesn't need cookies)
-		t.Run(fmt.Sprintf("Video_%s", videoID), func(t *testing.T) {
-			result := testVideoMode(t, tmpDir, videoID)
-			results = append(results, result)
-			logResult(t, result)
-		})
+		videoCacheDir := filepath.Join(tmpDir, "cache_video_"+videoID)
+		if err := os.MkdirAll(videoCacheDir, 0755); err != nil {
+			t.Fatalf("create video cache dir: %v", err)
+		}
+		videoRuntime := NewRuntime()
+		defer videoRuntime.CloseCachedEngine()
+
+		for _, cacheState := range []string{"cold", "warm"} {
+			cacheState := cacheState
+			t.Run(fmt.Sprintf("Video_%s_%s", cacheState, videoID), func(t *testing.T) {
+				result := testVideoMode(t, videoCacheDir, videoID, videoRuntime, cacheState)
+				results = append(results, result)
+				logResult(t, result)
+			})
+		}
 
 		// Test music mode if cookies are available
-		t.Run(fmt.Sprintf("Music_%s", videoID), func(t *testing.T) {
-			home, _ := os.UserHomeDir()
-			cookiePath := filepath.Join(home, ".config", "ytx", "cookies.txt")
-			if _, err := os.Stat(cookiePath); os.IsNotExist(err) {
-				t.Skip("Cookie file not found, skipping music mode test")
-			}
-			result := testMusicMode(t, tmpDir, videoID, cookiePath)
-			results = append(results, result)
-			logResult(t, result)
-		})
+		musicCacheDir := filepath.Join(tmpDir, "cache_music_"+videoID)
+		if err := os.MkdirAll(musicCacheDir, 0755); err != nil {
+			t.Fatalf("create music cache dir: %v", err)
+		}
+		musicRuntime := NewRuntime()
+		defer musicRuntime.CloseCachedEngine()
+
+		for _, cacheState := range []string{"cold", "warm"} {
+			cacheState := cacheState
+			t.Run(fmt.Sprintf("Music_%s_%s", cacheState, videoID), func(t *testing.T) {
+				home, _ := os.UserHomeDir()
+				cookiePath := filepath.Join(home, ".config", "ytx", "cookies.txt")
+				if _, err := os.Stat(cookiePath); os.IsNotExist(err) {
+					t.Skip("Cookie file not found, skipping music mode test")
+				}
+				result := testMusicMode(t, musicCacheDir, videoID, cookiePath, musicRuntime, cacheState)
+				results = append(results, result)
+				logResult(t, result)
+			})
+		}
 	}
+
+	updateGolden := os.Getenv("UPDATE_GOLDEN") == "1"
 
 	// Load existing golden image for comparison
 	existingGolden, err := loadGoldenImage()
-	if err == nil && len(existingGolden.Results) > 0 {
+	if !updateGolden && err == nil && len(existingGolden.Results) > 0 {
 		t.Log("Comparing against existing golden image...")
 		compareResults(t, results, existingGolden.Results)
+	} else if updateGolden {
+		t.Log("UPDATE_GOLDEN=1 set, skipping golden comparison")
 	} else {
 		t.Log("No existing golden image found, creating new baseline")
 	}
@@ -179,7 +243,7 @@ func TestExtractorRegression(t *testing.T) {
 	// Create new golden image
 	golden := GoldenImage{
 		GeneratedAt: time.Now().Format(time.RFC3339),
-		Version:     2, // Increment when test structure changes
+		Version:     3, // Increment when test structure changes
 		Results:     results,
 	}
 
@@ -187,7 +251,7 @@ func TestExtractorRegression(t *testing.T) {
 	t.Logf("\n=== Current Results ===\n%s\n", goldenJSON)
 
 	// Save if UPDATE_GOLDEN env is set or no golden exists
-	if os.Getenv("UPDATE_GOLDEN") == "1" || err != nil {
+	if updateGolden || err != nil {
 		if saveErr := saveGoldenImage(&golden); saveErr != nil {
 			t.Logf("Failed to save golden image: %v", saveErr)
 		} else {
@@ -199,28 +263,22 @@ func TestExtractorRegression(t *testing.T) {
 }
 
 // testVideoMode tests video extraction with timing
-func testVideoMode(t *testing.T, tmpDir, videoID string) TestResult {
+func testVideoMode(t *testing.T, cacheDir, videoID string, runtime *Runtime, cacheState string) TestResult {
 	result := TestResult{
-		Mode:    "video",
-		VideoID: videoID,
+		Mode:       "video",
+		CacheState: cacheState,
+		VideoID:    videoID,
 	}
 
 	totalStart := time.Now()
 
-	// Create extractor with isolated cache
-	cacheDir := filepath.Join(tmpDir, "cache_video_"+videoID)
-	os.MkdirAll(cacheDir, 0755)
-
 	// Video mode doesn't need cookies
-	ext, err := NewExtractor(ModeVideo, "")
+	ext, err := NewExtractor(ModeVideo, "", WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir}))
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to create extractor: %v", err)
 		result.TotalDuration = time.Since(totalStart).String()
 		return result
 	}
-
-	// Override cache manager to use temp dir
-	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
 
 	// Enable profiling
 	ext.SetProfile(true)
@@ -268,27 +326,21 @@ func testVideoMode(t *testing.T, tmpDir, videoID string) TestResult {
 }
 
 // testMusicMode tests music extraction with timing and profiling
-func testMusicMode(t *testing.T, tmpDir, videoID, cookiePath string) TestResult {
+func testMusicMode(t *testing.T, cacheDir, videoID, cookiePath string, runtime *Runtime, cacheState string) TestResult {
 	result := TestResult{
-		Mode:    "music",
-		VideoID: videoID,
+		Mode:       "music",
+		CacheState: cacheState,
+		VideoID:    videoID,
 	}
 
 	totalStart := time.Now()
 
-	// Create extractor with isolated cache
-	cacheDir := filepath.Join(tmpDir, "cache_music_"+videoID)
-	os.MkdirAll(cacheDir, 0755)
-
-	ext, err := NewExtractor(ModeMusic, cookiePath)
+	ext, err := NewExtractor(ModeMusic, cookiePath, WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir}))
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to create extractor: %v", err)
 		result.TotalDuration = time.Since(totalStart).String()
 		return result
 	}
-
-	// Override cache manager to use temp dir
-	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
 
 	// Enable profiling
 	ext.SetProfile(true)
@@ -303,7 +355,6 @@ func testMusicMode(t *testing.T, tmpDir, videoID, cookiePath string) TestResult 
 	if err != nil {
 		result.Error = fmt.Sprintf("extraction failed: %v", err)
 		result.TotalDuration = time.Since(totalStart).String()
-		CloseCachedEngine()
 		return result
 	}
 
@@ -337,9 +388,6 @@ func testMusicMode(t *testing.T, tmpDir, videoID, cookiePath string) TestResult 
 	}
 
 	result.TotalDuration = time.Since(totalStart).String()
-
-	// Cleanup
-	CloseCachedEngine()
 
 	return result
 }
@@ -384,8 +432,8 @@ func logResult(t *testing.T, r TestResult) {
 		status = "✗"
 	}
 
-	t.Logf("%s [%s] %s: itag=%d, http=%d, duration=%s",
-		status, r.Mode, r.VideoID, r.Itag, r.HTTPStatus, r.TotalDuration)
+	t.Logf("%s [%s/%s] %s: itag=%d, http=%d, duration=%s",
+		status, r.Mode, r.CacheState, r.VideoID, r.Itag, r.HTTPStatus, r.TotalDuration)
 
 	if r.Timings.TotalMs > 0 {
 		t.Logf("  Profiled: visitor=%dms, sts-wait=%dms, api=%dms, cipher-wait=%dms, cipher-prewarm=%dms, sig=%dms, n-transform=%dms, other=%dms, total=%dms",
