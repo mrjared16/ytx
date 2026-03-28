@@ -126,6 +126,12 @@ CACHE_DIR := $(HOME)/.cache/ytx
 TEST_VIDEO := dQw4w9WgXcQ
 TEST_VIDEO_2 := hbl2Cuw75oE
 
+# Troubleshooting defaults
+DEBUG_VIDEO ?= $(TEST_VIDEO)
+DEBUG_MODE ?= music
+DEBUG_FIELD ?= url
+DEBUG_COOKIE_FILE ?= $(HOME)/.config/ytx/cookies.txt
+
 # =============================================================================
 # Default Target
 # =============================================================================
@@ -205,6 +211,23 @@ test-short:
 test-regression:
 	@echo "Running regression tests with golden image..."
 	go test -v -run 'TestExtractorRegression|TestNTransformIsolated|TestCacheIsolation' ./pkg -timeout 180s
+	@echo "Done"
+
+## test-regression-update: Rewrite regression golden image intentionally
+##   USE: After validating an intentional change in extraction behavior/timings
+.PHONY: test-regression-update
+test-regression-update:
+	@echo "Updating regression golden image..."
+	UPDATE_GOLDEN=1 go test -v ./pkg -run '^TestExtractorRegression$$' -count=1 -timeout 180s
+	@echo "Done"
+
+## test-regression-perf: Fail on significant slowdown versus golden baseline
+##   RULE: Fails only when total_ms exceeds baseline by > max(250ms, 35%)
+##   USE: Manual performance gate after latency-sensitive changes
+.PHONY: test-regression-perf
+test-regression-perf:
+	@echo "Running strict regression performance check..."
+	STRICT_REGRESSION=1 go test -v ./pkg -run '^TestExtractorRegression$$' -count=1 -timeout 180s
 	@echo "Done"
 
 ## test-music: Run music mode test (requires cookies)
@@ -340,6 +363,48 @@ analyze-goja:
 		echo "Analysis script not found. See Makefile comments for explanation."; \
 	fi
 
+## diagnose: Compare ytx with yt-dlp and direct API behavior
+##   USE: First command to run when extraction breaks
+.PHONY: diagnose
+diagnose:
+	@echo "Running extractor diagnosis for $(DEBUG_VIDEO)..."
+	go run ./cmd/diagnose/main.go $(DEBUG_VIDEO)
+
+## probe-url: Extract a fresh URL and perform a quick HTTP probe
+##   DEFAULTS: DEBUG_MODE=music DEBUG_FIELD=url
+##   VIDEO MODE: set DEBUG_FIELD=audio_url or DEBUG_FIELD=video_url
+.PHONY: probe-url
+probe-url: build-fast
+	@set -e; \
+	if [ "$(DEBUG_MODE)" = "music" ]; then \
+		JSON=$$(./$(BINARY_NAME) music $(DEBUG_VIDEO) --cookies "$(DEBUG_COOKIE_FILE)" --profile); \
+	else \
+		JSON=$$(./$(BINARY_NAME) video $(DEBUG_VIDEO) --profile); \
+	fi; \
+	URL=$$(printf '%s' "$$JSON" | python3 -c 'import json,sys; data=json.load(sys.stdin); key=sys.argv[1]; value=data.get(key, ""); assert value, f"missing field: {key}"; print(value)' "$(DEBUG_FIELD)"); \
+	echo "Probing $(DEBUG_MODE)/$(DEBUG_FIELD) for $(DEBUG_VIDEO)..."; \
+	echo "URL: $$URL"; \
+	curl -L --silent --show-error --output /dev/null --range 0-0 \
+		--write-out "http=%{http_code} bytes=%{size_download} total=%{time_total}s speed=%{speed_download}B/s\n" \
+		"$$URL"
+
+## probe-download: Extract a fresh URL and download the full stream to /dev/null
+##   USE: Distinguish invalid URL vs throttling vs rate limiting/blocking
+.PHONY: probe-download
+probe-download: build-fast
+	@set -e; \
+	if [ "$(DEBUG_MODE)" = "music" ]; then \
+		JSON=$$(./$(BINARY_NAME) music $(DEBUG_VIDEO) --cookies "$(DEBUG_COOKIE_FILE)" --profile); \
+	else \
+		JSON=$$(./$(BINARY_NAME) video $(DEBUG_VIDEO) --profile); \
+	fi; \
+	URL=$$(printf '%s' "$$JSON" | python3 -c 'import json,sys; data=json.load(sys.stdin); key=sys.argv[1]; value=data.get(key, ""); assert value, f"missing field: {key}"; print(value)' "$(DEBUG_FIELD)"); \
+	echo "Downloading $(DEBUG_MODE)/$(DEBUG_FIELD) for $(DEBUG_VIDEO) to /dev/null..."; \
+	echo "URL: $$URL"; \
+	curl -L --fail --silent --show-error --output /dev/null \
+		--write-out "http=%{http_code} bytes=%{size_download} total=%{time_total}s speed=%{speed_download}B/s\n" \
+		"$$URL"
+
 ## profile-cpu: CPU profiling for optimization
 .PHONY: profile-cpu
 profile-cpu:
@@ -456,7 +521,7 @@ help:
 	@grep -E '^## cache' $(MAKEFILE_LIST) | sed 's/^## /  /' | cut -d: -f1
 	@echo ""
 	@echo "ANALYSIS:"
-	@grep -E '^## (analyze|profile)' $(MAKEFILE_LIST) | sed 's/^## /  /' | cut -d: -f1
+	@grep -E '^## (analyze|profile|diagnose|probe)' $(MAKEFILE_LIST) | sed 's/^## /  /' | cut -d: -f1
 	@echo ""
 	@echo "BULK MUSIC PERFORMANCE:"
 	@echo "  First video:  ~700ms (cold start)"

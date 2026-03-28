@@ -126,6 +126,8 @@ UPDATE_GOLDEN=1 go test -v ./pkg/... -run TestExtractorRegression
 
 ## When YouTube Breaks Things
 
+For the step-by-step operational workflow, use `docs/extractor-breakage-playbook.md`.
+
 ### Quick Diagnosis
 
 ```bash
