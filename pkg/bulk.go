@@ -1,6 +1,7 @@
 package ytx
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -26,6 +27,11 @@ const (
 // BulkExtract processes multiple video IDs with bucket-based batching
 // Results are streamed to stdout as NDJSON
 func (e *Extractor) BulkExtract(videoIDs []string) {
+	e.BulkExtractContext(context.Background(), videoIDs)
+}
+
+// BulkExtractContext processes multiple video IDs with shared context.
+func (e *Extractor) BulkExtractContext(ctx context.Context, videoIDs []string) {
 	encoder := json.NewEncoder(os.Stdout)
 
 	// Process in batches
@@ -34,7 +40,7 @@ func (e *Extractor) BulkExtract(videoIDs []string) {
 		batch := videoIDs[batchStart:batchEnd]
 
 		// Process this batch with pipelining and batch n-transform
-		results := e.processBatchOptimized(batch)
+		results := e.processBatchOptimizedContext(ctx, batch)
 
 		// Stream results immediately
 		for _, result := range results {
@@ -64,16 +70,23 @@ type intermediateResult struct {
 // 2. Batch n-transform all n-parameters in single IPC call
 // 3. Apply transformed n-parameters to URLs
 func (e *Extractor) processBatchOptimized(videoIDs []string) []BulkResult {
+	return e.processBatchOptimizedContext(context.Background(), videoIDs)
+}
+
+func (e *Extractor) processBatchOptimizedContext(ctx context.Context, videoIDs []string) []BulkResult {
 	results := make([]BulkResult, len(videoIDs))
 	intermediates := make([]intermediateResult, len(videoIDs))
 	var wg sync.WaitGroup
+	if len(videoIDs) > 0 {
+		e.prefetchBatchSharedState(ctx, videoIDs[0])
+	}
 
 	// Step 1: Parallel API calls (get URLs without n-transform)
 	for i, id := range videoIDs {
 		wg.Add(1)
 		go func(idx int, videoID string) {
 			defer wg.Done()
-			ir := e.extractWithoutNTransform(videoID)
+			ir := e.extractWithoutNTransformContext(ctx, videoID)
 			intermediates[idx] = ir
 		}(i, id)
 
@@ -98,7 +111,7 @@ func (e *Extractor) processBatchOptimized(videoIDs []string) []BulkResult {
 	var transformedN []string
 	if len(nValues) > 0 && e.cipher != nil {
 		var err error
-		transformedN, err = e.cipher.TransformNBatch(nValues)
+		transformedN, err = e.cipher.TransformNBatchContext(ctx, nValues)
 		if err != nil {
 			// Fallback: use original n-values
 			transformedN = nValues
@@ -135,15 +148,19 @@ func (e *Extractor) processBatchOptimized(videoIDs []string) []BulkResult {
 
 // extractWithoutNTransform gets stream URL without doing n-transform
 func (e *Extractor) extractWithoutNTransform(videoID string) intermediateResult {
+	return e.extractWithoutNTransformContext(context.Background(), videoID)
+}
+
+func (e *Extractor) extractWithoutNTransformContext(ctx context.Context, videoID string) intermediateResult {
 	ir := intermediateResult{videoID: videoID}
 
 	// Fetch visitorData (use cache)
-	if err := e.fetchVisitorData(videoID); err != nil {
+	if err := e.fetchVisitorDataContext(ctx, videoID); err != nil {
 		// Non-fatal
 	}
 
 	// Call API
-	playerResp, err := e.callPlayerAPI(videoID)
+	playerResp, err := e.callPlayerAPIContext(ctx, videoID)
 	if err != nil {
 		ir.err = err
 		return ir
@@ -162,7 +179,7 @@ func (e *Extractor) extractWithoutNTransform(videoID string) intermediateResult 
 	}
 
 	// Get stream URL (without n-transform)
-	streamURL, err := e.getStreamURLRaw(videoID, stream)
+	streamURL, err := e.getStreamURLRawContext(ctx, videoID, stream)
 	if err != nil {
 		ir.err = err
 		return ir
@@ -186,6 +203,10 @@ func (e *Extractor) extractWithoutNTransform(videoID string) intermediateResult 
 // - Bulk mode skips retry logic (batch n-transform handles failures)
 // - Single mode has fail-forward retry for robustness
 func (e *Extractor) getStreamURLRaw(videoID string, stream *Format) (string, error) {
+	return e.getStreamURLRawContext(context.Background(), videoID, stream)
+}
+
+func (e *Extractor) getStreamURLRawContext(ctx context.Context, videoID string, stream *Format) (string, error) {
 	// If URL is directly available (pre-signed), use it
 	if stream.URL != "" {
 		return stream.URL, nil
@@ -210,7 +231,7 @@ func (e *Extractor) getStreamURLRaw(videoID string, stream *Format) (string, err
 	}
 
 	// Initialize cipher if needed
-	cipher, err := e.ensureCipher(videoID)
+	cipher, err := e.ensureCipherContext(ctx, videoID)
 	if err != nil {
 		return "", err
 	}
@@ -234,6 +255,18 @@ func (e *Extractor) getStreamURLRaw(videoID string, stream *Format) (string, err
 	return parsedURL.String(), nil
 }
 
+func (e *Extractor) prefetchBatchSharedState(ctx context.Context, videoID string) {
+	go func() {
+		prefetchCtx, cancel := backgroundRefreshContext(ctx, backgroundWarmupTTL)
+		defer cancel()
+		_ = e.fetchVisitorDataContext(prefetchCtx, videoID)
+		cipher, err := e.ensureCipherContext(prefetchCtx, videoID)
+		if err == nil && cipher != nil {
+			_ = cipher.WarmNTransformEngineContext(prefetchCtx)
+		}
+	}()
+}
+
 // applyNParam replaces n-parameter in URL with transformed value
 func applyNParam(streamURL, transformedN string) string {
 	parsedURL, err := url.Parse(streamURL)
@@ -252,6 +285,10 @@ func applyNParam(streamURL, transformedN string) string {
 // Uses bucket-based batching for rate-limit safety
 // This is the programmatic API - use BulkExtract() for CLI streaming to stdout
 func (e *Extractor) BulkExtractOrdered(videoIDs []string) []BulkResult {
+	return e.BulkExtractOrderedContext(context.Background(), videoIDs)
+}
+
+func (e *Extractor) BulkExtractOrderedContext(ctx context.Context, videoIDs []string) []BulkResult {
 	allResults := make([]BulkResult, 0, len(videoIDs))
 
 	// Process in batches
@@ -260,7 +297,7 @@ func (e *Extractor) BulkExtractOrdered(videoIDs []string) []BulkResult {
 		batch := videoIDs[batchStart:batchEnd]
 
 		// Process this batch
-		batchResults := e.processBatchOptimized(batch)
+		batchResults := e.processBatchOptimizedContext(ctx, batch)
 		allResults = append(allResults, batchResults...)
 
 		// Inter-batch delay (except for last batch)
