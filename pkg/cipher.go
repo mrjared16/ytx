@@ -2,11 +2,13 @@ package ytx
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -28,6 +30,7 @@ import (
 //
 // For n-function: Use kkdai's approach - extract raw function body and ExportTo
 type Cipher struct {
+	runtime            *Runtime
 	sigFunctionName    string
 	sigParam           int
 	sigUsesURLWrapper  bool
@@ -39,6 +42,7 @@ type Cipher struct {
 	playerFingerprint  string
 	playerJS           []byte // Full player JS for n-function extraction
 	warnings           []string
+	isBytecode         bool
 	lazyMu             sync.Mutex
 
 	// Cached QuickJS wrapper runtime — reused for both sig and n calls.
@@ -153,16 +157,25 @@ var nRuntimeExposePattern = regexp.MustCompile(`\}\)\(_yt_player\);\s*$`)
 // If cachedPath is provided and valid, skips the embed page fetch (~150ms savings)
 // baseURL allows domain reuse (e.g., music.youtube.com for music mode) to avoid extra TLS handshake
 func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath string, baseURL string) (*Cipher, string, error) {
+	return NewCipherWithCachedPathContext(context.Background(), defaultRuntime, videoID, httpClient, cachedPath, baseURL)
+}
+
+func NewCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, videoID string, httpClient *http.Client, cachedPath string, baseURL string) (*Cipher, string, error) {
 	var playerPath string
 	var playerJS []byte
 	var err error
 	warnings := make([]string, 0, 2)
 
-	_ = baseURL
+	if runtime == nil {
+		runtime = defaultRuntime
+	}
 	playerBaseURL := PlayerJSURLBase
+	if baseURL != "" {
+		playerBaseURL = strings.TrimRight(baseURL, "/")
+	}
 
 	// Determine engine type for pre-spawning
-	engineType := GetEngineType()
+	engineType := runtime.GetEngineType()
 	var engineName string
 	switch engineType {
 	case EngineBun:
@@ -179,14 +192,16 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	// Pre-spawn JS process in parallel with player.js download (saves ~100-150ms)
 	// This overlaps process startup with network I/O
 	if engineName != "" {
-		go PreSpawnJSProcess(engineName)
+		go func() {
+			_ = runtime.PreSpawnJSProcess(context.Background(), engineName, nil, "")
+		}()
 	}
 
 	// Try cached path first (skip embed page fetch)
 	// Use playerBaseURL to benefit from connection reuse
 	if cachedPath != "" {
 		playerURL := playerBaseURL + cachedPath
-		playerJS, err = httpGetBytes(httpClient, playerURL)
+		playerJS, err = httpGetBytesContext(ctx, httpClient, playerURL)
 		if err == nil {
 			playerPath = cachedPath
 		} else {
@@ -196,7 +211,7 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	}
 
 	if playerPath == "" {
-		playerPath, playerJS, err = fetchPlayerJS(videoID, httpClient, playerBaseURL)
+		playerPath, playerJS, err = fetchPlayerJSContext(ctx, videoID, httpClient, playerBaseURL)
 		if err != nil {
 			return nil, "", err
 		}
@@ -206,7 +221,7 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	sigUsesURLWrapper := false
 	if err != nil {
 		if cachedPath != "" && playerPath == cachedPath {
-			playerPath, playerJS, err = fetchPlayerJS(videoID, httpClient, playerBaseURL)
+			playerPath, playerJS, err = fetchPlayerJSContext(ctx, videoID, httpClient, playerBaseURL)
 			if err != nil {
 				return nil, "", err
 			}
@@ -237,6 +252,7 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 	nRuntimeJS := buildNTransformRuntime(playerJS, nName)
 
 	return &Cipher{
+		runtime:            runtime,
 		sigFunctionName:    sigName,
 		sigParam:           sigParam,
 		sigUsesURLWrapper:  sigUsesURLWrapper,
@@ -252,10 +268,19 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 
 // NewCipherFromCache reconstructs a Cipher from cached data
 func NewCipherFromCache(cache *CipherCache) *Cipher {
+	return NewCipherFromCacheWithRuntime(defaultRuntime, cache)
+}
+
+func NewCipherFromCacheWithRuntime(runtime *Runtime, cache *CipherCache) *Cipher {
+	if runtime == nil {
+		runtime = defaultRuntime
+	}
 	return &Cipher{
+		runtime:            runtime,
 		sigFunctionName:    cache.SigFunction,
 		sigParam:           cache.SigParam,
 		sigUsesURLWrapper:  cache.SigUsesURLWrapper,
+		isBytecode:         cache.IsBytecode,
 		nFunctionName:      cache.NFunction,
 		signatureTimestamp: cache.SignatureTimestamp,
 		jsCode:             cache.JSCode,
@@ -276,10 +301,44 @@ func (c *Cipher) ToCache() *CipherCache {
 		SigFunction:        c.sigFunctionName,
 		SigParam:           c.sigParam,
 		SigUsesURLWrapper:  c.sigUsesURLWrapper,
+		IsBytecode:         c.isBytecode,
 		NFunction:          c.nFunctionName,
 		SignatureTimestamp: c.signatureTimestamp,
 		JSCode:             c.jsCode,
 	}
+}
+
+// Prewarm spins up the QuickJS runtime aggressively ahead of time
+func (c *Cipher) Prewarm() error {
+	c.lazyMu.Lock()
+	defer c.lazyMu.Unlock()
+	_, err := c.ensureWrapperContext(c.jsCode)
+	return err
+}
+
+func (c *Cipher) runtimeOrDefault() *Runtime {
+	if c.runtime != nil {
+		return c.runtime
+	}
+	return defaultRuntime
+}
+
+func (c *Cipher) WarmNTransformEngine() error {
+	return c.WarmNTransformEngineContext(context.Background())
+}
+
+func (c *Cipher) WarmNTransformEngineContext(ctx context.Context) error {
+	if c.nFunctionName == "" {
+		return nil
+	}
+	if len(c.nRuntimeJS) == 0 {
+		c.nRuntimeJS = buildNTransformRuntime(c.playerJS, c.nFunctionName)
+	}
+	if len(c.nRuntimeJS) == 0 {
+		return fmt.Errorf("no player.js available for n-transform")
+	}
+	_, err := c.runtimeOrDefault().GetCachedEngine(ctx, c.engineCacheKey(), c.nRuntimeJS, c.nFunctionName)
+	return err
 }
 
 func (c *Cipher) ensureSignatureReady() error {
@@ -305,18 +364,29 @@ func (c *Cipher) ensureSignatureReady() error {
 		if c.jsCode == "" {
 			c.jsCode = string(c.playerJS)
 		}
-		return nil
-	}
-
-	jsCode, err := extractWithAST(string(c.playerJS), c.sigFunctionName)
-	if err != nil {
-		jsCode, err = extractSimple(c.playerJS, c.sigFunctionName)
+	} else {
+		jsCode, err := extractWithAST(string(c.playerJS), c.sigFunctionName)
 		if err != nil {
-			return fmt.Errorf("failed to extract sig function: %w", err)
+			jsCode, err = extractSimple(c.playerJS, c.sigFunctionName)
+			if err != nil {
+				return fmt.Errorf("failed to extract sig function: %w", err)
+			}
 		}
+		c.jsCode = jsCode
 	}
 
-	c.jsCode = jsCode
+	// Fast Boot Optimization: Automatically compile to QuickJS Bytecode if plain script.
+	if !c.isBytecode && len(c.jsCode) > 0 {
+		rt := quickjs.NewRuntime()
+		ctx := rt.NewContext()
+		if bytecode, err := ctx.Compile(c.jsCode, quickjs.EvalFlagGlobal(true)); err == nil {
+			c.jsCode = string(bytecode)
+			c.isBytecode = true
+		}
+		ctx.Close()
+		rt.Close()
+	}
+
 	return nil
 }
 
@@ -1031,30 +1101,14 @@ func (c *Cipher) DecryptSignature(sig string) (string, error) {
 		return "", errors.New("url wrapper function unavailable in current player JS")
 	}
 
-	rt := quickjs.NewRuntime(
-		quickjs.WithMemoryLimit(256*1024*1024),
-		quickjs.WithMaxStackSize(8*1024*1024),
-	)
-	defer rt.Close()
-	ctx := rt.NewContext()
-	defer ctx.Close()
-
-	// Inject browser stubs first (needed for signature function)
-	stubsVal := ctx.Eval(browserStubsJS, quickjs.EvalFlagGlobal(true))
-	if ctx.HasException() {
-		exc := ctx.Exception()
-		stubsVal.Free()
-		return "", fmt.Errorf("failed to inject browser stubs: %v", exc)
+	// Try pre-warmed context first or create one if not pre-warmed
+	c.lazyMu.Lock()
+	ctx, err := c.ensureWrapperContext(c.jsCode)
+	c.lazyMu.Unlock()
+	if err != nil {
+		return "", err
 	}
-	stubsVal.Free()
-
-	val := ctx.Eval(c.jsCode, quickjs.EvalFlagGlobal(true))
-	if ctx.HasException() {
-		exc := ctx.Exception()
-		val.Free()
-		return "", fmt.Errorf("failed to load JS: %v", exc)
-	}
-	val.Free()
+	// Intentionally don't close ctx here since it is cached in c.wrapperCtx
 
 	// Call the function
 	var callCode string
@@ -1095,6 +1149,10 @@ func (c *Cipher) DecryptSignature(sig string) (string, error) {
 // - You cannot extract the n-function without the ENTIRE 2.6MB player.js
 // - goja (ES5.1) fails with "ReferenceError: MP is not defined" and lacks ES2020+ support
 func (c *Cipher) TransformN(n string) (string, error) {
+	return c.TransformNContext(context.Background(), n)
+}
+
+func (c *Cipher) TransformNContext(ctx context.Context, n string) (string, error) {
 	if c.nFunctionName == "" {
 		if c.sigUsesURLWrapper {
 			var lastErr error
@@ -1124,7 +1182,7 @@ func (c *Cipher) TransformN(n string) (string, error) {
 	}
 
 	// Use cached engine for efficiency (engine type set via SetEngineType)
-	engine, err := GetCachedEngine(c.engineCacheKey(), c.nRuntimeJS, c.nFunctionName)
+	engine, err := c.runtimeOrDefault().GetCachedEngine(ctx, c.engineCacheKey(), c.nRuntimeJS, c.nFunctionName)
 	if err != nil {
 		wrapperName := ""
 		wrapperCodes := []string{}
@@ -1152,6 +1210,26 @@ func (c *Cipher) TransformN(n string) (string, error) {
 	}
 
 	return engine.TransformN(n)
+}
+
+func (c *Cipher) TransformNBatchContext(ctx context.Context, nValues []string) ([]string, error) {
+	if len(nValues) == 0 {
+		return nValues, nil
+	}
+	if c.nFunctionName == "" {
+		return nValues, nil
+	}
+	if len(c.nRuntimeJS) == 0 {
+		c.nRuntimeJS = buildNTransformRuntime(c.playerJS, c.nFunctionName)
+	}
+	if len(c.nRuntimeJS) == 0 {
+		return nValues, fmt.Errorf("no player.js available for n-transform")
+	}
+	engine, err := c.runtimeOrDefault().GetCachedEngine(ctx, c.engineCacheKey(), c.nRuntimeJS, c.nFunctionName)
+	if err != nil {
+		return nValues, err
+	}
+	return engine.TransformNBatch(nValues)
 }
 
 func (c *Cipher) wrapperCodeCandidates() []string {
@@ -1212,7 +1290,14 @@ func (c *Cipher) ensureWrapperContext(jsCode string) (*quickjs.Context, error) {
 	}
 	stubsVal.Free()
 
-	val := ctx.Eval(jsCode, quickjs.EvalFlagGlobal(true))
+	// Evaluate context payloads
+	var val *quickjs.Value
+	if c.isBytecode {
+		val = ctx.EvalBytecode([]byte(c.jsCode))
+	} else {
+		val = ctx.Eval(c.jsCode, quickjs.EvalFlagGlobal(true))
+	}
+
 	if ctx.HasException() {
 		exc := ctx.Exception()
 		val.Free()
@@ -1352,23 +1437,7 @@ return __n||'%s';
 
 // TransformNBatch transforms multiple n-parameters in a single IPC call
 func (c *Cipher) TransformNBatch(nValues []string) ([]string, error) {
-	if c.nFunctionName == "" || len(nValues) == 0 {
-		return nValues, nil
-	}
-
-	if len(c.playerJS) == 0 {
-		return nValues, fmt.Errorf("no player.js available for n-transform")
-	}
-
-	if len(c.nRuntimeJS) == 0 {
-		c.nRuntimeJS = buildNTransformRuntime(c.playerJS, c.nFunctionName)
-	}
-	engine, err := GetCachedEngine(c.engineCacheKey(), c.nRuntimeJS, c.nFunctionName)
-	if err != nil {
-		return nValues, err
-	}
-
-	return engine.TransformNBatch(nValues)
+	return c.TransformNBatchContext(context.Background(), nValues)
 }
 
 // findSigFunctionName finds the signature function name and optional param
@@ -1614,7 +1683,15 @@ func escapeJSString(s string) string {
 }
 
 func httpGetBytes(client *http.Client, url string) ([]byte, error) {
-	resp, err := client.Get(url)
+	return httpGetBytesContext(context.Background(), client, url)
+}
+
+func httpGetBytesContext(ctx context.Context, client *http.Client, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1679,14 +1756,25 @@ func buildNTransformRuntime(playerJS []byte, funcName string) []byte {
 }
 
 func fetchPlayerJS(videoID string, httpClient *http.Client, playerBaseURL string) (string, []byte, error) {
-	pageURLs := []string{
-		fmt.Sprintf("%s/embed/%s?hl=en", PlayerJSURLBase, videoID),
-		fmt.Sprintf("%s/watch?v=%s", PlayerJSURLBase, videoID),
+	return fetchPlayerJSContext(context.Background(), videoID, httpClient, playerBaseURL)
+}
+
+func fetchPlayerJSContext(ctx context.Context, videoID string, httpClient *http.Client, playerBaseURL string) (string, []byte, error) {
+	pageURLs := make([]string, 0, 4)
+	addPageURL := func(base string) {
+		pageURLs = append(pageURLs,
+			fmt.Sprintf("%s/embed/%s?hl=en", base, videoID),
+			fmt.Sprintf("%s/watch?v=%s", base, videoID),
+		)
+	}
+	addPageURL(playerBaseURL)
+	if playerBaseURL != PlayerJSURLBase {
+		addPageURL(PlayerJSURLBase)
 	}
 
 	var lastErr error
 	for _, pageURL := range pageURLs {
-		body, err := httpGetBytes(httpClient, pageURL)
+		body, err := httpGetBytesContext(ctx, httpClient, pageURL)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1698,7 +1786,12 @@ func fetchPlayerJS(videoID string, httpClient *http.Client, playerBaseURL string
 			continue
 		}
 
-		playerJS, err := httpGetBytes(httpClient, playerBaseURL+playerPath)
+		pageBaseURL := playerBaseURL
+		if parsedPageURL, parseErr := url.Parse(pageURL); parseErr == nil {
+			pageBaseURL = parsedPageURL.Scheme + "://" + parsedPageURL.Host
+		}
+
+		playerJS, err := httpGetBytesContext(ctx, httpClient, pageBaseURL+playerPath)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to fetch player JS from %s: %w", pageURL, err)
 			continue

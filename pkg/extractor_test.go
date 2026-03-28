@@ -533,26 +533,31 @@ func TestFetchVisitorDataUsesGlobalCacheForMusicMode(t *testing.T) {
 		t.Fatalf("failed to write cookie file: %v", err)
 	}
 
-	ext, err := NewExtractor(ModeMusic, cookieFile)
+	runtime := NewRuntime()
+	ext, err := NewExtractor(ModeMusic, cookieFile, WithRuntime(runtime))
 	if err != nil {
 		t.Fatalf("failed to create extractor: %v", err)
 	}
 
-	visitorDataCache.Lock()
-	visitorDataCache.data = "VISITOR_CACHE"
-	visitorDataCache.sessionIndex = "7"
-	visitorDataCache.delegatedSID = "DELEGATED_CACHE"
-	visitorDataCache.isAuth = true
-	visitorDataCache.expiry = time.Now().Add(visitorDataTTL)
-	visitorDataCache.Unlock()
+	runtime.visitorCache.Lock()
+	runtime.visitorCache.data = "VISITOR_CACHE"
+	runtime.visitorCache.sessionIndex = "7"
+	runtime.visitorCache.delegatedSID = "DELEGATED_CACHE"
+	runtime.visitorCache.isAuth = true
+	runtime.visitorCache.authKey = "music:test-sapisid"
+	runtime.visitorCache.expiry = time.Now().Add(visitorDataTTL)
+	runtime.visitorCache.updated = time.Now()
+	runtime.visitorCache.Unlock()
 	defer func() {
-		visitorDataCache.Lock()
-		visitorDataCache.data = ""
-		visitorDataCache.sessionIndex = ""
-		visitorDataCache.delegatedSID = ""
-		visitorDataCache.isAuth = false
-		visitorDataCache.expiry = time.Time{}
-		visitorDataCache.Unlock()
+		runtime.visitorCache.Lock()
+		runtime.visitorCache.data = ""
+		runtime.visitorCache.sessionIndex = ""
+		runtime.visitorCache.delegatedSID = ""
+		runtime.visitorCache.isAuth = false
+		runtime.visitorCache.authKey = ""
+		runtime.visitorCache.expiry = time.Time{}
+		runtime.visitorCache.updated = time.Time{}
+		runtime.visitorCache.Unlock()
 	}()
 
 	requests := 0
@@ -588,25 +593,30 @@ func TestExtractProfileTimingsAddUpToTotal(t *testing.T) {
 		t.Fatalf("write cookies: %v", err)
 	}
 
-	visitorDataCache.Lock()
-	visitorDataCache.data = ""
-	visitorDataCache.sessionIndex = ""
-	visitorDataCache.delegatedSID = ""
-	visitorDataCache.isAuth = false
-	visitorDataCache.expiry = time.Time{}
-	visitorDataCache.Unlock()
+	runtime := NewRuntime()
+	runtime.visitorCache.Lock()
+	runtime.visitorCache.data = ""
+	runtime.visitorCache.sessionIndex = ""
+	runtime.visitorCache.delegatedSID = ""
+	runtime.visitorCache.isAuth = false
+	runtime.visitorCache.authKey = ""
+	runtime.visitorCache.expiry = time.Time{}
+	runtime.visitorCache.updated = time.Time{}
+	runtime.visitorCache.Unlock()
 	defer func() {
-		visitorDataCache.Lock()
-		visitorDataCache.data = ""
-		visitorDataCache.sessionIndex = ""
-		visitorDataCache.delegatedSID = ""
-		visitorDataCache.isAuth = false
-		visitorDataCache.expiry = time.Time{}
-		visitorDataCache.Unlock()
-		CloseCachedEngine()
+		runtime.visitorCache.Lock()
+		runtime.visitorCache.data = ""
+		runtime.visitorCache.sessionIndex = ""
+		runtime.visitorCache.delegatedSID = ""
+		runtime.visitorCache.isAuth = false
+		runtime.visitorCache.authKey = ""
+		runtime.visitorCache.expiry = time.Time{}
+		runtime.visitorCache.updated = time.Time{}
+		runtime.visitorCache.Unlock()
+		runtime.CloseCachedEngine()
 	}()
 
-	ext, err := NewExtractor(ModeMusic, cookieFile)
+	ext, err := NewExtractor(ModeMusic, cookieFile, WithRuntime(runtime))
 	if err != nil {
 		t.Fatalf("NewExtractor returned error: %v", err)
 	}

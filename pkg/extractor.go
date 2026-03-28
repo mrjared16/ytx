@@ -2,6 +2,7 @@ package ytx
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,29 +16,18 @@ import (
 	"time"
 )
 
-// Global cipher cache (shared across Extractor instances for bulk operations)
-// This provides in-memory caching within a single process run
-var cipherCache struct {
-	sync.RWMutex
-	cipher *Cipher
-	expiry time.Time
-}
-
-// Global visitorData cache (valid for ~30 minutes)
-var visitorDataCache struct {
-	sync.RWMutex
-	data         string
-	sessionIndex string
-	delegatedSID string
-	isAuth       bool
-	expiry       time.Time
-}
-
 const visitorDataTTL = 30 * time.Minute
+
+const (
+	visitorDataSWRGrace = 2 * time.Hour
+	cipherSWRGrace      = 18 * time.Hour
+	backgroundWarmupTTL = 20 * time.Second
+)
 
 // Extractor handles YouTube stream extraction
 type Extractor struct {
 	config           ClientConfig
+	runtime          *Runtime
 	cookies          []*http.Cookie
 	httpClient       *http.Client
 	sapisid          string
@@ -62,12 +52,43 @@ type Extractor struct {
 // Users can override via --sub-langs flag
 var defaultSubtitleLangs = []string{"en"}
 
+// ExtractorOption customizes shared services for a new extractor.
+type ExtractorOption func(*Extractor) error
+
+func WithRuntime(runtime *Runtime) ExtractorOption {
+	return func(e *Extractor) error {
+		if runtime == nil {
+			return fmt.Errorf("runtime cannot be nil")
+		}
+		e.runtime = runtime
+		return nil
+	}
+}
+
+func WithHTTPClient(client *http.Client) ExtractorOption {
+	return func(e *Extractor) error {
+		if client == nil {
+			return fmt.Errorf("http client cannot be nil")
+		}
+		e.httpClient = client
+		return nil
+	}
+}
+
+func WithCacheManager(cacheManager *CacheManager) ExtractorOption {
+	return func(e *Extractor) error {
+		e.cacheManager = cacheManager
+		return nil
+	}
+}
+
 // NewExtractor creates a new extractor for the given mode
-func NewExtractor(mode ClientMode, cookieFile string) (*Extractor, error) {
+func NewExtractor(mode ClientMode, cookieFile string, opts ...ExtractorOption) (*Extractor, error) {
 	config := GetClientConfig(mode)
 
 	ext := &Extractor{
-		config: config,
+		config:  config,
+		runtime: defaultRuntime,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -79,9 +100,21 @@ func NewExtractor(mode ClientMode, cookieFile string) (*Extractor, error) {
 		},
 	}
 
+	for _, opt := range opts {
+		if err := opt(ext); err != nil {
+			return nil, err
+		}
+	}
+
 	// Initialize file-based cache manager (graceful degradation if fails)
-	if cm, err := NewCacheManager(); err == nil {
-		ext.cacheManager = cm
+	if ext.cacheManager == nil {
+		if cm, err := NewCacheManager(); err == nil {
+			ext.cacheManager = cm
+		}
+	}
+
+	if ext.runtime == nil {
+		ext.runtime = defaultRuntime
 	}
 
 	// Only load cookies if needed (music mode)
@@ -140,41 +173,142 @@ func (e *Extractor) SetAudioFormat(format AudioFormat) {
 }
 
 // fetchVisitorData gets visitorData from YouTube using WEB client (required since Jan 2025)
-// Uses a global cache to avoid redundant fetches across bulk operations
+// and reuses shared runtime cache state across extractors.
 func (e *Extractor) fetchVisitorData(videoID string) error {
-	// Check instance cache first
+	return e.fetchVisitorDataContext(context.Background(), videoID)
+}
+
+func (e *Extractor) fetchVisitorDataContext(ctx context.Context, videoID string) error {
 	if e.visitorData != "" {
 		if !e.config.NeedsCookies || e.sessionIndex != "" || e.delegatedSID != "" {
 			return nil
 		}
 	}
 
-	// Check global cache (for bulk operations and cross-extractor reuse)
-	visitorDataCache.RLock()
-	if visitorDataCache.data != "" && time.Now().Before(visitorDataCache.expiry) {
-		e.visitorData = visitorDataCache.data
-		e.sessionIndex = visitorDataCache.sessionIndex
-		e.delegatedSID = visitorDataCache.delegatedSID
-		isAuth := visitorDataCache.isAuth
-		visitorDataCache.RUnlock()
-		if !e.config.NeedsCookies || isAuth {
-			return nil
-		}
-	} else {
-		visitorDataCache.RUnlock()
-	}
+	authKey := e.visitorAuthKey()
+	now := time.Now()
 
-	if e.config.NeedsCookies {
-		if err := e.fetchMusicVisitorData(videoID); err != nil {
-			return err
+	e.runtime.visitorCache.RLock()
+	memVisitor := &VisitorCache{
+		Data:         e.runtime.visitorCache.data,
+		SessionIndex: e.runtime.visitorCache.sessionIndex,
+		DelegatedSID: e.runtime.visitorCache.delegatedSID,
+		IsAuth:       e.runtime.visitorCache.isAuth,
+		AuthKey:      e.runtime.visitorCache.authKey,
+		ExpiresAt:    e.runtime.visitorCache.expiry,
+	}
+	memUpdated := e.runtime.visitorCache.updated
+	e.runtime.visitorCache.RUnlock()
+	if e.visitorCacheUsable(memVisitor, authKey) {
+		e.applyVisitorCache(memVisitor)
+		if now.After(memVisitor.ExpiresAt) && now.Before(memUpdated.Add(visitorDataSWRGrace)) {
+			e.refreshVisitorDataAsync(ctx, videoID)
 		}
-		e.cacheVisitorData()
 		return nil
 	}
 
-	// Use WEB client to get visitorData - this is critical!
-	// ANDROID_VR returns LOGIN_REQUIRED without visitorData,
-	// but WEB client returns visitorData that then works with ANDROID_VR
+	if e.cacheManager != nil {
+		if vc, stale, err := e.cacheManager.LoadVisitorDataAllowStale(visitorDataSWRGrace); err == nil && e.visitorCacheUsable(vc, authKey) {
+			e.applyVisitorCache(vc)
+			e.storeVisitorCache(vc)
+			if stale {
+				e.refreshVisitorDataAsync(ctx, videoID)
+			}
+			return nil
+		}
+	}
+
+	v, err, _ := e.runtime.visitorGroup.Do(authKey, func() (any, error) {
+		vc, err := e.fetchFreshVisitorDataContext(ctx, videoID)
+		if err != nil {
+			return nil, err
+		}
+		e.storeVisitorCache(vc)
+		return vc, nil
+	})
+	if err != nil {
+		return err
+	}
+	if vc, ok := v.(*VisitorCache); ok {
+		e.applyVisitorCache(vc)
+	}
+	return nil
+}
+
+func (e *Extractor) visitorAuthKey() string {
+	if !e.config.NeedsCookies {
+		return "video"
+	}
+	if e.sapisid != "" {
+		return "music:" + e.sapisid
+	}
+	return "music"
+}
+
+func (e *Extractor) visitorCacheUsable(vc *VisitorCache, authKey string) bool {
+	if vc == nil || vc.Data == "" {
+		return false
+	}
+	if vc.AuthKey != "" && vc.AuthKey != authKey {
+		return false
+	}
+	if e.config.NeedsCookies {
+		return vc.IsAuth
+	}
+	return true
+}
+
+func (e *Extractor) applyVisitorCache(vc *VisitorCache) {
+	if vc == nil {
+		return
+	}
+	e.visitorData = vc.Data
+	e.sessionIndex = vc.SessionIndex
+	e.delegatedSID = vc.DelegatedSID
+}
+
+func (e *Extractor) storeVisitorCache(vc *VisitorCache) {
+	if vc == nil || vc.Data == "" {
+		return
+	}
+	e.runtime.visitorCache.Lock()
+	e.runtime.visitorCache.data = vc.Data
+	e.runtime.visitorCache.sessionIndex = vc.SessionIndex
+	e.runtime.visitorCache.delegatedSID = vc.DelegatedSID
+	e.runtime.visitorCache.isAuth = vc.IsAuth
+	e.runtime.visitorCache.authKey = vc.AuthKey
+	e.runtime.visitorCache.expiry = vc.ExpiresAt
+	e.runtime.visitorCache.updated = time.Now()
+	e.runtime.visitorCache.Unlock()
+
+	if e.cacheManager != nil {
+		_ = e.cacheManager.SaveVisitorData(vc)
+	}
+}
+
+func (e *Extractor) refreshVisitorDataAsync(parent context.Context, videoID string) {
+	go func() {
+		ctx, cancel := backgroundRefreshContext(parent, backgroundWarmupTTL)
+		defer cancel()
+		_, _, _ = e.runtime.visitorGroup.Do(e.visitorAuthKey(), func() (any, error) {
+			vc, err := e.fetchFreshVisitorDataContext(ctx, videoID)
+			if err != nil {
+				return nil, err
+			}
+			e.storeVisitorCache(vc)
+			return vc, nil
+		})
+	}()
+}
+
+func (e *Extractor) fetchFreshVisitorDataContext(ctx context.Context, videoID string) (*VisitorCache, error) {
+	if e.config.NeedsCookies {
+		return e.fetchMusicVisitorDataContext(ctx, videoID)
+	}
+	return e.fetchWebVisitorDataContext(ctx, videoID)
+}
+
+func (e *Extractor) fetchWebVisitorDataContext(ctx context.Context, videoID string) (*VisitorCache, error) {
 	reqBody := InnertubeRequest{
 		VideoID: videoID,
 		Context: InnertubeContext{
@@ -193,13 +327,13 @@ func (e *Extractor) fetchVisitorData(videoID string) error {
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	apiURL := fmt.Sprintf("%s?key=%s&prettyPrint=false", WEBAPIEndpoint, WEBAPIKey)
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(jsonBody))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -207,35 +341,35 @@ func (e *Extractor) fetchVisitorData(videoID string) error {
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var playerResp PlayerResponse
 	if err := json.NewDecoder(resp.Body).Decode(&playerResp); err != nil {
-		return err
+		return nil, err
 	}
 
-	if playerResp.ResponseContext.VisitorData != "" {
-		e.visitorData = playerResp.ResponseContext.VisitorData
-		e.cacheVisitorData()
-	}
-
-	return nil
+	return &VisitorCache{
+		Data:      playerResp.ResponseContext.VisitorData,
+		IsAuth:    false,
+		AuthKey:   e.visitorAuthKey(),
+		ExpiresAt: time.Now().Add(visitorDataTTL),
+	}, nil
 }
 
-// cacheVisitorData stores visitorData in the global cache
 func (e *Extractor) cacheVisitorData() {
 	if e.visitorData == "" {
 		return
 	}
-	visitorDataCache.Lock()
-	visitorDataCache.data = e.visitorData
-	visitorDataCache.sessionIndex = e.sessionIndex
-	visitorDataCache.delegatedSID = e.delegatedSID
-	visitorDataCache.isAuth = e.config.NeedsCookies
-	visitorDataCache.expiry = time.Now().Add(visitorDataTTL)
-	visitorDataCache.Unlock()
+	e.storeVisitorCache(&VisitorCache{
+		Data:         e.visitorData,
+		SessionIndex: e.sessionIndex,
+		DelegatedSID: e.delegatedSID,
+		IsAuth:       e.config.NeedsCookies,
+		AuthKey:      e.visitorAuthKey(),
+		ExpiresAt:    time.Now().Add(visitorDataTTL),
+	})
 }
 
 // musicVisitorDataRegex extracts visitorData from music.youtube.com HTML
@@ -246,12 +380,22 @@ var (
 	datasyncIDRegex       = regexp.MustCompile(`"DATASYNC_ID"\s*:\s*"([^"]+)"`)
 )
 
-// fetchMusicVisitorData gets visitorData from music.youtube.com page
+// fetchMusicVisitorData gets visitorData from music.youtube.com page.
 func (e *Extractor) fetchMusicVisitorData(videoID string) error {
-	watchURL := fmt.Sprintf("https://music.youtube.com/watch?v=%s", videoID)
-	req, err := http.NewRequest("GET", watchURL, nil)
+	vc, err := e.fetchMusicVisitorDataContext(context.Background(), videoID)
 	if err != nil {
 		return err
+	}
+	e.applyVisitorCache(vc)
+	e.storeVisitorCache(vc)
+	return nil
+}
+
+func (e *Extractor) fetchMusicVisitorDataContext(ctx context.Context, videoID string) (*VisitorCache, error) {
+	watchURL := fmt.Sprintf("https://music.youtube.com/watch?v=%s", videoID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, watchURL, nil)
+	if err != nil {
+		return nil, err
 	}
 
 	req.Header.Set("User-Agent", e.config.UserAgent)
@@ -259,47 +403,49 @@ func (e *Extractor) fetchMusicVisitorData(videoID string) error {
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	vc := &VisitorCache{IsAuth: true, AuthKey: e.visitorAuthKey(), ExpiresAt: time.Now().Add(visitorDataTTL)}
 
 	matches := musicVisitorDataRegex.FindSubmatch(body)
 	if len(matches) >= 2 {
-		e.visitorData = string(matches[1])
+		vc.Data = string(matches[1])
 	}
 
-	// Extract Session Index (X-Goog-AuthUser)
 	matches = sessionIndexRegex.FindSubmatch(body)
 	if len(matches) >= 2 {
-		e.sessionIndex = string(matches[1])
+		vc.SessionIndex = string(matches[1])
 	}
 
-	// Extract Delegated Session ID (X-Goog-PageId)
-	// Try DELEGATED_SESSION_ID first
 	matches = delegatedSIDRegex.FindSubmatch(body)
 	if len(matches) >= 2 {
-		e.delegatedSID = string(matches[1])
+		vc.DelegatedSID = string(matches[1])
 	} else {
-		// Fallback: try parsing DATASYNC_ID (format: delegated||user)
 		matches = datasyncIDRegex.FindSubmatch(body)
 		if len(matches) >= 2 {
 			parts := strings.Split(string(matches[1]), "||")
 			if len(parts) >= 2 && parts[0] != "" {
-				e.delegatedSID = parts[0]
+				vc.DelegatedSID = parts[0]
 			}
 		}
 	}
 
-	return nil
+	return vc, nil
 }
 
 // Extract gets the best audio stream URL for a video
 func (e *Extractor) Extract(videoID string) (*Result, error) {
+	return e.ExtractContext(context.Background(), videoID)
+}
+
+func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result, error) {
 	e.warnings = nil
 	e.cipherRetried.Store(false) // Allow one retry per extraction
 	var totalStart time.Time
@@ -325,7 +471,7 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 
 	// Fetch visitorData in parallel
 	go func() {
-		err := e.fetchVisitorData(videoID)
+		err := e.fetchVisitorDataContext(ctx, videoID)
 		visitorCh <- visitorResult{err: err}
 	}()
 
@@ -337,11 +483,8 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 		if e.profile {
 			prewarmStart = time.Now()
 		}
-		cipher, err := e.getCachedCipher(videoID)
+		cipher, err := e.getCachedCipherContext(ctx, videoID)
 		prewarmMs := int64(0)
-		if e.profile {
-			prewarmMs = time.Since(prewarmStart).Milliseconds()
-		}
 		if err == nil && cipher != nil {
 			// Signal STS as soon as cipher is available (even from cache)
 			select {
@@ -349,14 +492,20 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 			default:
 			}
 
-			// (Removed QuickJS pre-warm here to avoid CGO OS-thread affinity corruption)
 			// ensureSignatureReady() populates jsCode (lazy init)
 			_ = cipher.ensureSignatureReady()
+
+			// Concurrently Pre-warm QuickJS CVM bytecode execution to completely mask it within the HTTP network latency!
+			_ = cipher.Prewarm()
 		} else {
 			select {
 			case stsCh <- 0:
 			default:
 			}
+		}
+
+		if e.profile {
+			prewarmMs = time.Since(prewarmStart).Milliseconds()
 		}
 		cipherCh <- cipherResult{cipher: cipher, err: err, prewarmMs: prewarmMs}
 	}()
@@ -390,7 +539,7 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 		apiStart = time.Now()
 	}
 	e.earlySTSOverride = sts
-	playerResp, err := e.callPlayerAPI(videoID)
+	playerResp, err := e.callPlayerAPIContext(ctx, videoID)
 	e.earlySTSOverride = 0
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
@@ -429,7 +578,7 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 	}
 
 	// Get stream URL (may need decryption) - cipher already initialized
-	streamURL, err := e.getStreamURL(videoID, stream)
+	streamURL, err := e.getStreamURLContext(ctx, videoID, stream)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get stream URL: %w", err)
 	}
@@ -454,6 +603,10 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 
 // ExtractVideo gets video and audio stream URLs (for MPV playback)
 func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
+	return e.ExtractVideoContext(context.Background(), videoID)
+}
+
+func (e *Extractor) ExtractVideoContext(ctx context.Context, videoID string) (*VideoResult, error) {
 	e.warnings = nil
 	var totalStart time.Time
 	if e.profile {
@@ -466,7 +619,7 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 	if e.profile {
 		visitorStart = time.Now()
 	}
-	if err := e.fetchVisitorData(videoID); err != nil {
+	if err := e.fetchVisitorDataContext(ctx, videoID); err != nil {
 		// Non-fatal, continue without it
 	}
 	if e.profile {
@@ -477,7 +630,7 @@ func (e *Extractor) ExtractVideo(videoID string) (*VideoResult, error) {
 	if e.profile {
 		apiStart = time.Now()
 	}
-	playerResp, err := e.callPlayerAPI(videoID)
+	playerResp, err := e.callPlayerAPIContext(ctx, videoID)
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
 	}
@@ -555,6 +708,10 @@ func (e *Extractor) finalizeProfile(totalStart time.Time) {
 
 // callPlayerAPI makes the innertube player API call
 func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
+	return e.callPlayerAPIContext(context.Background(), videoID)
+}
+
+func (e *Extractor) callPlayerAPIContext(ctx context.Context, videoID string) (*PlayerResponse, error) {
 	// Build request body
 	client := InnertubeClient{
 		HL:            "en",
@@ -617,7 +774,7 @@ func (e *Extractor) callPlayerAPI(videoID string) (*PlayerResponse, error) {
 	}
 	// Build request
 	apiURL := fmt.Sprintf("%s?key=%s&prettyPrint=false", e.config.APIEndpoint, e.config.APIKey)
-	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -768,37 +925,65 @@ func (e *Extractor) findBestVideoStream(formats []Format) *Format {
 // getCachedCipher returns a cached cipher or creates a new one
 // Priority: 1) in-memory cache, 2) file cache, 3) fetch fresh
 func (e *Extractor) getCachedCipher(videoID string) (*Cipher, error) {
-	// 1. Try in-memory cache first (fast path for bulk operations)
-	cipherCache.RLock()
-	if cipherCache.cipher != nil && time.Now().Before(cipherCache.expiry) {
-		c := cipherCache.cipher
-		cipherCache.RUnlock()
-		return c, nil
-	}
-	cipherCache.RUnlock()
+	return e.getCachedCipherContext(context.Background(), videoID)
+}
 
-	// 2. Try file cache
-	if e.cacheManager != nil {
-		if cache, err := e.cacheManager.Load(); err == nil && e.cacheManager.IsValid(cache) {
-			cipher := NewCipherFromCache(cache)
-			// Load player.js from separate cache file
-			if playerJS, err := e.cacheManager.LoadPlayerJS(); err == nil {
-				cipher.playerJS = playerJS
-			}
-			// Also populate in-memory cache
-			cipherCache.Lock()
-			cipherCache.cipher = cipher
-			cipherCache.expiry = cache.ExpiresAt
-			cipherCache.Unlock()
-			return cipher, nil
+func (e *Extractor) getCachedCipherContext(ctx context.Context, videoID string) (*Cipher, error) {
+	now := time.Now()
+
+	// 1. Try shared runtime cache first.
+	e.runtime.cipherCache.RLock()
+	memCipher := e.runtime.cipherCache.cipher
+	memExpiry := e.runtime.cipherCache.expiry
+	memUpdated := e.runtime.cipherCache.updated
+	e.runtime.cipherCache.RUnlock()
+	if memCipher != nil {
+		if now.Before(memExpiry) {
+			return memCipher, nil
+		}
+		if now.Before(memUpdated.Add(cipherSWRGrace)) {
+			e.refreshCipherAsync(ctx, videoID)
+			return memCipher, nil
 		}
 	}
 
-	// 3. Fetch fresh cipher
-	return e.fetchAndCacheCipher(videoID)
+	// 2. Try persistent cache.
+	if e.cacheManager != nil {
+		if cache, err := e.cacheManager.Load(); err == nil {
+			stale := now.After(cache.ExpiresAt)
+			if !stale || now.Before(cache.ExpiresAt.Add(cipherSWRGrace)) {
+				cipher := NewCipherFromCacheWithRuntime(e.runtime, cache)
+				if playerJS, err := e.cacheManager.LoadPlayerJS(); err == nil {
+					cipher.playerJS = playerJS
+				}
+				if nRuntimeJS, err := e.cacheManager.LoadNRuntimeJS(); err == nil {
+					cipher.nRuntimeJS = nRuntimeJS
+				}
+				e.storeCipherCache(cipher, cache.ExpiresAt)
+				e.warmCipherAsync(ctx, cipher)
+				if stale {
+					e.refreshCipherAsync(ctx, videoID)
+				}
+				return cipher, nil
+			}
+		}
+	}
+
+	// 3. Fetch fresh cipher (singleflighted).
+	v, err, _ := e.runtime.cipherGroup.Do("shared", func() (any, error) {
+		return e.fetchAndCacheCipherContext(ctx, videoID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*Cipher), nil
 }
 
 func (e *Extractor) ensureCipher(videoID string) (*Cipher, error) {
+	return e.ensureCipherContext(context.Background(), videoID)
+}
+
+func (e *Extractor) ensureCipherContext(ctx context.Context, videoID string) (*Cipher, error) {
 	if e.cipher != nil {
 		return e.cipher, nil
 	}
@@ -810,7 +995,7 @@ func (e *Extractor) ensureCipher(videoID string) (*Cipher, error) {
 		return e.cipher, nil
 	}
 
-	cipher, err := e.getCachedCipher(videoID)
+	cipher, err := e.getCachedCipherContext(ctx, videoID)
 	if err != nil {
 		return nil, err
 	}
@@ -820,14 +1005,10 @@ func (e *Extractor) ensureCipher(videoID string) (*Cipher, error) {
 
 // fetchAndCacheCipher fetches a new cipher and saves to both caches
 func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
-	cipherCache.Lock()
-	defer cipherCache.Unlock()
+	return e.fetchAndCacheCipherContext(context.Background(), videoID)
+}
 
-	// Double-check after acquiring write lock
-	if cipherCache.cipher != nil && time.Now().Before(cipherCache.expiry) {
-		return cipherCache.cipher, nil
-	}
-
+func (e *Extractor) fetchAndCacheCipherContext(ctx context.Context, videoID string) (*Cipher, error) {
 	// Try to use cached base.js path (saves ~150ms by skipping embed page)
 	var cachedPath string
 	var previousCache *CipherCache
@@ -843,7 +1024,7 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 	// Fetch new cipher (will try cached path first, fallback to embed page)
 	// Use config.Origin for domain reuse (music.youtube.com for music mode)
 	// This saves ~50-80ms by reusing existing HTTP/2 connection instead of new TLS handshake
-	cipher, playerPath, err := NewCipherWithCachedPath(videoID, e.httpClient, cachedPath, e.config.Origin)
+	cipher, playerPath, err := NewCipherWithCachedPathContext(ctx, e.runtime, videoID, e.httpClient, cachedPath, e.config.Origin)
 	if err != nil {
 		return nil, err
 	}
@@ -866,9 +1047,8 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 		}
 	}
 
-	// Save to in-memory cache
-	cipherCache.cipher = cipher
-	cipherCache.expiry = time.Now().Add(cacheTTL)
+	expiry := time.Now().Add(cacheTTL)
+	e.storeCipherCache(cipher, expiry)
 
 	// Save to file cache (ignore errors - graceful degradation)
 	if e.cacheManager != nil {
@@ -879,20 +1059,26 @@ func (e *Extractor) fetchAndCacheCipher(videoID string) (*Cipher, error) {
 		if len(cipher.playerJS) > 0 {
 			_ = e.cacheManager.SavePlayerJS(cipher.playerJS)
 		}
+		if len(cipher.nRuntimeJS) > 0 {
+			_ = e.cacheManager.SaveNRuntimeJS(cipher.nRuntimeJS)
+		}
 	}
+
+	e.warmCipherAsync(ctx, cipher)
 
 	return cipher, nil
 }
 
 // invalidateCipherCache clears both in-memory and file caches
 func (e *Extractor) invalidateCipherCache() {
-	cipherCache.Lock()
-	if cipherCache.cipher != nil {
-		cipherCache.cipher.Close()
+	e.runtime.cipherCache.Lock()
+	if e.runtime.cipherCache.cipher != nil {
+		e.runtime.cipherCache.cipher.Close()
 	}
-	cipherCache.cipher = nil
-	cipherCache.expiry = time.Time{}
-	cipherCache.Unlock()
+	e.runtime.cipherCache.cipher = nil
+	e.runtime.cipherCache.expiry = time.Time{}
+	e.runtime.cipherCache.updated = time.Time{}
+	e.runtime.cipherCache.Unlock()
 
 	if e.cacheManager != nil {
 		_ = e.cacheManager.Invalidate()
@@ -901,9 +1087,13 @@ func (e *Extractor) invalidateCipherCache() {
 
 // getStreamURL extracts the final stream URL, decrypting if necessary
 func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error) {
+	return e.getStreamURLContext(context.Background(), videoID, stream)
+}
+
+func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, stream *Format) (string, error) {
 	// If URL is directly available (pre-signed), use it
 	if stream.URL != "" {
-		streamURL, err := e.unthrottle(videoID, stream.URL)
+		streamURL, err := e.unthrottleContext(ctx, videoID, stream.URL)
 		if err != nil {
 			return "", err
 		}
@@ -932,7 +1122,7 @@ func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error)
 	}
 
 	if sig == "" {
-		streamURL, err := e.unthrottle(videoID, baseURL)
+		streamURL, err := e.unthrottleContext(ctx, videoID, baseURL)
 		if err != nil {
 			return "", err
 		}
@@ -940,7 +1130,7 @@ func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error)
 	}
 
 	// Initialize cipher if needed (using cache)
-	if _, err := e.ensureCipher(videoID); err != nil {
+	if _, err := e.ensureCipherContext(ctx, videoID); err != nil {
 		return "", fmt.Errorf("failed to initialize cipher: %w", err)
 	}
 
@@ -949,7 +1139,7 @@ func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error)
 	if e.profile {
 		sigDecryptStart = time.Now()
 	}
-	decryptedSig, err := e.decryptWithRetry(videoID, sig)
+	decryptedSig, err := e.decryptWithRetryContext(ctx, videoID, sig)
 	if e.profile {
 		e.timings.SigDecryptMs += time.Since(sigDecryptStart).Milliseconds()
 	}
@@ -975,7 +1165,7 @@ func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error)
 	parsedURL.RawQuery = query.Encode()
 
 	// Apply n-parameter transformation (throttle bypass)
-	streamURL, err := e.unthrottle(videoID, parsedURL.String())
+	streamURL, err := e.unthrottleContext(ctx, videoID, parsedURL.String())
 	if err != nil {
 		return "", err
 	}
@@ -1018,15 +1208,55 @@ func (e *Extractor) persistCipherArtifacts() {
 	cacheData.BaseJSPath = e.cipher.playerURL
 	_ = e.cacheManager.Save(cacheData)
 	_ = e.cacheManager.SavePlayerJS(e.cipher.playerJS)
-	cipherCache.Lock()
-	defer cipherCache.Unlock()
-	if time.Now().Before(cipherCache.expiry) {
-		cipherCache.cipher = e.cipher
+	if len(e.cipher.nRuntimeJS) > 0 {
+		_ = e.cacheManager.SaveNRuntimeJS(e.cipher.nRuntimeJS)
 	}
+	e.runtime.cipherCache.Lock()
+	defer e.runtime.cipherCache.Unlock()
+	if time.Now().Before(e.runtime.cipherCache.expiry) {
+		e.runtime.cipherCache.cipher = e.cipher
+		e.runtime.cipherCache.updated = time.Now()
+	}
+}
+
+func (e *Extractor) storeCipherCache(cipher *Cipher, expiry time.Time) {
+	e.runtime.cipherCache.Lock()
+	e.runtime.cipherCache.cipher = cipher
+	e.runtime.cipherCache.expiry = expiry
+	e.runtime.cipherCache.updated = time.Now()
+	e.runtime.cipherCache.Unlock()
+}
+
+func (e *Extractor) refreshCipherAsync(parent context.Context, videoID string) {
+	go func() {
+		ctx, cancel := backgroundRefreshContext(parent, backgroundWarmupTTL)
+		defer cancel()
+		_, _, _ = e.runtime.cipherGroup.Do("shared", func() (any, error) {
+			return e.fetchAndCacheCipherContext(ctx, videoID)
+		})
+	}()
+}
+
+func (e *Extractor) warmCipherAsync(parent context.Context, cipher *Cipher) {
+	if cipher == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := backgroundRefreshContext(parent, backgroundWarmupTTL)
+		defer cancel()
+		if err := cipher.ensureSignatureReady(); err == nil {
+			_ = cipher.Prewarm()
+		}
+		_ = cipher.WarmNTransformEngineContext(ctx)
+	}()
 }
 
 // decryptWithRetry attempts decryption, retrying once with fresh cipher if it fails
 func (e *Extractor) decryptWithRetry(videoID, sig string) (string, error) {
+	return e.decryptWithRetryContext(context.Background(), videoID, sig)
+}
+
+func (e *Extractor) decryptWithRetryContext(ctx context.Context, videoID, sig string) (string, error) {
 	result, err := e.cipher.DecryptSignature(sig)
 	if err == nil {
 		return result, nil
@@ -1042,7 +1272,7 @@ func (e *Extractor) decryptWithRetry(videoID, sig string) (string, error) {
 		e.cipherMu.Unlock()
 
 		// Fetch fresh cipher
-		newCipher, fetchErr := e.getCachedCipher(videoID)
+		newCipher, fetchErr := e.getCachedCipherContext(ctx, videoID)
 		if fetchErr != nil {
 			return "", fmt.Errorf("retry failed: %w", fetchErr)
 		}
@@ -1059,6 +1289,10 @@ func (e *Extractor) decryptWithRetry(videoID, sig string) (string, error) {
 
 // unthrottle applies the n-parameter transformation to bypass throttling
 func (e *Extractor) unthrottle(videoID, streamURL string) (string, error) {
+	return e.unthrottleContext(context.Background(), videoID, streamURL)
+}
+
+func (e *Extractor) unthrottleContext(ctx context.Context, videoID, streamURL string) (string, error) {
 	parsedURL, err := url.Parse(streamURL)
 	if err != nil {
 		return "", err
@@ -1071,7 +1305,7 @@ func (e *Extractor) unthrottle(videoID, streamURL string) (string, error) {
 		return streamURL, nil
 	}
 
-	cipher, err := e.ensureCipher(videoID)
+	cipher, err := e.ensureCipherContext(ctx, videoID)
 	if err != nil {
 		return streamURL, nil
 	}
@@ -1081,7 +1315,7 @@ func (e *Extractor) unthrottle(videoID, streamURL string) (string, error) {
 	if e.profile {
 		transformStart = time.Now()
 	}
-	transformedN, err := cipher.TransformN(nParam)
+	transformedN, err := cipher.TransformNContext(ctx, nParam)
 	if e.profile {
 		e.timings.NTransformMs += time.Since(transformStart).Milliseconds()
 	}
