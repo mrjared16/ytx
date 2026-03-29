@@ -32,6 +32,12 @@ func (e *Extractor) bulkExtractWithEmitterContext(ctx context.Context, videoIDs 
 		return
 	}
 
+	// Single-ID bulk: skip prefetch warmup and jitter overhead
+	if len(videoIDs) == 1 {
+		emit(e.extractBulkResultContext(ctx, videoIDs[0]))
+		return
+	}
+
 	e.prefetchBatchSharedState(ctx, videoIDs[0])
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
