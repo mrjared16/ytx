@@ -22,6 +22,8 @@ const TimingToleranceMs = 150
 // making normal network variance fail the suite.
 const PerfRegressionMinBudgetMs int64 = 250
 
+const liveProbeTestsEnvVar = "RUN_LIVE_PROBE_TESTS"
+
 // TestResult captures timing and results for a single extraction
 type TestResult struct {
 	Mode          string        `json:"mode"`
@@ -67,6 +69,11 @@ type GoldenImage struct {
 // Test video IDs - using popular videos that are unlikely to be deleted
 var testVideoIDs = []string{
 	"dQw4w9WgXcQ", // Rick Astley - Never Gonna Give You Up (very stable)
+}
+
+var bulkProbeVideoIDs = []string{
+	"bvfTp68YyZ0",
+	"QG3OcdUgv6Y",
 }
 
 // goldenImagePath returns the path to the golden image file
@@ -262,6 +269,60 @@ func TestExtractorRegression(t *testing.T) {
 	}
 }
 
+func TestBulkMusicProbeRegression(t *testing.T) {
+	requireExplicitLiveProbeRun(t)
+
+	if testing.Short() {
+		t.Skip("Skipping bulk probe regression test in short mode")
+	}
+
+	home, _ := os.UserHomeDir()
+	cookiePath := filepath.Join(home, ".config", "ytx", "cookies.txt")
+	if _, err := os.Stat(cookiePath); os.IsNotExist(err) {
+		t.Skip("Cookie file not found, skipping bulk probe regression test")
+	}
+
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache_bulk_probe")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("create cache dir: %v", err)
+	}
+
+	runtime := NewRuntime()
+	defer runtime.CloseCachedEngine()
+
+	ext, err := NewExtractor(ModeMusic, cookiePath, WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir}))
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+
+	results := ext.BulkExtractOrdered(bulkProbeVideoIDs)
+	if len(results) != len(bulkProbeVideoIDs) {
+		t.Fatalf("result count mismatch: got %d want %d", len(results), len(bulkProbeVideoIDs))
+	}
+
+	for i, videoID := range bulkProbeVideoIDs {
+		result := results[i]
+		if result.ID != videoID {
+			t.Fatalf("result %d id mismatch: got %s want %s", i, result.ID, videoID)
+		}
+		if result.Error != "" {
+			t.Fatalf("bulk extraction failed for %s: %s", videoID, result.Error)
+		}
+		if result.URL == "" {
+			t.Fatalf("bulk extraction returned empty URL for %s", videoID)
+		}
+		if !checkNTransformed(result.URL) {
+			t.Fatalf("bulk extraction returned untransformed n param for %s", videoID)
+		}
+
+		status := probeStreamURL(result.URL)
+		if status != http.StatusOK && status != http.StatusPartialContent {
+			t.Fatalf("bulk extraction URL not streamable for %s: got HTTP %d", videoID, status)
+		}
+	}
+}
+
 // testVideoMode tests video extraction with timing
 func testVideoMode(t *testing.T, cacheDir, videoID string, runtime *Runtime, cacheState string) TestResult {
 	result := TestResult{
@@ -421,6 +482,39 @@ func validateURL(url string) int {
 		return 0
 	}
 	defer resp.Body.Close()
+
+	return resp.StatusCode
+}
+
+func requireExplicitLiveProbeRun(t *testing.T) {
+	t.Helper()
+	if os.Getenv(liveProbeTestsEnvVar) != "1" {
+		t.Skip("Skipping live probe test; run via make target or set RUN_LIVE_PROBE_TESTS=1")
+	}
+
+}
+
+func probeStreamURL(url string) int {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	return resp.StatusCode
 }
@@ -782,6 +876,8 @@ func BenchmarkVideoExtraction(b *testing.B) {
 
 // TestMusicModeWithCookies tests music mode if cookies are available
 func TestMusicModeWithCookies(t *testing.T) {
+	requireExplicitLiveProbeRun(t)
+
 	if testing.Short() {
 		t.Skip("Skipping in short mode")
 	}
