@@ -181,28 +181,23 @@ build-fast:
 # TEST TARGETS
 # =============================================================================
 
-## test: Run all tests (isolated from system cache/config)
-##   WHY: Tests use t.TempDir() to avoid polluting ~/.cache/ytx
-##   SAFE: Won't affect your cookies, cache, or config
+# Three test concerns:
+#   1. make test              -> logical / local correctness
+#   2. make test-regression   -> regression baseline and timing checks
+#   3. make test-music-probe  -> explicit live YouTube probes
+
+## test: Run logical/local tests
+##   WHY: Fast default correctness check for code changes
+##   SAFE: Probe tests are opt-in and skipped here
 .PHONY: test
 test:
-	@echo "Running all tests (isolated)..."
+	@echo "Running logical/local tests..."
 	go test -v -timeout 180s ./pkg
 	@echo "Done"
 
-## test-short: Run fast tests only (cache isolation test)
-##   WHY: Quick feedback during development
-##   SKIPS: Network-dependent tests, benchmarks
-.PHONY: test-short
-test-short:
-	@echo "Running short tests (cache isolation only)..."
-	go test -v -run 'TestCacheIsolation' -timeout 30s ./pkg
-	@echo "Done"
-
-## test-regression: Run regression tests with golden image output
-##   WHY: Captures timing metrics as baseline for comparison
-##   OUTPUT: JSON golden image with timing for each stage
-##   ISOLATED: Uses temp directory, not system cache
+## test-regression: Run regression-focused tests
+##   WHY: Verifies correctness against saved baseline and regression-sensitive helpers
+##   OUTPUT: Golden comparison plus focused regression coverage
 ##   TESTS:
 ##     - TestExtractorRegression: Video mode extraction with timing
 ##     - TestNTransformIsolated: N-parameter transformation
@@ -230,22 +225,13 @@ test-regression-perf:
 	STRICT_REGRESSION=1 go test -v ./pkg -run '^TestExtractorRegression$$' -count=1 -timeout 180s
 	@echo "Done"
 
-## test-music: Run music mode test (requires cookies)
+## test-music-probe: Run opt-in live YouTube-side probe tests (single + bulk)
 ##   REQUIRES: ~/.config/ytx/cookies.txt
-##   SKIPPED: If no cookies available
-##   TESTS: Premium audio extraction (itag 141, 256kbps)
-.PHONY: test-music
-test-music:
-	@echo "Running music mode test..."
-	go test -v -run 'TestMusicModeWithCookies' ./pkg -timeout 120s
-	@echo "Done"
-
-## test-all: Run all tests including music mode
-##   COMPREHENSIVE: Runs every test
-.PHONY: test-all
-test-all:
-	@echo "Running ALL tests..."
-	go test -v -timeout 300s ./pkg
+##   NOTE: Explicit opt-in live probe against YouTube
+.PHONY: test-music-probe
+test-music-probe:
+	@echo "Running live music probe tests..."
+	RUN_LIVE_PROBE_TESTS=1 go test -v -run '^(TestMusicModeWithCookies|TestBulkMusicProbeRegression)$$' ./pkg -timeout 120s -count=1
 	@echo "Done"
 
 # =============================================================================

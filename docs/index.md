@@ -14,6 +14,7 @@
 - [**Persistent Caching**](internal/persistent-cache.md) — Performance through intelligent caching.
 
 ## 📖 Guides
+- [**Testing**](guides/testing.md) — The three test concerns: logical, regression, and live YouTube probes.
 - [**Troubleshooting**](guides/troubleshooting.md) — Diagnosing and fixing extraction breaks.
 - [**Benchmarking**](guides/benchmarking.md) — Measuring performance and interpreting metrics.
 

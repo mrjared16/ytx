@@ -107,9 +107,15 @@ go test -v ./pkg/... -run TestExtractorRegression
 # Update golden image
 UPDATE_GOLDEN=1 go test -v ./pkg/... -run TestExtractorRegression
 
+# Opt-in live probe tests (single and bulk music mode)
+make test-music-probe
+
 # Cache management
 ./ytx cache purge  # Clear all cache for fresh benchmark
 ```
+
+Live probe tests are intentionally opt-in because they hit YouTube stream URLs directly.
+Use `make test-music-probe` to run both the single-track probe and the 2-ID bulk probe.
 
 ## Performance Benchmarks
 

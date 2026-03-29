@@ -56,15 +56,18 @@ Run `make fmt` before finishing edits.
 Canonical targets:
 ```bash
 make test
-make test-short
 make test-regression
-make test-music
-make test-all
+make test-music-probe
 ```
+
+Testing concerns:
+- `make test` — logical/local correctness; safest default during development
+- `make test-regression` — regression-sensitive coverage and golden-baseline checks
+- `make test-music-probe` — explicit live YouTube-side stream probes; use sparingly
+
 Common raw commands:
 ```bash
 go test -v -timeout 180s ./pkg
-go test -v -run '^TestCacheIsolation$' -timeout 30s ./pkg
 go test -v -run '^TestExtractorRegression$' ./pkg/...
 UPDATE_GOLDEN=1 go test -v ./pkg/... -run '^TestExtractorRegression$'
 ```
@@ -150,6 +153,9 @@ Verified in this repo: `go test -v -run '^TestCacheIsolation$' -count=1 ./pkg`
 - For `pkg/` logic changes, prefer a single targeted `go test -run '^TestName$' ./pkg -count=1` before broader suites
 - If you touch regression-sensitive behavior, run `TestExtractorRegression` or explain why not
 - If you touch music-mode extraction, consider cookie-dependent tests and/or `cmd/diagnose`
+
+# IMPORTANT
+- Prefer codebase-memory MCP tools for code discovery and fff tools for file search.
 
 <!-- codebase-memory-mcp:start -->
 # Codebase Knowledge Graph (codebase-memory-mcp)
