@@ -96,12 +96,12 @@ func (cm *CacheManager) Load() (*CipherCache, error) {
 	var cache CipherCache
 	if err := json.Unmarshal(data, &cache); err != nil {
 		// Corrupted cache - delete it
-		_ = cm.Invalidate()
+		_ = cm.InvalidateCipherArtifacts()
 		return nil, err
 	}
 
 	// Fast load the raw bytecode/js payload avoiding JSON overhead
-	codePath := filepath.Join(cm.cacheDir, "cipher_code.bin")
+	codePath := cm.codeCachePath()
 	if codeData, err := os.ReadFile(codePath); err == nil {
 		cache.JSCode = string(codeData)
 	}
@@ -136,7 +136,7 @@ func (cm *CacheManager) Save(cache *CipherCache) error {
 
 	// Write the massive JS payload atomically to a raw binary file
 	if jsCode != "" {
-		codePath := filepath.Join(cm.cacheDir, "cipher_code.bin")
+		codePath := cm.codeCachePath()
 		tmpCodePath := codePath + fmt.Sprintf(".%d.tmp", os.Getpid())
 		if err := os.WriteFile(tmpCodePath, []byte(jsCode), 0644); err == nil {
 			_ = os.Rename(tmpCodePath, codePath)
@@ -181,6 +181,10 @@ func (cm *CacheManager) visitorCachePath() string {
 
 func (cm *CacheManager) poCachePath() string {
 	return filepath.Join(cm.cacheDir, poCacheFile)
+}
+
+func (cm *CacheManager) codeCachePath() string {
+	return filepath.Join(cm.cacheDir, "cipher_code.bin")
 }
 
 // LoadVisitorData reads the visitor cache from disk
@@ -394,6 +398,30 @@ func (cm *CacheManager) Invalidate() error {
 	return err
 }
 
+// InvalidateCipherArtifacts removes cipher metadata + runtime artifacts,
+// while preserving visitor/PO caches.
+func (cm *CacheManager) InvalidateCipherArtifacts() error {
+	var lastErr error
+
+	if err := os.Remove(cm.CachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	if err := os.Remove(cm.codeCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	if err := os.Remove(cm.PlayerCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	if err := os.Remove(cm.NRuntimeCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	return lastErr
+}
+
 // currentCacheVersion is the current cache format version
 // Increment when cache structure changes to invalidate old caches
 const currentCacheVersion = 6
@@ -483,7 +511,7 @@ func (cm *CacheManager) Purge() error {
 	}
 
 	// Remove isolated JS binary code cache
-	codePath := filepath.Join(cm.cacheDir, "cipher_code.bin")
+	codePath := cm.codeCachePath()
 	if err := os.Remove(codePath); err != nil && !os.IsNotExist(err) {
 		lastErr = err
 	}
