@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1042,7 +1040,7 @@ func (e *Extractor) getCachedCipherContext(ctx context.Context, videoID string) 
 	if e.cacheManager != nil {
 		if cache, err := e.cacheManager.Load(); err == nil {
 			if !e.cacheManager.IsValid(cache) {
-				_ = e.cacheManager.Invalidate()
+				_ = e.cacheManager.InvalidateCipherArtifacts()
 			} else {
 				stale := now.After(cache.ExpiresAt)
 				if !stale || now.Before(cache.ExpiresAt.Add(cipherSWRGrace)) {
@@ -1191,7 +1189,7 @@ func (e *Extractor) invalidateCipherCache() {
 	e.runtime.cipherCache.Unlock()
 
 	if e.cacheManager != nil {
-		_ = e.cacheManager.Invalidate()
+		_ = e.cacheManager.InvalidateCipherArtifacts()
 	}
 }
 
@@ -1661,21 +1659,11 @@ func (e *Extractor) persistCipherArtifacts() {
 		return
 	}
 
-	cachePath := e.cacheManager.CachePath()
-	codePath := filepath.Join(e.cacheManager.cacheDir, "cipher_code.bin")
-	playerPath := e.cacheManager.PlayerCachePath()
-	nRuntimePath := e.cacheManager.NRuntimeCachePath()
-
 	cacheData := e.cipher.ToCache()
 	cacheData.BaseJSPath = e.cipher.playerURL
-
-	if !pathExists(cachePath) || !pathExists(codePath) {
-		_ = e.cacheManager.Save(cacheData)
-	}
-	if !pathExists(playerPath) {
-		_ = e.cacheManager.SavePlayerJS(e.cipher.playerJS)
-	}
-	if len(e.cipher.nRuntimeJS) > 0 && !pathExists(nRuntimePath) {
+	_ = e.cacheManager.Save(cacheData)
+	_ = e.cacheManager.SavePlayerJS(e.cipher.playerJS)
+	if len(e.cipher.nRuntimeJS) > 0 {
 		_ = e.cacheManager.SaveNRuntimeJS(e.cipher.nRuntimeJS)
 	}
 
@@ -1685,11 +1673,6 @@ func (e *Extractor) persistCipherArtifacts() {
 		e.runtime.cipherCache.cipher = e.cipher
 		e.runtime.cipherCache.updated = time.Now()
 	}
-}
-
-func pathExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }
 
 func (e *Extractor) storeCipherCache(cipher *Cipher, expiry time.Time) {
