@@ -28,6 +28,7 @@ const liveProbeTestsEnvVar = "RUN_LIVE_PROBE_TESTS"
 // TestResult captures timing and results for a single extraction
 type TestResult struct {
 	Mode          string        `json:"mode"`
+	POMode        bool          `json:"po_mode,omitempty"`
 	CacheState    string        `json:"cache_state,omitempty"`
 	VideoID       string        `json:"video_id"`
 	Success       bool          `json:"success"`
@@ -161,6 +162,9 @@ func compareResults(t *testing.T, actual, expected []TestResult) {
 		if act.QualityLabel != exp.QualityLabel && exp.QualityLabel != "" {
 			t.Errorf("Result %d: quality mismatch: got %s, want %s", i, act.QualityLabel, exp.QualityLabel)
 		}
+		if act.POMode != exp.POMode {
+			t.Errorf("Result %d: po_mode mismatch: got %v, want %v", i, act.POMode, exp.POMode)
+		}
 		if act.NTransformed != exp.NTransformed && exp.Success {
 			t.Errorf("Result %d: n_transform mismatch: got %v, want %v", i, act.NTransformed, exp.NTransformed)
 		}
@@ -228,7 +232,28 @@ func TestExtractorRegression(t *testing.T) {
 				if _, err := os.Stat(cookiePath); os.IsNotExist(err) {
 					t.Skip("Cookie file not found, skipping music mode test")
 				}
-				result := testMusicMode(t, musicCacheDir, videoID, cookiePath, musicRuntime, cacheState)
+				result := testMusicMode(t, musicCacheDir, videoID, cookiePath, musicRuntime, cacheState, false)
+				results = append(results, result)
+				logResult(t, result)
+			})
+		}
+
+		musicPOCacheDir := filepath.Join(tmpDir, "cache_music_po_"+videoID)
+		if err := os.MkdirAll(musicPOCacheDir, 0755); err != nil {
+			t.Fatalf("create music po cache dir: %v", err)
+		}
+		musicPORuntime := NewRuntime()
+		defer musicPORuntime.CloseCachedEngine()
+
+		for _, cacheState := range []string{"cold", "warm"} {
+			cacheState := cacheState
+			t.Run(fmt.Sprintf("MusicPO_%s_%s", cacheState, videoID), func(t *testing.T) {
+				home, _ := os.UserHomeDir()
+				cookiePath := filepath.Join(home, ".config", "ytx", "cookies.txt")
+				if _, err := os.Stat(cookiePath); os.IsNotExist(err) {
+					t.Skip("Cookie file not found, skipping music+po mode test")
+				}
+				result := testMusicMode(t, musicPOCacheDir, videoID, cookiePath, musicPORuntime, cacheState, true)
 				results = append(results, result)
 				logResult(t, result)
 			})
@@ -251,7 +276,7 @@ func TestExtractorRegression(t *testing.T) {
 	// Create new golden image
 	golden := GoldenImage{
 		GeneratedAt: time.Now().Format(time.RFC3339),
-		Version:     3, // Increment when test structure changes
+		Version:     4, // Increment when test structure changes
 		Results:     results,
 	}
 
@@ -453,16 +478,21 @@ func testVideoMode(t *testing.T, cacheDir, videoID string, runtime *Runtime, cac
 }
 
 // testMusicMode tests music extraction with timing and profiling
-func testMusicMode(t *testing.T, cacheDir, videoID, cookiePath string, runtime *Runtime, cacheState string) TestResult {
+func testMusicMode(t *testing.T, cacheDir, videoID, cookiePath string, runtime *Runtime, cacheState string, poMode bool) TestResult {
 	result := TestResult{
 		Mode:       "music",
+		POMode:     poMode,
 		CacheState: cacheState,
 		VideoID:    videoID,
 	}
 
 	totalStart := time.Now()
 
-	ext, err := NewExtractor(ModeMusic, cookiePath, WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir}))
+	opts := []ExtractorOption{WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir})}
+	if poMode {
+		opts = append(opts, WithPOMode(true))
+	}
+	ext, err := NewExtractor(ModeMusic, cookiePath, opts...)
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to create extractor: %v", err)
 		result.TotalDuration = time.Since(totalStart).String()
@@ -607,8 +637,12 @@ func logResult(t *testing.T, r TestResult) {
 		status = "✗"
 	}
 
+	mode := r.Mode
+	if r.POMode {
+		mode += "+po"
+	}
 	t.Logf("%s [%s/%s] %s: itag=%d, http=%d, duration=%s",
-		status, r.Mode, r.CacheState, r.VideoID, r.Itag, r.HTTPStatus, r.TotalDuration)
+		status, mode, r.CacheState, r.VideoID, r.Itag, r.HTTPStatus, r.TotalDuration)
 
 	if r.Timings.TotalMs > 0 {
 		t.Logf("  Profiled: visitor=%dms, sts-wait=%dms, api=%dms, cipher-wait=%dms, cipher-prewarm=%dms, sig=%dms, n-transform=%dms, other=%dms, total=%dms",
