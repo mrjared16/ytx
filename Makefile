@@ -231,7 +231,7 @@ test-regression-perf:
 .PHONY: test-music-probe
 test-music-probe:
 	@echo "Running live music probe tests..."
-	RUN_LIVE_PROBE_TESTS=1 go test -v -run '^(TestMusicModeWithCookies|TestBulkMusicProbeRegression)$$' ./pkg -timeout 120s -count=1
+	RUN_LIVE_PROBE_TESTS=1 go test -v -run '^(TestMusicModeWithCookies|TestMusicModeWithCookiesPO|TestBulkMusicProbeRegression|TestBulkMusicProbeRegressionPO)$$' ./pkg -timeout 120s -count=1
 	@echo "Done"
 
 # =============================================================================

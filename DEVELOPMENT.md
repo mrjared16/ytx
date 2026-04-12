@@ -51,16 +51,16 @@ go build -o ytx ./cmd/ytx
 
 ### Performance Optimizations (Latest)
 
-1. **QuickJS context reuse** — Eval 2.7MB player.js once, reuse for both sig and n calls (~540ms → 2ms per n-transform)
-2. **Two-phase cipher init** — Signal STS early so API call starts before cipher finishes heavy work
-3. **Pre-warm JS engine during cipher fetch** — Starts Bun subprocess while API call is in flight
-4. **Cache base.js URL path** — Skips embed page fetch on warm starts (~150ms savings)
-5. **Send player.js via file path** — Writes to temp file instead of 1.5MB IPC transfer
+1. **FCIS Tiered Architecture** — Fallback ladder of regex window/full-file scanning drastically dropping regex analysis (~4.2s → ~100ms)
+2. **QuickJS bytecode caching** — Evaluates wrapper/URL functions as precompiled `libquickjs` bytecode rather than raw JS strings, dropping warmup from 500ms down to near 0ms in successive runs.
+3. **Decoupled API/Cipher fetching** — Signals STS incredibly early allowing asynchronous HTTP fetches to completely lap the JS evaluations.
+4. **Cache base.js URL path + payloads** — Skips embed page fetch AND HTTP player fetch on warm starts (100% network bypass).
+5. **Send player.js via file path** — Writes to temp file instead of 1.5MB IPC transfer for Botguard `bun` challenges.
 6. **Batch n-transform in bulk mode** — Single IPC call for all n-parameters
 7. **HTTP/2 connection pooling** — Reuses connections for bulk requests
-8. **Global visitorData cache** — 30-minute TTL, shared across extractions
+8. **Global visitorData & POToken cache** — Shared across extractions to seamlessly bypass repetitive 4-second Botguard challenges.
 
-See `docs/music-extraction-pipeline.md` for architecture details and optimization roadmap.
+See `docs/architecture/extraction-pipeline.md` for architecture details and the tiered fallback flowchart.
 
 ### Profiling
 
@@ -68,7 +68,7 @@ See `docs/music-extraction-pipeline.md` for architecture details and optimizatio
 # Enable timing breakdown
 ./ytx music VIDEO_ID --profile
 
-# Output includes:
+# Output includes comprehensive FCIS diagnostics (in .timings):
 {
   "timings": {
     "visitor_data_ms": 260,
@@ -76,7 +76,17 @@ See `docs/music-extraction-pipeline.md` for architecture details and optimizatio
     "cipher_init_ms": 700,
     "n_transform_ms": 5,
     "total_ms": 900,
-    "js_engine": "bun"
+    "js_engine": "bun",
+    "cipher_detail": {
+      "sig_tier": "global_fallback",
+      "wrapper_tier": "windowed",
+      "n_func_tier": "skipped_wrapper",
+      "player_js_bytes": 1666797,
+      "marker_miss": [
+        "set(\"alr\"",
+        "sig_patterns"
+      ]
+    }
   }
 }
 ```
@@ -121,10 +131,11 @@ Use `make test-music-probe` to run both the single-track probe and the 2-ID bulk
 
 | Operation | Cold Start | Warm (disk) | Warm (memory) |
 |-----------|------------|-------------|---------------|
-| Video mode | ~400ms | ~400ms | ~400ms |
-| Music mode | ~3200ms | ~600-1000ms | ~450ms |
+| Video mode | ~400ms | ~250ms | ~250ms |
+| Music mode | **~1.4s** | ~400ms | ~400ms |
+| PO mode (Botguard) | ~4.6s | ~330ms | ~330ms |
 | Bulk 5 tracks | ~700ms | ~500ms | ~500ms |
-| n-transform (per call) | ~500ms (bootstrap) | ~2ms | ~2ms |
+| n-transform | ~500ms (bootstrap) | < 1ms | < 1ms |
 
 ### Throughput (Bulk Mode)
 - **7+ videos/sec** with warm cache
@@ -213,18 +224,13 @@ bun poc_solver.mjs
 # 3. Transform challenge values
 ```
 
-### Cipher Function Pattern Changes
+If signature decryption fails, the issue is likely in `pkg/cipher_detect.go`. The system uses an FCIS (Functional Core/Imperative Shell) tiered fallback:
 
-If signature decryption fails, the issue is likely in `pkg/cipher.go:findSigFunctionName()` or `findNFunctionName()`.
+1. **Tier 1 (Fast Windowed Regex):** Uses `detectFastSignature` to scan an 8KB window of `player.js` for well-known structural clues (e.g. `encodeURIComponent(`).
+2. **Tier 2 (Wrapper AST/Regex):** Uses `detectWrapperSignature` if Tier 1 misses.
+3. **Tier 3 (Global Fallback):** Uses `detectGlobalSignature` to scan the full 1.66MB file using heavy recursive regex. This protects the pipeline against minification variable changes.
 
-**Old approach (FRAGILE - DO NOT USE):**
-```go
-// Finds decoys, not real functions
-pattern := regexp.MustCompile(`var\s+[a-zA-Z0-9$_]{3}\s*=\s*\[([a-zA-Z0-9$_]{3})\]`)
-```
-
-**New approach (ROBUST):**
-Use yt-dlp's solver via subprocess, or validate function body has `try-catch` structure.
+If YouTube completely overhauls the AST, we will see `detail.SigTier = "not_found"` in the `--profile` diagnostic output. Adjust the window markers (`sigFunctionPatterns`) in `cipher_detect.go`.
 
 ### Client Version Updates
 

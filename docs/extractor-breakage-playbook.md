@@ -170,11 +170,13 @@ If strict perf fails, inspect the profiled stages in the output:
 
 - `visitor_data_ms`
 - `player_api_ms`
-- `cipher_init_ms`
+- `cipher_init_ms` (includes Analysis + Fetch)
+- `cipher_detail.sig_tier` (check for "global_fallback")
+- `cipher_detail.marker_miss` (JSON array of broken regex markers)
 - `n_transform_ms`
 - `total_ms`
 
-These usually tell you whether the regression is in auth/bootstrap, player API, cipher bootstrap, or JS runtime work.
+These usually tell you whether the regression is in auth/bootstrap, player API, cipher bootstrap, or JS runtime work. If `cipher_detail.sig_tier` is `global_fallback`, the **Tier 1 Fast Path** in `pkg/cipher_detect.go` has broken and needs new markers.
 
 ## Related files
 

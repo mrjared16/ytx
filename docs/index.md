@@ -5,6 +5,7 @@
 ## 🏛️ Architecture
 - [**Overview**](architecture/overview.md) — The dual-client strategy and performance philosophy.
 - [**Extraction Pipeline**](architecture/extraction-pipeline.md) — Detailed technical flow and timing profiles.
+- [**PO Token Engine**](architecture/po-token.md) — Technical details of the Botguard bypass and optimizations.
 
 ## 💡 Concepts
 - [**YouTube Extraction 101**](concepts/yt-extraction.md) — Understanding Innertube, Cipher, and N-Transform.
@@ -19,5 +20,6 @@
 - [**Benchmarking**](guides/benchmarking.md) — Measuring performance and interpreting metrics.
 
 ## 🗃️ Archive
+- [**PO Mode Implementation Plan**](archive/po-mode-plan.md) — Historical context for the PO mode project.
 - [**Historical Learnings**](archive/youtube-403-fix-learnings.md) — Retrospective on the 403 Forbidden fix.
 - [**Historical Help Request**](archive/music-mode-help-request.md) — Context for the music mode optimization project.

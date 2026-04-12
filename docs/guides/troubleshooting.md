@@ -25,7 +25,12 @@ This tool will compare the signature (`s`) and N-parameter (`n`) transformations
 
 ### HTTP 403 Forbidden
 This usually indicates that the Cipher or N-Transform is outdated.
-- **Solution**: Run `ytx cache purge` and try again. If it still fails, the extraction patterns in `pkg/cipher.go` may need an update.
+- **Solution**: Run `ytx cache purge` and try again. If it still fails, the extraction patterns in `pkg/cipher_detect.go` may need an update.
+
+### Advanced Diagnosis with `--profile`
+If patterns are failing, run with `--profile` and inspect the `cipher_detail`:
+- **sig_tier**: Tells you if it hit Tier 1 (fast) or fell back to Tier 3 (global).
+- **marker_miss**: A list of exactly which markers failed. If you see `set("alr"`, it means Tier 1 is breaking.
 
 ### Missing Premium Audio (itag 141)
 If `ytx music` returns itag 140 instead of 141:

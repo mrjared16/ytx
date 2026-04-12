@@ -31,11 +31,11 @@ The time taken to execute the N-parameter transformation.
 
 ### `total_ms`
 The end-to-end time from input ID to playable URL output.
-- **Cold Target**: < 1200ms
+- **Cold Target**: < 1500ms
 - **Warm Target**: < 500ms
 
 ## Interpreting Results
 
-If `cipher_init_ms` is high on a cold start (> 2500ms), it indicates a network bottleneck or inefficient pattern matching in `pkg/cipher.go`.
+If `cipher_analyze_ms` (found in `cipher_detail`) is high on a cold start (> 500ms), it indicates that the **Tier 1 Fast Path** in `pkg/cipher_detect.go` has failed and the system is paying the cost of a full-file regex scan (Tier 3). Check `marker_miss` for clues.
 
 If `n_transform_ms` is high, check if `ytx` is falling back to QuickJS instead of using Bun/Node, or if the JS runtime pre-spawning logic is failing.

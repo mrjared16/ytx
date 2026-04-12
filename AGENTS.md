@@ -1,6 +1,3 @@
-# AGENTS.md
-Guidance for coding agents working in `/home/user/workspace/projects/pytubefix/ytx`.
-
 ## Project
 - Language: Go
 - Module: `github.com/mrjared16/ytx`

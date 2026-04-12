@@ -22,8 +22,10 @@ The API request specifies the `clientName` and `clientVersion`. `ytx` uses speci
 
 YouTube's player JavaScript (`base.js`, ~3MB) contains the functions for signature decryption and n-parameter transformation. These functions change frequently (often weekly).
 
-### Decoy Functions
-YouTube intentionally adds "decoy" functions to break simple regex-based scrapers. `ytx` uses AST (Abstract Syntax Tree) validation to reliably identify the correct transformation functions within the obfuscated code.
+### Tiered Fallback
+YouTube intentionally adds "decoy" functions to break simple regex-based scrapers. `ytx` uses an **FCIS Tiered Detection** pipeline:
+1.  **Fast Path**: Optimized regex search in small (8KB) windows near discriminating markers.
+2.  **Global Path**: Full AST/Regex validation used as a backup if the fast path fails.
 
 ## Signature vs. N-Transform
 
@@ -31,5 +33,5 @@ YouTube intentionally adds "decoy" functions to break simple regex-based scraper
 | :--- | :--- | :--- |
 | **Purpose** | Authentication / Authorization | Throttling / Rate Limiting |
 | **Complexity** | Simple (Slice, Swap, Reverse) | High (Obfuscated, heavily nested) |
-| **Execution** | Extracted snippet (~20KB) | Full player context required |
+| **Execution** | Extracted snippet (~20KB) | Wrapper Mode (surgical injection) |
 | **Frequency** | Rotates with player version | Rotates with player version |
