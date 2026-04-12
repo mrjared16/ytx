@@ -2,6 +2,9 @@ package ytx
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -48,5 +51,62 @@ func TestSaveAndLoadNRuntimeJS(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("unexpected n-runtime contents: got %q want %q", got, want)
+	}
+}
+
+func TestLoadPOTokenLegacyTokenFallback(t *testing.T) {
+	cm := &CacheManager{cacheDir: t.TempDir()}
+	legacy := `{"token":"LEGACY","video_id":"vid","expires_at":"2099-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(cm.cacheDir, poCacheFile), []byte(legacy), 0644); err != nil {
+		t.Fatalf("failed to write legacy cache: %v", err)
+	}
+
+	loaded, err := cm.LoadPOToken("vid", "", "")
+	if err != nil {
+		t.Fatalf("LoadPOToken failed: %v", err)
+	}
+	if loaded.PlayerToken != "LEGACY" || loaded.URLToken != "LEGACY" {
+		t.Fatalf("expected legacy token to populate split fields, got %#v", loaded)
+	}
+}
+
+func TestLoadPOTokenFromLayeredStoreByBinding(t *testing.T) {
+	cm := &CacheManager{cacheDir: t.TempDir()}
+	store := poTokenCacheStore{
+		Version: poTokenCacheVersion,
+		Entries: map[string]POTokenCache{
+			poTokenCacheKey("vid-a", "visitor-a", "0", ""): {
+				PlayerToken:  "PLAYER_A",
+				URLToken:     "URL_A",
+				VideoID:      "vid-a",
+				VisitorData:  "visitor-a",
+				SessionIndex: "0",
+				ExpiresAt:    time.Now().Add(10 * time.Minute),
+			},
+			poTokenCacheKey("vid-b", "visitor-b", "0", ""): {
+				PlayerToken:  "PLAYER_B",
+				URLToken:     "URL_B",
+				VideoID:      "vid-b",
+				VisitorData:  "visitor-b",
+				SessionIndex: "0",
+				ExpiresAt:    time.Now().Add(10 * time.Minute),
+			},
+		},
+	}
+
+	data, err := json.Marshal(store)
+	if err != nil {
+		t.Fatalf("failed to marshal store: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cm.cacheDir, poCacheFile), data, 0644); err != nil {
+		t.Fatalf("failed to write layered po cache: %v", err)
+	}
+
+	loaded, err := cm.LoadPOToken("vid-b", "visitor-b", "0")
+	if err != nil {
+		t.Fatalf("LoadPOToken failed: %v", err)
+	}
+	if loaded.PlayerToken != "PLAYER_B" || loaded.URLToken != "URL_B" {
+		t.Fatalf("expected B entry, got %#v", loaded)
 	}
 }

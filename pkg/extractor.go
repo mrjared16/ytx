@@ -8,8 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +25,8 @@ const (
 	visitorDataSWRGrace = 2 * time.Hour
 	cipherSWRGrace      = 18 * time.Hour
 	backgroundWarmupTTL = 20 * time.Second
+	defaultPOTokenTTL   = 10 * time.Minute
+	stsWaitBudget       = 250 * time.Millisecond
 )
 
 // Extractor handles YouTube stream extraction
@@ -46,6 +51,10 @@ type Extractor struct {
 	audioFormat      AudioFormat   // preferred audio format (default: AudioFormatWebm)
 	earlySTSOverride int           // STS from early cipher signal (for API overlap)
 	warnings         []string
+	poMode           bool // explicit PO mode; off by default
+	poChallenge      *POTokenChallenge
+	poPlayerToken    string
+	poURLToken       string
 }
 
 // defaultSubtitleLangs are fetched when --subs is used without --sub-langs
@@ -78,6 +87,13 @@ func WithHTTPClient(client *http.Client) ExtractorOption {
 func WithCacheManager(cacheManager *CacheManager) ExtractorOption {
 	return func(e *Extractor) error {
 		e.cacheManager = cacheManager
+		return nil
+	}
+}
+
+func WithPOMode(enabled bool) ExtractorOption {
+	return func(e *Extractor) error {
+		e.poMode = enabled
 		return nil
 	}
 }
@@ -378,6 +394,8 @@ var (
 	sessionIndexRegex     = regexp.MustCompile(`"SESSION_INDEX"\s*:\s*"([^"]+)"`)
 	delegatedSIDRegex     = regexp.MustCompile(`"DELEGATED_SESSION_ID"\s*:\s*"([^"]+)"`)
 	datasyncIDRegex       = regexp.MustCompile(`"DATASYNC_ID"\s*:\s*"([^"]+)"`)
+	ytAtNRegex            = regexp.MustCompile(`(?s)window\s*\.\s*ytAtN\s*\(\s*(\{.+?\})\s*\)\s*;`)
+	ytAtRRegex            = regexp.MustCompile(`(?s)window\s*\.\s*ytAtR\s*=\s*(['"].+?['"])\s*;`)
 )
 
 // fetchMusicVisitorData gets visitorData from music.youtube.com page.
@@ -447,6 +465,9 @@ func (e *Extractor) Extract(videoID string) (*Result, error) {
 
 func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result, error) {
 	e.warnings = nil
+	e.poPlayerToken = ""
+	e.poURLToken = ""
+	e.poChallenge = nil
 	e.cipherRetried.Store(false) // Allow one retry per extraction
 	var totalStart time.Time
 	if e.profile {
@@ -468,6 +489,12 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 	visitorCh := make(chan visitorResult, 1)
 	cipherCh := make(chan cipherResult, 1)
 	stsCh := make(chan int, 1) // early STS for API overlap
+	type poTokenResult struct {
+		playerToken string
+		urlToken    string
+		err         error
+	}
+	poCh := make(chan poTokenResult, 1)
 
 	// Fetch visitorData in parallel
 	go func() {
@@ -484,7 +511,6 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 			prewarmStart = time.Now()
 		}
 		cipher, err := e.getCachedCipherContext(ctx, videoID)
-		prewarmMs := int64(0)
 		if err == nil && cipher != nil {
 			// Signal STS as soon as cipher is available (even from cache)
 			select {
@@ -492,11 +518,17 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 			default:
 			}
 
-			// ensureSignatureReady() populates jsCode (lazy init)
-			_ = cipher.ensureSignatureReady()
-
-			// Concurrently Pre-warm QuickJS CVM bytecode execution to completely mask it within the HTTP network latency!
-			_ = cipher.Prewarm()
+			// Synchronously ensure sig runtime is ready before sending cipher result.
+			// This eliminates the race where DecryptSignature hits ensureWrapperContext
+			// before an async prewarm finishes, paying ~326ms bootstrap redundantly.
+			if cipher.canPrecomputeSignatureRuntime() {
+				_ = cipher.ensureSignatureReady()
+			}
+			if cipher.canPrewarmSignatureRuntime() {
+				_ = cipher.Prewarm()
+			}
+			// N-transform engine can warm in background — not needed before decrypt.
+			go func() { _ = cipher.WarmNTransformEngineContext(ctx) }()
 		} else {
 			select {
 			case stsCh <- 0:
@@ -504,10 +536,12 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 			}
 		}
 
-		if e.profile {
-			prewarmMs = time.Since(prewarmStart).Milliseconds()
-		}
-		cipherCh <- cipherResult{cipher: cipher, err: err, prewarmMs: prewarmMs}
+		cipherCh <- cipherResult{cipher: cipher, err: err, prewarmMs: func() int64 {
+			if e.profile {
+				return time.Since(prewarmStart).Milliseconds()
+			}
+			return 0
+		}()}
 	}()
 
 	// Wait for visitorData (required for API call)
@@ -523,14 +557,43 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 		// Non-fatal, continue without it
 	}
 
-	// Wait for STS only (not full cipher) — allows API call to start sooner
+	if e.poMode {
+		poCoordinator := e.newPOCoordinator()
+		go func() {
+			playerToken, urlToken, err := poCoordinator.acquireTokens(ctx, videoID)
+			poCh <- poTokenResult{playerToken: playerToken, urlToken: urlToken, err: err}
+		}()
+	}
+
+	// Wait briefly for STS (not full cipher) — allows API call to start sooner
 	var stsWaitStart time.Time
 	if e.profile {
 		stsWaitStart = time.Now()
 	}
-	sts := <-stsCh
+	sts := 0
+	stsReady := false
+	if !e.config.NeedsCookies {
+		sts = <-stsCh
+		stsReady = true
+	} else {
+		select {
+		case sts = <-stsCh:
+			stsReady = true
+		case <-time.After(stsWaitBudget):
+			sts = 0
+		}
+	}
 	if e.profile {
 		e.timings.STSWaitMs = time.Since(stsWaitStart).Milliseconds()
+	}
+
+	if e.poMode {
+		poRes := <-poCh
+		e.poPlayerToken = poRes.playerToken
+		e.poURLToken = poRes.urlToken
+		if poRes.err != nil {
+			return nil, NewPOError(POFailureTokenUnavailable, "po mode token unavailable", poRes.err)
+		}
 	}
 
 	// Call innertube API with STS (cipher may still be finishing heavy init)
@@ -541,6 +604,17 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 	e.earlySTSOverride = sts
 	playerResp, err := e.callPlayerAPIContext(ctx, videoID)
 	e.earlySTSOverride = 0
+	if err != nil && !stsReady {
+		select {
+		case sts = <-stsCh:
+			if sts > 0 {
+				e.earlySTSOverride = sts
+				playerResp, err = e.callPlayerAPIContext(ctx, videoID)
+				e.earlySTSOverride = 0
+			}
+		default:
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
 	}
@@ -566,6 +640,13 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 
 	// Check playability
 	if playerResp.PlayabilityStatus.Status != "OK" {
+		if !e.poMode && IsLikelyPORequiredFromPlayerResponse(playerResp) {
+			return nil, NewPOError(
+				POFailureRequired,
+				fmt.Sprintf("video not playable: %s - %s", playerResp.PlayabilityStatus.Status, playerResp.PlayabilityStatus.Reason),
+				nil,
+			)
+		}
 		return nil, fmt.Errorf("video not playable: %s - %s",
 			playerResp.PlayabilityStatus.Status,
 			playerResp.PlayabilityStatus.Reason)
@@ -639,6 +720,13 @@ func (e *Extractor) ExtractVideoContext(ctx context.Context, videoID string) (*V
 	}
 
 	if playerResp.PlayabilityStatus.Status != "OK" {
+		if !e.poMode && IsLikelyPORequiredFromPlayerResponse(playerResp) {
+			return nil, NewPOError(
+				POFailureRequired,
+				fmt.Sprintf("video not playable: %s - %s", playerResp.PlayabilityStatus.Status, playerResp.PlayabilityStatus.Reason),
+				nil,
+			)
+		}
 		return nil, fmt.Errorf("video not playable: %s - %s",
 			playerResp.PlayabilityStatus.Status,
 			playerResp.PlayabilityStatus.Reason)
@@ -766,6 +854,9 @@ func (e *Extractor) callPlayerAPIContext(ctx context.Context, videoID string) (*
 				SignatureTimestamp: sts,
 			},
 		},
+	}
+	if e.poMode && e.poPlayerToken != "" {
+		reqBody.ServiceIntegrityDimensions = &ServiceIntegrityDimensions{PoToken: e.poPlayerToken}
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -950,21 +1041,30 @@ func (e *Extractor) getCachedCipherContext(ctx context.Context, videoID string) 
 	// 2. Try persistent cache.
 	if e.cacheManager != nil {
 		if cache, err := e.cacheManager.Load(); err == nil {
-			stale := now.After(cache.ExpiresAt)
-			if !stale || now.Before(cache.ExpiresAt.Add(cipherSWRGrace)) {
-				cipher := NewCipherFromCacheWithRuntime(e.runtime, cache)
-				if playerJS, err := e.cacheManager.LoadPlayerJS(); err == nil {
-					cipher.playerJS = playerJS
+			if !e.cacheManager.IsValid(cache) {
+				_ = e.cacheManager.Invalidate()
+			} else {
+				stale := now.After(cache.ExpiresAt)
+				if !stale || now.Before(cache.ExpiresAt.Add(cipherSWRGrace)) {
+					cipher := NewCipherFromCacheWithRuntime(e.runtime, cache)
+					if nRuntimeJS, err := e.cacheManager.LoadNRuntimeJS(); err == nil {
+						cipher.nRuntimeJS = nRuntimeJS
+					}
+
+					needPlayerJS := cache.JSCode == "" || (cache.NFunction != "" && len(cipher.nRuntimeJS) == 0)
+					if needPlayerJS {
+						if playerJS, err := e.cacheManager.LoadPlayerJS(); err == nil {
+							cipher.playerJS = playerJS
+						}
+					}
+
+					e.storeCipherCache(cipher, cache.ExpiresAt)
+					e.warmNTransformAsync(ctx, cipher)
+					if stale {
+						e.refreshCipherAsync(ctx, videoID)
+					}
+					return cipher, nil
 				}
-				if nRuntimeJS, err := e.cacheManager.LoadNRuntimeJS(); err == nil {
-					cipher.nRuntimeJS = nRuntimeJS
-				}
-				e.storeCipherCache(cipher, cache.ExpiresAt)
-				e.warmCipherAsync(ctx, cipher)
-				if stale {
-					e.refreshCipherAsync(ctx, videoID)
-				}
-				return cipher, nil
 			}
 		}
 	}
@@ -1039,12 +1139,22 @@ func (e *Extractor) fetchAndCacheCipherContext(ctx context.Context, videoID stri
 		}
 	}
 	e.absorbCipherWarnings(cipher)
-	if cipher.sigFunctionName != "" {
+	if cipher.canPrecomputeSignatureRuntime() {
 		if err := cipher.ensureSignatureReady(); err != nil {
 			cipher.warnings = append(cipher.warnings,
 				fmt.Sprintf("failed to precompute signature runtime during cache warmup: %v", err))
 			e.absorbCipherWarnings(cipher)
 		}
+	}
+
+	if cipher.PlayerJSFetchMs > 0 {
+		e.timings.PlayerJSFetchMs = cipher.PlayerJSFetchMs
+	}
+	if cipher.CipherAnalyzeMs > 0 {
+		e.timings.CipherAnalyzeMs = cipher.CipherAnalyzeMs
+	}
+	if cipher.AnalyzeDetail != nil {
+		e.timings.CipherDetail = cipher.AnalyzeDetail
 	}
 
 	expiry := time.Now().Add(cacheTTL)
@@ -1064,7 +1174,7 @@ func (e *Extractor) fetchAndCacheCipherContext(ctx context.Context, videoID stri
 		}
 	}
 
-	e.warmCipherAsync(ctx, cipher)
+	e.warmNTransformAsync(ctx, cipher)
 
 	return cipher, nil
 }
@@ -1097,7 +1207,7 @@ func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, str
 		if err != nil {
 			return "", err
 		}
-		return streamURL, nil
+		return e.applyPOToken(streamURL), nil
 	}
 
 	// Otherwise, decrypt the signature cipher
@@ -1126,7 +1236,7 @@ func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, str
 		if err != nil {
 			return "", err
 		}
-		return streamURL, nil
+		return e.applyPOToken(streamURL), nil
 	}
 
 	// Initialize cipher if needed (using cache)
@@ -1170,7 +1280,353 @@ func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, str
 		return "", err
 	}
 
-	return streamURL, nil
+	return e.applyPOToken(streamURL), nil
+}
+
+func (e *Extractor) applyPOToken(streamURL string) string {
+	if !e.poMode || (e.poPlayerToken == "" && e.poURLToken == "") {
+		return streamURL
+	}
+	token := e.poURLToken
+	if token == "" {
+		token = e.poPlayerToken
+	}
+	parsedURL, err := url.Parse(streamURL)
+	if err != nil {
+		return streamURL
+	}
+	q := parsedURL.Query()
+	if q.Get("pot") == "" {
+		q.Set("pot", token)
+		parsedURL.RawQuery = q.Encode()
+	}
+	return parsedURL.String()
+}
+
+func (e *Extractor) ensurePOTokenContext(ctx context.Context, videoID string) (string, string, error) {
+	if !e.poMode {
+		return "", "", nil
+	}
+	if videoID == "" {
+		return "", "", fmt.Errorf("missing video id")
+	}
+
+	if e.cacheManager != nil {
+		if cache, err := e.cacheManager.LoadPOToken(videoID, e.visitorData, e.sessionIndex); err == nil && cache.PlayerToken != "" && cache.URLToken != "" {
+			return cache.PlayerToken, cache.URLToken, nil
+		}
+	}
+
+	t0 := time.Now()
+	challenge, err := e.loadPOTokenChallengeContext(ctx, videoID)
+	if err != nil {
+		return "", "", err
+	}
+	if e.profile {
+		e.timings.POChallengeMs = time.Since(t0).Milliseconds()
+	}
+
+	e.poChallenge = challenge
+	t1 := time.Now()
+	playerToken, urlToken, ttl, err := e.mintPOTokenContext(ctx, challenge)
+	if err != nil {
+		return "", "", err
+	}
+	if e.profile {
+		e.timings.POMintMs = time.Since(t1).Milliseconds()
+	}
+	if ttl <= 0 {
+		ttl = defaultPOTokenTTL
+	}
+
+	if e.cacheManager != nil {
+		_ = e.cacheManager.SavePOToken(&POTokenCache{
+			Token:        urlToken,
+			PlayerToken:  playerToken,
+			URLToken:     urlToken,
+			VideoID:      videoID,
+			VisitorData:  e.visitorData,
+			SessionIndex: e.sessionIndex,
+			ExpiresAt:    time.Now().Add(ttl),
+		})
+	}
+
+	return playerToken, urlToken, nil
+}
+
+func (e *Extractor) loadPOTokenChallengeContext(ctx context.Context, videoID string) (*POTokenChallenge, error) {
+	if challenge := e.extractWatchPagePOTokenChallengeContext(ctx, videoID); challenge != nil {
+		return challenge, nil
+	}
+	return e.requestPOTokenChallengeViaAttGetContext(ctx, videoID)
+}
+
+func (e *Extractor) extractWatchPagePOTokenChallengeContext(ctx context.Context, videoID string) *POTokenChallenge {
+	if e.config.Name != "WEB_MUSIC" {
+		return nil
+	}
+	watchURL := fmt.Sprintf("https://music.youtube.com/watch?v=%s", videoID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, watchURL, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", e.config.UserAgent)
+	req.Header.Set("Cookie", BuildCookieHeader(e.cookies))
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+
+	bgChallenge := extractBGChallengeFromWatchPage(body)
+	if len(bgChallenge) == 0 {
+		return nil
+	}
+
+	return &POTokenChallenge{
+		Source:       "watch",
+		Webpage:      append([]byte(nil), body...),
+		BGChallenge:  append([]byte(nil), bgChallenge...),
+		VideoID:      videoID,
+		VisitorData:  e.visitorData,
+		SessionIndex: e.sessionIndex,
+	}
+}
+
+func (e *Extractor) requestPOTokenChallengeViaAttGetContext(ctx context.Context, videoID string) (*POTokenChallenge, error) {
+	client := InnertubeClient{
+		HL:            "en",
+		GL:            "US",
+		ClientName:    e.config.Name,
+		ClientVersion: e.config.Version,
+		UserAgent:     e.config.UserAgent,
+		TimeZone:      "UTC",
+		UTCOffset:     0,
+		VisitorData:   e.visitorData,
+	}
+
+	if e.config.DeviceMake != "" {
+		client.DeviceMake = e.config.DeviceMake
+	}
+	if e.config.DeviceModel != "" {
+		client.DeviceModel = e.config.DeviceModel
+	}
+	if e.config.Platform != "" {
+		client.Platform = e.config.Platform
+	}
+	if e.config.OSName != "" {
+		client.OSName = e.config.OSName
+	}
+	if e.config.OSVersion != "" {
+		client.OSVersion = e.config.OSVersion
+	}
+
+	payload := map[string]any{
+		"videoId":        videoID,
+		"context":        map[string]any{"client": client},
+		"engagementType": "ENGAGEMENT_TYPE_UNBOUND",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	attEndpoint := strings.Replace(e.config.APIEndpoint, "/player", "/att/get", 1)
+	apiURL := fmt.Sprintf("%s?key=%s&prettyPrint=false", attEndpoint, e.config.APIKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", e.config.UserAgent)
+	req.Header.Set("Origin", e.config.Origin)
+	req.Header.Set("Referer", e.config.Origin+"/")
+	for k, v := range e.config.Headers {
+		req.Header.Set(k, v)
+	}
+	if e.config.NeedsCookies && e.sapisid != "" {
+		sapisidhash := GenerateSAPISIDHASH(e.sapisid, e.config.Origin)
+		req.Header.Set("Authorization", sapisidhash)
+		req.Header.Set("X-Origin", e.config.Origin)
+		req.Header.Set("Cookie", BuildCookieHeader(e.cookies))
+		if e.sessionIndex != "" {
+			req.Header.Set("X-Goog-AuthUser", e.sessionIndex)
+		}
+		req.Header.Set("X-Youtube-Bootstrap-Logged-In", "true")
+	}
+	if e.visitorData != "" {
+		req.Header.Set("X-Goog-Visitor-Id", e.visitorData)
+	}
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, NewPOError(POFailureAttGetChallenge, "att/get request failed", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, NewPOError(POFailureAttGetChallenge, "failed reading att/get response", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, NewPOError(POFailureAttGetChallenge, fmt.Sprintf("att/get returned %d: %s", resp.StatusCode, string(respBody[:min(200, len(respBody))])), nil)
+	}
+
+	var raw any
+	if err := json.Unmarshal(respBody, &raw); err != nil {
+		return nil, NewPOError(POFailureAttGetChallenge, "failed to parse att/get response", err)
+	}
+
+	challenge := extractBGChallenge(raw)
+	if challenge == nil {
+		return nil, NewPOError(POFailureAttGetChallenge, "att/get response missing bgChallenge", nil)
+	}
+	return &POTokenChallenge{Source: "att/get", BGChallenge: challenge.BgChallenge, Challenge: *challenge, VideoID: videoID, VisitorData: e.visitorData, SessionIndex: e.sessionIndex}, nil
+}
+
+func (e *Extractor) mintPOTokenContext(ctx context.Context, challenge *POTokenChallenge) (string, string, time.Duration, error) {
+	playerToken, urlToken, ttl, err := mintPOTokenWithBun(ctx, challenge)
+	if err != nil {
+		return "", "", 0, NewPOError(POFailureRuntimeMint, "failed to mint po token", err)
+	}
+	return playerToken, urlToken, ttl, nil
+}
+
+func extractBGChallengeFromWatchPage(body []byte) json.RawMessage {
+	if len(body) == 0 {
+		return nil
+	}
+
+	if match := ytAtRRegex.FindSubmatch(body); len(match) >= 2 {
+		quoted := string(match[1])
+		if strings.HasPrefix(quoted, "'") {
+			quoted = `"` + strings.Trim(strings.TrimPrefix(quoted, "'"), "'") + `"`
+		}
+		if rawJSON, err := strconv.Unquote(quoted); err == nil {
+			var container map[string]any
+			if err := json.Unmarshal([]byte(rawJSON), &container); err == nil {
+				if raw, ok := container["bgChallenge"]; ok {
+					if encoded, err := json.Marshal(raw); err == nil {
+						return encoded
+					}
+				}
+			}
+		}
+	}
+
+	if match := ytAtNRegex.FindSubmatch(body); len(match) >= 2 {
+		var container map[string]any
+		if err := json.Unmarshal(match[1], &container); err == nil {
+			if raw, ok := container["bgChallenge"]; ok {
+				if encoded, err := json.Marshal(raw); err == nil {
+					return encoded
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func extractPOToken(v any) string {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, child := range t {
+			if strings.EqualFold(k, "poToken") {
+				if s, ok := child.(string); ok {
+					return s
+				}
+			}
+			if tok := extractPOToken(child); tok != "" {
+				return tok
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if tok := extractPOToken(child); tok != "" {
+				return tok
+			}
+		}
+	}
+	return ""
+}
+
+func extractBGChallenge(v any) *BotGuardChallenge {
+	switch t := v.(type) {
+	case map[string]any:
+		if raw, ok := t["bgChallenge"]; ok {
+			data, err := json.Marshal(raw)
+			if err != nil {
+				return nil
+			}
+			challenge := &BotGuardChallenge{BgChallenge: data}
+			if m, ok := raw.(map[string]any); ok {
+				if s, ok := m["engagementType"].(string); ok {
+					challenge.EngagementType = s
+				}
+				if s, ok := m["challengeToken"].(string); ok {
+					challenge.ChallengeToken = s
+				}
+			}
+			return challenge
+		}
+		for _, child := range t {
+			if challenge := extractBGChallenge(child); challenge != nil {
+				return challenge
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if challenge := extractBGChallenge(child); challenge != nil {
+				return challenge
+			}
+		}
+	}
+	return nil
+}
+
+func extractPOTokenTTL(v any) time.Duration {
+	seconds := extractTTLSeconds(v)
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func extractTTLSeconds(v any) int {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, child := range t {
+			if strings.EqualFold(k, "expiresInSeconds") || strings.EqualFold(k, "ttlSeconds") {
+				switch vv := child.(type) {
+				case float64:
+					return int(vv)
+				case int:
+					return vv
+				case string:
+					n, _ := strconv.Atoi(vv)
+					if n > 0 {
+						return n
+					}
+				}
+			}
+			if n := extractTTLSeconds(child); n > 0 {
+				return n
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if n := extractTTLSeconds(child); n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
 }
 
 func (e *Extractor) warningsForResult() []string {
@@ -1201,22 +1657,39 @@ func (e *Extractor) absorbCipherWarnings(cipher *Cipher) {
 }
 
 func (e *Extractor) persistCipherArtifacts() {
-	if e.cacheManager == nil || e.cipher == nil || len(e.cipher.playerJS) == 0 || e.cipher.jsCode == "" {
+	if e.cacheManager == nil || e.cipher == nil || len(e.cipher.playerJS) == 0 || !e.cipher.canPersistSignatureRuntime() {
 		return
 	}
+
+	cachePath := e.cacheManager.CachePath()
+	codePath := filepath.Join(e.cacheManager.cacheDir, "cipher_code.bin")
+	playerPath := e.cacheManager.PlayerCachePath()
+	nRuntimePath := e.cacheManager.NRuntimeCachePath()
+
 	cacheData := e.cipher.ToCache()
 	cacheData.BaseJSPath = e.cipher.playerURL
-	_ = e.cacheManager.Save(cacheData)
-	_ = e.cacheManager.SavePlayerJS(e.cipher.playerJS)
-	if len(e.cipher.nRuntimeJS) > 0 {
+
+	if !pathExists(cachePath) || !pathExists(codePath) {
+		_ = e.cacheManager.Save(cacheData)
+	}
+	if !pathExists(playerPath) {
+		_ = e.cacheManager.SavePlayerJS(e.cipher.playerJS)
+	}
+	if len(e.cipher.nRuntimeJS) > 0 && !pathExists(nRuntimePath) {
 		_ = e.cacheManager.SaveNRuntimeJS(e.cipher.nRuntimeJS)
 	}
+
 	e.runtime.cipherCache.Lock()
 	defer e.runtime.cipherCache.Unlock()
 	if time.Now().Before(e.runtime.cipherCache.expiry) {
 		e.runtime.cipherCache.cipher = e.cipher
 		e.runtime.cipherCache.updated = time.Now()
 	}
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func (e *Extractor) storeCipherCache(cipher *Cipher, expiry time.Time) {
@@ -1237,16 +1710,15 @@ func (e *Extractor) refreshCipherAsync(parent context.Context, videoID string) {
 	}()
 }
 
-func (e *Extractor) warmCipherAsync(parent context.Context, cipher *Cipher) {
+// warmNTransformAsync warms the n-transform JS engine in the background.
+// Signature runtime prewarm is done synchronously before cipher is sent on cipherCh.
+func (e *Extractor) warmNTransformAsync(parent context.Context, cipher *Cipher) {
 	if cipher == nil {
 		return
 	}
 	go func() {
 		ctx, cancel := backgroundRefreshContext(parent, backgroundWarmupTTL)
 		defer cancel()
-		if err := cipher.ensureSignatureReady(); err == nil {
-			_ = cipher.Prewarm()
-		}
 		_ = cipher.WarmNTransformEngineContext(ctx)
 	}()
 }
@@ -1261,18 +1733,36 @@ func (e *Extractor) decryptWithRetryContext(ctx context.Context, videoID, sig st
 	if err == nil {
 		return result, nil
 	}
+	useWatchFirst := strings.Contains(err.Error(), "url wrapper") || strings.Contains(err.Error(), "wrapper function not found")
 
-	// Fail-forward: retry once with fresh cipher (atomic to prevent races)
+	maxRetries := 1
+	if e.cipher != nil && e.cipher.sigUsesURLWrapper {
+		maxRetries = 2
+	}
+
+	// Fail-forward: retry with fresh cipher when live player variants are flaky.
 	e.warnings = append(e.warnings, fmt.Sprintf("sig decrypt failed (will retry): %v [fn=%s jsCodeLen=%d playerJSLen=%d]",
 		err, e.cipher.sigFunctionName, len(e.cipher.jsCode), len(e.cipher.playerJS)))
-	if !e.cipherRetried.Swap(true) {
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		oldCipher := e.cipher
+		e.cipherRetried.Store(true)
 		e.invalidateCipherCache()
 		e.cipherMu.Lock()
 		e.cipher = nil
 		e.cipherMu.Unlock()
 
 		// Fetch fresh cipher
-		newCipher, fetchErr := e.getCachedCipherContext(ctx, videoID)
+		var newCipher *Cipher
+		var fetchErr error
+		if useWatchFirst && attempt == 0 {
+			playerBaseURL := e.config.Origin
+			if oldCipher != nil && oldCipher.playerURL != "" {
+				playerBaseURL = oldCipher.playerURL
+			}
+			newCipher, _, fetchErr = fetchPlayerJSWatchFirstCipherContext(ctx, e.runtime, videoID, e.httpClient, playerBaseURL, e.cacheManager)
+		} else {
+			newCipher, fetchErr = e.getCachedCipherContext(ctx, videoID)
+		}
 		if fetchErr != nil {
 			return "", fmt.Errorf("retry failed: %w", fetchErr)
 		}
@@ -1281,10 +1771,17 @@ func (e *Extractor) decryptWithRetryContext(ctx context.Context, videoID, sig st
 		e.cipherMu.Unlock()
 
 		// Retry decryption
-		return newCipher.DecryptSignature(sig)
+		result, err = newCipher.DecryptSignature(sig)
+		if err == nil {
+			return result, nil
+		}
+		if attempt+1 < maxRetries {
+			e.warnings = append(e.warnings, fmt.Sprintf("sig decrypt retry %d failed: %v [fn=%s jsCodeLen=%d playerJSLen=%d]",
+				attempt+1, err, newCipher.sigFunctionName, len(newCipher.jsCode), len(newCipher.playerJS)))
+		}
 	}
 
-	return result, nil
+	return "", err
 }
 
 // unthrottle applies the n-parameter transformation to bypass throttling

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,7 @@ const (
 	playerCacheFile   = "player.js.gz" // Compressed player.js for n-transform
 	nRuntimeCacheFile = "n_runtime.js"
 	visitorCacheFile  = "visitor.json"
+	poCacheFile       = "po_token.json"
 	cacheTTL          = 6 * time.Hour
 )
 
@@ -154,8 +156,31 @@ type VisitorCache struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 
+// POTokenCache represents persisted PO token data for explicit --po mode.
+type POTokenCache struct {
+	Token        string    `json:"token,omitempty"`
+	PlayerToken  string    `json:"player_token,omitempty"`
+	URLToken     string    `json:"url_token,omitempty"`
+	VideoID      string    `json:"video_id"`
+	VisitorData  string    `json:"visitor_data,omitempty"`
+	SessionIndex string    `json:"session_index,omitempty"`
+	NetworkKey   string    `json:"network_key,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+type poTokenCacheStore struct {
+	Version int                     `json:"version"`
+	Entries map[string]POTokenCache `json:"entries"`
+}
+
+const poTokenCacheVersion = 2
+
 func (cm *CacheManager) visitorCachePath() string {
 	return filepath.Join(cm.cacheDir, visitorCacheFile)
+}
+
+func (cm *CacheManager) poCachePath() string {
+	return filepath.Join(cm.cacheDir, poCacheFile)
 }
 
 // LoadVisitorData reads the visitor cache from disk
@@ -210,6 +235,156 @@ func (cm *CacheManager) SaveVisitorData(cache *VisitorCache) error {
 	return os.Rename(tmpPath, cm.visitorCachePath())
 }
 
+// LoadPOToken reads a cached PO token and validates binding + expiry.
+func (cm *CacheManager) LoadPOToken(videoID, visitorData, sessionIndex string) (*POTokenCache, error) {
+	data, err := os.ReadFile(cm.poCachePath())
+	if err != nil {
+		return nil, err
+	}
+	if store, ok := decodePOTokenStore(data); ok {
+		key := poTokenCacheKey(videoID, visitorData, sessionIndex, "")
+		if candidate, ok := store.Entries[key]; ok {
+			cache := normalizePOTokenCache(candidate)
+			if err := validatePOTokenCache(cache, videoID, visitorData, sessionIndex, ""); err == nil {
+				return cache, nil
+			}
+		}
+
+		for _, candidate := range store.Entries {
+			cache := normalizePOTokenCache(candidate)
+			if err := validatePOTokenCache(cache, videoID, visitorData, sessionIndex, ""); err == nil {
+				return cache, nil
+			}
+		}
+		return nil, fmt.Errorf("po token cache expired")
+	}
+
+	var cache POTokenCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		_ = os.Remove(cm.poCachePath())
+		return nil, err
+	}
+	normalized := normalizePOTokenCache(cache)
+	if err := validatePOTokenCache(normalized, videoID, visitorData, sessionIndex, ""); err != nil {
+		return nil, err
+	}
+
+	return normalized, nil
+}
+
+// SavePOToken persists PO token data atomically.
+func (cm *CacheManager) SavePOToken(cache *POTokenCache) error {
+	if cache == nil {
+		return nil
+	}
+	normalized := normalizePOTokenCache(*cache)
+	if normalized.PlayerToken == "" || normalized.URLToken == "" {
+		return nil
+	}
+
+	store := &poTokenCacheStore{Version: poTokenCacheVersion, Entries: map[string]POTokenCache{}}
+	if existingData, err := os.ReadFile(cm.poCachePath()); err == nil {
+		if existingStore, ok := decodePOTokenStore(existingData); ok {
+			store = existingStore
+		} else {
+			var legacy POTokenCache
+			if json.Unmarshal(existingData, &legacy) == nil {
+				legacyNorm := normalizePOTokenCache(legacy)
+				if legacyNorm.PlayerToken != "" && legacyNorm.URLToken != "" && time.Now().Before(legacyNorm.ExpiresAt) {
+					legacyKey := poTokenCacheKey(legacyNorm.VideoID, legacyNorm.VisitorData, legacyNorm.SessionIndex, legacyNorm.NetworkKey)
+					store.Entries[legacyKey] = *legacyNorm
+				}
+			}
+		}
+	}
+
+	for key, entry := range store.Entries {
+		if time.Now().After(entry.ExpiresAt) {
+			delete(store.Entries, key)
+		}
+	}
+
+	entryKey := poTokenCacheKey(normalized.VideoID, normalized.VisitorData, normalized.SessionIndex, normalized.NetworkKey)
+	store.Entries[entryKey] = *normalized
+
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmpPath := cm.poCachePath() + fmt.Sprintf(".%d.tmp", os.Getpid())
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, cm.poCachePath())
+}
+
+func decodePOTokenStore(data []byte) (*poTokenCacheStore, bool) {
+	var store poTokenCacheStore
+	if err := json.Unmarshal(data, &store); err != nil {
+		return nil, false
+	}
+	if store.Version <= 0 || len(store.Entries) == 0 {
+		return nil, false
+	}
+	if store.Entries == nil {
+		store.Entries = map[string]POTokenCache{}
+	}
+	return &store, true
+}
+
+func poTokenCacheKey(videoID, visitorData, sessionIndex, networkKey string) string {
+	return strings.Join([]string{videoID, visitorData, sessionIndex, networkKey}, "|")
+}
+
+func normalizePOTokenCache(cache POTokenCache) *POTokenCache {
+	if cache.PlayerToken == "" {
+		cache.PlayerToken = cache.Token
+	}
+	if cache.URLToken == "" {
+		cache.URLToken = cache.Token
+	}
+	if cache.Token == "" {
+		cache.Token = cache.URLToken
+		if cache.Token == "" {
+			cache.Token = cache.PlayerToken
+		}
+	}
+	return &cache
+}
+
+func validatePOTokenCache(cache *POTokenCache, videoID, visitorData, sessionIndex, networkKey string) error {
+	if cache == nil {
+		return fmt.Errorf("po token cache missing")
+	}
+	if cache.PlayerToken == "" || cache.URLToken == "" || time.Now().After(cache.ExpiresAt) {
+		return fmt.Errorf("po token cache expired")
+	}
+	if cache.VideoID != "" && videoID != "" && cache.VideoID != videoID {
+		return fmt.Errorf("po token cache video mismatch")
+	}
+	if cache.VisitorData != "" && visitorData != "" && cache.VisitorData != visitorData {
+		return fmt.Errorf("po token cache visitor mismatch")
+	}
+	if cache.SessionIndex != "" && sessionIndex != "" && cache.SessionIndex != sessionIndex {
+		return fmt.Errorf("po token cache session mismatch")
+	}
+	if cache.NetworkKey != "" && networkKey != "" && cache.NetworkKey != networkKey {
+		return fmt.Errorf("po token cache network mismatch")
+	}
+	return nil
+}
+
+// InvalidatePOToken removes cached PO token data.
+func (cm *CacheManager) InvalidatePOToken() error {
+	err := os.Remove(cm.poCachePath())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
 // Invalidate removes the cache file
 func (cm *CacheManager) Invalidate() error {
 	err := os.Remove(cm.CachePath())
@@ -221,7 +396,7 @@ func (cm *CacheManager) Invalidate() error {
 
 // currentCacheVersion is the current cache format version
 // Increment when cache structure changes to invalidate old caches
-const currentCacheVersion = 5
+const currentCacheVersion = 6
 
 // IsValid checks if a cache entry is still valid (not expired and correct version)
 func (cm *CacheManager) IsValid(cache *CipherCache) bool {
@@ -322,6 +497,10 @@ func (cm *CacheManager) Purge() error {
 		lastErr = err
 	}
 
+	if err := os.Remove(cm.poCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
 	return lastErr
 }
 
@@ -417,9 +596,11 @@ func RefreshPlayerCache(videoID string) (*CacheInfo, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := cipher.ensureSignatureReady(); err == nil {
-		ext.cipher = cipher
-		ext.persistCipherArtifacts()
+	if cipher.canPrecomputeSignatureRuntime() {
+		if err := cipher.ensureSignatureReady(); err == nil {
+			ext.cipher = cipher
+			ext.persistCipherArtifacts()
+		}
 	}
 	info, err := GetCacheInfo()
 	if err != nil {

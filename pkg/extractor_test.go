@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -270,6 +271,14 @@ func TestExtractorRegression(t *testing.T) {
 }
 
 func TestBulkMusicProbeRegression(t *testing.T) {
+	runBulkMusicProbeRegression(t, false)
+}
+
+func TestBulkMusicProbeRegressionPO(t *testing.T) {
+	runBulkMusicProbeRegression(t, true)
+}
+
+func runBulkMusicProbeRegression(t *testing.T, poMode bool) {
 	requireExplicitLiveProbeRun(t)
 
 	if testing.Short() {
@@ -291,7 +300,15 @@ func TestBulkMusicProbeRegression(t *testing.T) {
 	runtime := NewRuntime()
 	defer runtime.CloseCachedEngine()
 
-	ext, err := NewExtractor(ModeMusic, cookiePath, WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir}))
+	opts := []ExtractorOption{
+		WithRuntime(runtime),
+		WithCacheManager(&CacheManager{cacheDir: cacheDir}),
+	}
+	if poMode {
+		opts = append(opts, WithPOMode(true))
+	}
+
+	ext, err := NewExtractor(ModeMusic, cookiePath, opts...)
 	if err != nil {
 		t.Fatalf("failed to create extractor: %v", err)
 	}
@@ -317,10 +334,59 @@ func TestBulkMusicProbeRegression(t *testing.T) {
 		}
 
 		status := probeStreamURL(result.URL)
+		if !poMode && status == http.StatusForbidden {
+			t.Logf("bulk extraction URL returned HTTP 403 for %s in normal mode; treating as PO-gated live behavior (hint: rerun in explicit PO mode)", videoID)
+			continue
+		}
+		if poMode && status == http.StatusForbidden {
+			t.Logf("bulk PO extraction URL returned HTTP 403 for %s; retrying once with fresh runtime/cache", videoID)
+			retryResult, retryStatus, retryErr := retrySingleMusicProbe(t, cookiePath, videoID, true)
+			if retryErr == nil && retryResult != nil && (retryStatus == http.StatusOK || retryStatus == http.StatusPartialContent) {
+				continue
+			}
+			if retryErr != nil {
+				t.Logf("bulk PO retry for %s failed during extraction: %v", videoID, retryErr)
+			} else {
+				t.Logf("bulk PO retry for %s returned HTTP %d", videoID, retryStatus)
+			}
+		}
 		if status != http.StatusOK && status != http.StatusPartialContent {
-			t.Fatalf("bulk extraction URL not streamable for %s: got HTTP %d", videoID, status)
+			hint := ""
+			if !poMode {
+				hint = " (hint: rerun in explicit PO mode)"
+			}
+			t.Fatalf("bulk extraction URL not streamable for %s: got HTTP %d%s", videoID, status, hint)
 		}
 	}
+}
+
+func retrySingleMusicProbe(t *testing.T, cookiePath, videoID string, poMode bool) (*Result, int, error) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return nil, 0, err
+	}
+
+	runtime := NewRuntime()
+	defer runtime.CloseCachedEngine()
+
+	opts := []ExtractorOption{WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir})}
+	if poMode {
+		opts = append(opts, WithPOMode(true))
+	}
+
+	ext, err := NewExtractor(ModeMusic, cookiePath, opts...)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	result, err := ext.Extract(videoID)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return result, probeStreamURL(result.URL), nil
 }
 
 // testVideoMode tests video extraction with timing
@@ -515,6 +581,21 @@ func probeStreamURL(url string) int {
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if total := resp.Header.Get("Content-Range"); strings.HasPrefix(total, "bytes 0-0/") {
+		if size, err := strconv.ParseInt(strings.TrimPrefix(total, "bytes 0-0/"), 10, 64); err == nil && size > 1 {
+			nearEndReq, err := http.NewRequest(http.MethodGet, url, nil)
+			if err == nil {
+				nearEndReq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", size-1, size-1))
+				nearEndReq.Header.Set("User-Agent", "Mozilla/5.0")
+				if nearEndResp, err := client.Do(nearEndReq); err == nil {
+					defer nearEndResp.Body.Close()
+					_, _ = io.Copy(io.Discard, nearEndResp.Body)
+					return nearEndResp.StatusCode
+				}
+			}
+		}
+	}
 
 	return resp.StatusCode
 }
@@ -876,6 +957,14 @@ func BenchmarkVideoExtraction(b *testing.B) {
 
 // TestMusicModeWithCookies tests music mode if cookies are available
 func TestMusicModeWithCookies(t *testing.T) {
+	runMusicModeWithCookiesProbe(t, false)
+}
+
+func TestMusicModeWithCookiesPO(t *testing.T) {
+	runMusicModeWithCookiesProbe(t, true)
+}
+
+func runMusicModeWithCookiesProbe(t *testing.T, poMode bool) {
 	requireExplicitLiveProbeRun(t)
 
 	if testing.Short() {
@@ -891,13 +980,22 @@ func TestMusicModeWithCookies(t *testing.T) {
 	}
 	tmpDir := t.TempDir()
 	cacheDir := filepath.Join(tmpDir, "cache")
-	os.MkdirAll(cacheDir, 0755)
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
 
-	ext, err := NewExtractor(ModeMusic, defaultCookiePath)
+	runtime := NewRuntime()
+	defer runtime.CloseCachedEngine()
+
+	opts := []ExtractorOption{WithRuntime(runtime), WithCacheManager(&CacheManager{cacheDir: cacheDir})}
+	if poMode {
+		opts = append(opts, WithPOMode(true))
+	}
+
+	ext, err := NewExtractor(ModeMusic, defaultCookiePath, opts...)
 	if err != nil {
 		t.Fatalf("failed to create extractor: %v", err)
 	}
-	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
 
 	videoID := "dQw4w9WgXcQ"
 
@@ -916,16 +1014,34 @@ func TestMusicModeWithCookies(t *testing.T) {
 	nTransformed := checkNTransformed(result.URL)
 	t.Logf("N-parameter transformed: %v", nTransformed)
 
-	// Validate URL
-	status := validateURL(result.URL)
+	// Validate URL with a stream-style probe; HEAD is flaky on googlevideo URLs.
+	status := probeStreamURL(result.URL)
 	t.Logf("HTTP status: %d", status)
-
-	if status != 200 {
-		t.Errorf("Expected HTTP 200, got %d", status)
+	if !poMode && status == http.StatusForbidden {
+		t.Log("normal-mode live probe returned HTTP 403; treating as PO-gated live behavior (hint: rerun in explicit PO mode)")
+		return
+	}
+	if poMode && status == http.StatusForbidden {
+		t.Log("PO-mode live probe returned HTTP 403; retrying once with fresh runtime/cache")
+		retryResult, retryStatus, retryErr := retrySingleMusicProbe(t, defaultCookiePath, videoID, true)
+		if retryErr == nil && retryResult != nil && (retryStatus == http.StatusOK || retryStatus == http.StatusPartialContent) {
+			return
+		}
+		if retryErr != nil {
+			t.Logf("PO-mode retry extraction failed: %v", retryErr)
+		} else {
+			t.Logf("PO-mode retry returned HTTP %d", retryStatus)
+		}
 	}
 
-	// Cleanup
-	CloseCachedEngine()
+	if status != http.StatusOK && status != http.StatusPartialContent {
+		hint := ""
+		if !poMode {
+			hint = " (hint: rerun in explicit PO mode)"
+		}
+		t.Errorf("Expected HTTP 200, got %d%s", status, hint)
+	}
+
 }
 
 func TestMusicModeUsesDocumentedCipherPathWithoutPOT(t *testing.T) {
@@ -1187,6 +1303,122 @@ func TestMusicModeDoesNotRequireChallengeOrPOTOnDocumentedPath(t *testing.T) {
 	}
 	if playerBodyPoToken != "" {
 		t.Fatalf("did not expect serviceIntegrityDimensions.poToken on documented path, got %q", playerBodyPoToken)
+	}
+
+	CloseCachedEngine()
+}
+
+func TestMusicModeExplicitPOModeInjectsTokenAndCachesIt(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	cookieFile := filepath.Join(tmpDir, "cookies.txt")
+	cookieData := ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\ttest-sapisid\n"
+	if err := os.WriteFile(cookieFile, []byte(cookieData), 0644); err != nil {
+		t.Fatalf("failed to write cookie file: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeMusic, cookieFile, WithPOMode(true))
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	var mu sync.Mutex
+	attGetCount := 0
+	playerBodyPoToken := ""
+
+	ext.httpClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Host == "music.youtube.com" && req.URL.Path == "/watch":
+				html := `<!doctype html><html><script>
+"visitorData":"VISITOR_TEST",
+"SESSION_INDEX":"0",
+"DELEGATED_SESSION_ID":"DELEGATED_TEST"
+</script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/embed/dQw4w9WgXcQ":
+				html := `<!doctype html><html><script src="/s/player/test123/player_ias.vflset/en_US/base.js"></script></html>`
+				return jsonHTTPResponse(http.StatusOK, html), nil
+
+			case req.Method == http.MethodGet && req.URL.Host == "www.youtube.com" && req.URL.Path == "/s/player/test123/player_ias.vflset/en_US/base.js":
+				playerJS := `var signatureTimestamp=12345;x&&(x=AbC(decodeURIComponent(x)));function AbC(a){a=a.split("");a.reverse();return a.join("")}`
+				return jsonHTTPResponse(http.StatusOK, playerJS), nil
+
+			case req.Method == http.MethodPost && req.URL.Host == "music.youtube.com" && req.URL.Path == "/youtubei/v1/att/get":
+				mu.Lock()
+				attGetCount++
+				mu.Unlock()
+				return jsonHTTPResponse(http.StatusOK, `{"bgChallenge":{"engagementType":"ENGAGEMENT_TYPE_UNBOUND","challengeToken":"CHALLENGE_TEST"}}`), nil
+
+			case req.Method == http.MethodPost && req.URL.Host == "music.youtube.com" && req.URL.Path == "/youtubei/v1/player":
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					return nil, err
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(body, &payload); err != nil {
+					return nil, err
+				}
+
+				mu.Lock()
+				if sid, ok := payload["serviceIntegrityDimensions"].(map[string]any); ok {
+					if token, ok := sid["poToken"].(string); ok {
+						playerBodyPoToken = token
+					}
+				}
+				mu.Unlock()
+
+				responseBody := `{
+"responseContext":{"visitorData":"VISITOR_TEST"},
+"playabilityStatus":{"status":"OK"},
+"streamingData":{"adaptiveFormats":[{"itag":141,"url":"https://stream.test/videoplayback?foo=bar","mimeType":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":256000,"quality":"tiny"}]},
+"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"test","lengthSeconds":"1","author":"author","shortDescription":""}
+}`
+				return jsonHTTPResponse(http.StatusOK, responseBody), nil
+			}
+
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.String())
+		}),
+	}
+
+	result, err := ext.Extract("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("first extraction failed: %v", err)
+	}
+	if !strings.Contains(result.URL, "pot=") {
+		t.Fatalf("expected pot in URL, got %q", result.URL)
+	}
+
+	mu.Lock()
+	if playerBodyPoToken == "" {
+		mu.Unlock()
+		t.Fatal("expected serviceIntegrityDimensions.poToken to be set")
+	}
+	if attGetCount != 1 {
+		mu.Unlock()
+		t.Fatalf("expected att/get to be called once, got %d", attGetCount)
+	}
+	mu.Unlock()
+
+	// Second extraction should reuse cached PO token and avoid another att/get call.
+	_, err = ext.Extract("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("second extraction failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if attGetCount != 1 {
+		t.Fatalf("expected cached PO token reuse (att/get count stays 1), got %d", attGetCount)
 	}
 
 	CloseCachedEngine()

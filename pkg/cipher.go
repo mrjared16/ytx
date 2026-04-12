@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,11 @@ type Cipher struct {
 	wrapperCtx    *quickjs.Context
 	wrapperReady  bool
 	wrapperJSCode string // the jsCode used to bootstrap this context
+
+	// Profiling metrics generated during initialization
+	PlayerJSFetchMs int64
+	CipherAnalyzeMs int64
+	AnalyzeDetail   *CipherAnalyzeDetail
 }
 
 // Close releases cached QuickJS resources. Call when the Cipher is no longer needed.
@@ -108,8 +114,9 @@ type sigFunctionPattern struct {
 
 var sigFunctionPatterns = []sigFunctionPattern{
 	{
-		regex:    regexp.MustCompile(`(?:\b|[^a-zA-Z0-9_$])([a-zA-Z0-9_$]{2,})\s*=\s*function\(\s*a\s*\)\s*{\s*a\s*=\s*a\.split\(\s*""\s*\)(?:;[a-zA-Z0-9_$]{2}\.[a-zA-Z0-9_$]{2}\(a,\d+\))?`),
-		sigIdx:   1,
+		// Strong primary fallback: var && ((var)=sig(decodeURIComponent(var)))
+		regex:    regexp.MustCompile(`\b([a-zA-Z0-9_$]+)\s*&&\s*\(\s*(?:\(\s*)?[a-zA-Z0-9_$]+\s*\)?\s*=\s*([a-zA-Z0-9_$]{2,})\(\s*decodeURIComponent\(\s*[a-zA-Z0-9_$]+\s*\)\s*\)\s*\)?`),
+		sigIdx:   2,
 		paramIdx: 0,
 	},
 	{
@@ -118,12 +125,7 @@ var sigFunctionPatterns = []sigFunctionPattern{
 		paramIdx: 2,
 	},
 	{
-		regex:    regexp.MustCompile(`\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(`),
-		sigIdx:   1,
-		paramIdx: 0,
-	},
-	{
-		regex:    regexp.MustCompile(`\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+\s*,\s*encodeURIComponent\s*\(\s*([a-zA-Z0-9$]+)\(`),
+		regex:    regexp.MustCompile(`(?:\b|[^a-zA-Z0-9_$])([a-zA-Z0-9_$]{2,})\s*=\s*function\(\s*a\s*\)\s*{\s*a\s*=\s*a\.split\(\s*""\s*\)(?:;[a-zA-Z0-9_$]{2}\.[a-zA-Z0-9_$]{2}\(a,\d+\))?`),
 		sigIdx:   1,
 		paramIdx: 0,
 	},
@@ -161,6 +163,15 @@ func NewCipherWithCachedPath(videoID string, httpClient *http.Client, cachedPath
 }
 
 func NewCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, videoID string, httpClient *http.Client, cachedPath string, baseURL string) (*Cipher, string, error) {
+	return newCipherWithCachedPathContext(ctx, runtime, videoID, httpClient, cachedPath, baseURL, true)
+}
+
+func fetchPlayerJSWatchFirstCipherContext(ctx context.Context, runtime *Runtime, videoID string, httpClient *http.Client, baseURL string, cacheManager *CacheManager) (*Cipher, string, error) {
+	_ = cacheManager
+	return newCipherWithCachedPathContext(ctx, runtime, videoID, httpClient, "", baseURL, false)
+}
+
+func newCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, videoID string, httpClient *http.Client, cachedPath string, baseURL string, embedFirst bool) (*Cipher, string, error) {
 	var playerPath string
 	var playerJS []byte
 	var err error
@@ -174,7 +185,6 @@ func NewCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 		playerBaseURL = strings.TrimRight(baseURL, "/")
 	}
 
-	// Determine engine type for pre-spawning
 	engineType := runtime.GetEngineType()
 	var engineName string
 	switch engineType {
@@ -185,20 +195,16 @@ func NewCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 	case EngineQuickJS:
 		engineName = ""
 	case EngineAuto:
-		// Auto mode: try bun first
 		engineName = "bun"
 	}
 
-	// Pre-spawn JS process in parallel with player.js download (saves ~100-150ms)
-	// This overlaps process startup with network I/O
 	if engineName != "" {
 		go func() {
 			_ = runtime.PreSpawnJSProcess(context.Background(), engineName, nil, "")
 		}()
 	}
 
-	// Try cached path first (skip embed page fetch)
-	// Use playerBaseURL to benefit from connection reuse
+	t0 := time.Now()
 	if cachedPath != "" {
 		playerURL := playerBaseURL + cachedPath
 		playerJS, err = httpGetBytesContext(ctx, httpClient, playerURL)
@@ -207,62 +213,108 @@ func NewCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 		} else {
 			warnings = append(warnings, fmt.Sprintf("cached player path %s failed, falling back to discovery: %v", cachedPath, err))
 		}
-		// If cached path fails, fall through to embed page fetch
 	}
 
 	if playerPath == "" {
-		playerPath, playerJS, err = fetchPlayerJSContext(ctx, videoID, httpClient, playerBaseURL)
+		if embedFirst {
+			playerPath, playerJS, err = fetchPlayerJSContext(ctx, videoID, httpClient, playerBaseURL)
+		} else {
+			playerPath, playerJS, err = fetchPlayerJSWatchFirstContext(ctx, videoID, httpClient, playerBaseURL)
+		}
 		if err != nil {
 			return nil, "", err
 		}
 	}
+	tFetch := time.Since(t0).Milliseconds()
 
-	sigName, sigParam, err := findSigFunctionName(playerJS)
-	sigUsesURLWrapper := false
-	if err != nil {
+	t2 := time.Now()
+	detail := &CipherAnalyzeDetail{
+		PlayerJSBytes: len(playerJS),
+	}
+
+	// === THE DETECTION PIPELINE (FCIS Chain of Responsibility) ===
+	var result cipherDetectionResult
+	var ok bool
+
+	if result, ok = detectFastSignature(playerJS, detail); ok {
+		// Tier 1 Success
+	} else if result, ok = detectWrapperSignature(playerJS, detail); ok {
+		// Tier 2 Success
+	} else if result, ok = detectGlobalSignature(playerJS, detail); ok {
+		// Tier 3 Success
+	} else {
+		// Tier 4: Last resort - re-fetch player.js via alternate URL
 		if cachedPath != "" && playerPath == cachedPath {
-			playerPath, playerJS, err = fetchPlayerJSContext(ctx, videoID, httpClient, playerBaseURL)
+			if embedFirst {
+				playerPath, playerJS, err = fetchPlayerJSContext(ctx, videoID, httpClient, playerBaseURL)
+			} else {
+				playerPath, playerJS, err = fetchPlayerJSWatchFirstContext(ctx, videoID, httpClient, playerBaseURL)
+			}
 			if err != nil {
 				return nil, "", err
 			}
-			sigName, sigParam, err = findSigFunctionName(playerJS)
-		}
-	}
-	if err != nil {
-		if wrapperName := findURLTransformFunctionName(playerJS); wrapperName != "" {
-			sigName = wrapperName
-			sigParam = 0
-			sigUsesURLWrapper = true
-			err = nil
+			detail.PlayerJSBytes = len(playerJS)
+
+			// Retry global signature on the new player
+			tSigRetry := time.Now()
+			result.SigName, result.SigParam, err = findSigFunctionName(playerJS)
+			detail.SigMs += time.Since(tSigRetry).Milliseconds()
+			
+			if err == nil {
+				detail.SigName = result.SigName
+				detail.SigTier = "refetch"
+			} else {
+				// Try wrapper on re-fetched player
+				wrapperNames := findURLTransformFunctionNames(playerJS)
+				if len(wrapperNames) > 0 {
+					result.SigName = wrapperNames[0]
+					result.SigParam = 0
+					result.SigUsesURLWrapper = true
+					result.WrapperRuntimeJS = buildWrapperRuntimeJS(string(playerJS), result.SigName)
+					
+					detail.SigName = result.SigName
+					detail.SigTier = "refetch_wrapper"
+					err = nil
+				}
+			}
 		}
 	}
 
-	// Find n-function name (we don't need the body, playerJS is used directly)
-	nName := findNFunctionName(playerJS)
-	if sigName == "" && nName == "" {
+	// Stage 3: Universal N-Function application
+	result.NName = detectNFunction(playerJS, result.SigUsesURLWrapper, detail)
+
+	if result.SigName == "" && result.NName == "" {
 		if err != nil {
 			return nil, "", err
 		}
 		return nil, "", errors.New("failed to detect signature and n transform functions")
 	}
 
-	// Extract signatureTimestamp (STS) from player.js
+	// --- Stage 4: Signature timestamp ---
+	tSts := time.Now()
 	sts := findSignatureTimestamp(playerJS)
+	detail.StsMs = time.Since(tSts).Milliseconds()
+
 	fingerprint := computePlayerFingerprint(playerJS)
-	nRuntimeJS := buildNTransformRuntime(playerJS, nName)
+	nRuntimeJS := buildNTransformRuntime(playerJS, result.NName)
+	tAnalyze := time.Since(t2).Milliseconds()
 
 	return &Cipher{
 		runtime:            runtime,
-		sigFunctionName:    sigName,
-		sigParam:           sigParam,
-		sigUsesURLWrapper:  sigUsesURLWrapper,
-		nFunctionName:      nName,
+		sigFunctionName:    result.SigName,
+		sigParam:           result.SigParam,
+		sigUsesURLWrapper:  result.SigUsesURLWrapper,
+		nFunctionName:      result.NName,
 		signatureTimestamp: sts,
+		jsCode:             result.WrapperRuntimeJS,
 		nRuntimeJS:         nRuntimeJS,
 		playerURL:          playerPath,
 		playerFingerprint:  fingerprint,
 		playerJS:           playerJS,
 		warnings:           warnings,
+		PlayerJSFetchMs:    tFetch,
+		CipherAnalyzeMs:    tAnalyze,
+		AnalyzeDetail:      detail,
 	}, playerPath, nil
 }
 
@@ -292,23 +344,43 @@ func NewCipherFromCacheWithRuntime(runtime *Runtime, cache *CipherCache) *Cipher
 // ToCache converts a Cipher to a cacheable format
 func (c *Cipher) ToCache() *CipherCache {
 	now := time.Now()
+	sigFunction := c.sigFunctionName
+	sigParam := c.sigParam
+	sigUsesURLWrapper := c.sigUsesURLWrapper
+	isBytecode := c.isBytecode
+	jsCode := c.jsCode
+
 	return &CipherCache{
 		Version:            currentCacheVersion,
 		CreatedAt:          now,
 		ExpiresAt:          now.Add(cacheTTL),
 		PlayerURL:          c.playerURL,
 		PlayerFingerprint:  c.playerFingerprint,
-		SigFunction:        c.sigFunctionName,
-		SigParam:           c.sigParam,
-		SigUsesURLWrapper:  c.sigUsesURLWrapper,
-		IsBytecode:         c.isBytecode,
+		SigFunction:        sigFunction,
+		SigParam:           sigParam,
+		SigUsesURLWrapper:  sigUsesURLWrapper,
+		IsBytecode:         isBytecode,
 		NFunction:          c.nFunctionName,
 		SignatureTimestamp: c.signatureTimestamp,
-		JSCode:             c.jsCode,
+		JSCode:             jsCode,
 	}
 }
 
-// Prewarm spins up the QuickJS runtime aggressively ahead of time
+func (c *Cipher) canPrecomputeSignatureRuntime() bool {
+	return c.sigFunctionName != "" && !c.sigUsesURLWrapper
+}
+
+func (c *Cipher) canPersistSignatureRuntime() bool {
+	return c.sigFunctionName != "" && c.jsCode != ""
+}
+
+func (c *Cipher) canPrewarmSignatureRuntime() bool {
+	return c.jsCode != ""
+}
+
+// Prewarm spins up the QuickJS runtime aggressively ahead of time.
+// Must be called (and waited on) before first DecryptSignature call
+// to avoid paying the ~270ms bootstrap cost on the hot path.
 func (c *Cipher) Prewarm() error {
 	c.lazyMu.Lock()
 	defer c.lazyMu.Unlock()
@@ -345,6 +417,9 @@ func (c *Cipher) ensureSignatureReady() error {
 	if c.sigFunctionName == "" {
 		return errors.New("signature decryption function unavailable in current player JS")
 	}
+	if c.sigUsesURLWrapper {
+		return errors.New("url-wrapper signature fallback is runtime-only and cannot be precomputed")
+	}
 	if c.jsCode != "" {
 		return nil
 	}
@@ -359,23 +434,16 @@ func (c *Cipher) ensureSignatureReady() error {
 		return errors.New("no player.js available for signature decryption")
 	}
 
-	if c.sigUsesURLWrapper {
-		c.jsCode = buildWrapperRuntimeJS(string(c.playerJS), c.sigFunctionName)
-		if c.jsCode == "" {
-			c.jsCode = string(c.playerJS)
-		}
-	} else {
-		jsCode, err := extractWithAST(string(c.playerJS), c.sigFunctionName)
+	jsCode, err := extractWithAST(string(c.playerJS), c.sigFunctionName)
+	if err != nil {
+		jsCode, err = extractSimple(c.playerJS, c.sigFunctionName)
 		if err != nil {
-			jsCode, err = extractSimple(c.playerJS, c.sigFunctionName)
-			if err != nil {
-				return fmt.Errorf("failed to extract sig function: %w", err)
-			}
+			return fmt.Errorf("failed to extract sig function: %w", err)
 		}
-		c.jsCode = jsCode
 	}
+	c.jsCode = jsCode
 
-	// Fast Boot Optimization: Automatically compile to QuickJS Bytecode if plain script.
+	// Fast Boot Optimization: Automatically compile to QuickJS bytecode.
 	if !c.isBytecode && len(c.jsCode) > 0 {
 		rt := quickjs.NewRuntime()
 		ctx := rt.NewContext()
@@ -627,47 +695,150 @@ func emitCodeFromIndex(segIDs []int, idx *definitionIndex, jsCode string) string
 }
 
 func buildWrapperRuntimeJS(jsCode, functionName string) string {
-	if jsCode == "" || functionName == "" {
-		return ""
+	if result := buildWrapperRuntimeJSWindowed(jsCode, functionName); result != "" {
+		return result
 	}
+	return buildWrapperRuntimeJSGlobal(jsCode, functionName)
+}
 
+type wrapperReplacement struct {
+	pattern *regexp.Regexp
+	replace string
+	arrow   bool
+}
+
+func buildWrapperReplacements(functionName string) []wrapperReplacement {
 	quotedName := regexp.QuoteMeta(functionName)
-	replacements := []struct {
-		pattern *regexp.Regexp
-		replace string
-	}{
+	return []wrapperReplacement{
 		{
 			pattern: regexp.MustCompile(`\bvar\s+` + quotedName + `\s*=\s*function\s*\(`),
 			replace: `var ` + functionName + `=globalThis["` + functionName + `"]=function(`,
+		},
+		{
+			pattern: regexp.MustCompile(`\bvar\s+` + quotedName + `\s*=\s*`),
+			replace: `var ` + functionName + `=globalThis["` + functionName + `"]=` + functionName + `=`,
+			arrow:   true,
 		},
 		{
 			pattern: regexp.MustCompile(`\blet\s+` + quotedName + `\s*=\s*function\s*\(`),
 			replace: `let ` + functionName + `=globalThis["` + functionName + `"]=function(`,
 		},
 		{
+			pattern: regexp.MustCompile(`\blet\s+` + quotedName + `\s*=\s*`),
+			replace: `let ` + functionName + `=globalThis["` + functionName + `"]=` + functionName + `=`,
+			arrow:   true,
+		},
+		{
 			pattern: regexp.MustCompile(`\bconst\s+` + quotedName + `\s*=\s*function\s*\(`),
 			replace: `const ` + functionName + `=globalThis["` + functionName + `"]=function(`,
+		},
+		{
+			pattern: regexp.MustCompile(`\bconst\s+` + quotedName + `\s*=\s*`),
+			replace: `const ` + functionName + `=globalThis["` + functionName + `"]=` + functionName + `=`,
+			arrow:   true,
 		},
 		{
 			pattern: regexp.MustCompile(`\b` + quotedName + `\s*=\s*function\s*\(`),
 			replace: `globalThis["` + functionName + `"]=` + functionName + `=function(`,
 		},
 		{
+			pattern: regexp.MustCompile(`\b` + quotedName + `\s*=\s*`),
+			replace: `globalThis["` + functionName + `"]=` + functionName + `=`,
+			arrow:   true,
+		},
+		{
 			pattern: regexp.MustCompile(`function\s+` + quotedName + `\s*\(`),
 			replace: `globalThis["` + functionName + `"]=function ` + functionName + `(`,
 		},
 	}
+}
 
-	for _, candidate := range replacements {
-		loc := candidate.pattern.FindStringIndex(jsCode)
-		if loc == nil {
-			continue
+// buildWrapperRuntimeJSWindowed uses string index to find function name occurrences,
+// then applies regex on small windows around each occurrence.
+func buildWrapperRuntimeJSWindowed(jsCode, functionName string) string {
+	if jsCode == "" || functionName == "" {
+		return ""
+	}
+	replacements := buildWrapperReplacements(functionName)
+
+	var indices []int
+	offset := 0
+	for {
+		idx := strings.Index(jsCode[offset:], functionName)
+		if idx == -1 {
+			break
 		}
-		return jsCode[:loc[0]] + candidate.replace + jsCode[loc[1]:]
+		absIdx := offset + idx
+		indices = append(indices, absIdx)
+		offset = absIdx + len(functionName)
+	}
+
+	for _, absIdx := range indices {
+		start := absIdx - 30
+		if start < 0 {
+			start = 0
+		}
+		end := absIdx + len(functionName) + 30
+		if end > len(jsCode) {
+			end = len(jsCode)
+		}
+		chunk := jsCode[start:end]
+
+		for _, candidate := range replacements {
+			matches := candidate.pattern.FindAllStringIndex(chunk, -1)
+			for _, loc := range matches {
+				absLoc0 := start + loc[0]
+				absLoc1 := start + loc[1]
+
+				if !hasSafeJSIdentifierBoundary(jsCode, absLoc0, absLoc1) {
+					continue
+				}
+				if candidate.arrow && !strings.HasPrefix(strings.TrimSpace(jsCode[absLoc1:]), "(") {
+					continue
+				}
+				return jsCode[:absLoc0] + candidate.replace + jsCode[absLoc1:]
+			}
+		}
 	}
 
 	return ""
 }
+
+// buildWrapperRuntimeJSGlobal runs regex patterns on the entire file (slow but correct fallback).
+func buildWrapperRuntimeJSGlobal(jsCode, functionName string) string {
+	if jsCode == "" || functionName == "" {
+		return ""
+	}
+	replacements := buildWrapperReplacements(functionName)
+
+	for _, candidate := range replacements {
+		matches := candidate.pattern.FindAllStringIndex(jsCode, -1)
+		for _, loc := range matches {
+			if !hasSafeJSIdentifierBoundary(jsCode, loc[0], loc[1]) {
+				continue
+			}
+			if candidate.arrow && !strings.HasPrefix(strings.TrimSpace(jsCode[loc[1]:]), "(") {
+				continue
+			}
+			return jsCode[:loc[0]] + candidate.replace + jsCode[loc[1]:]
+		}
+	}
+
+	return ""
+}
+
+func hasSafeJSIdentifierBoundary(s string, start, end int) bool {
+	if start > 0 && isJSIdentifierByte(s[start-1]) {
+		return false
+	}
+	return true
+}
+
+func isJSIdentifierByte(b byte) bool {
+	return b == '$' || b == '_' || ('0' <= b && b <= '9') || ('A' <= b && b <= 'Z') || ('a' <= b && b <= 'z')
+}
+
+
 
 // extractWithAST uses goja parser to extract a function and its dependencies.
 func extractWithAST(jsCode string, funcName string) (string, error) {
@@ -1081,24 +1252,51 @@ this.crypto = {
 `
 
 func (c *Cipher) DecryptSignature(sig string) (string, error) {
-	if err := c.ensureSignatureReady(); err != nil {
-		return "", err
-	}
-
 	if c.sigUsesURLWrapper {
-		codes := c.wrapperCodeCandidates()
-		var lastErr error
-		for _, wrapperCode := range codes {
-			decrypted, err := c.transformWithURLWrapper(wrapperCode, c.sigFunctionName, sig, "s")
-			if err == nil {
+		if c.sigFunctionName != "" && c.jsCode != "" {
+			if decrypted, err := c.transformWithURLWrapper(c.jsCode, c.sigFunctionName, sig, "s"); err == nil {
 				return decrypted, nil
 			}
-			lastErr = err
+		}
+
+		codes := c.wrapperCodeCandidates()
+		wrapperNames := c.wrapperFunctionCandidates()
+		var lastErr error
+		for _, wrapperName := range wrapperNames {
+			for _, wrapperCode := range codes {
+				decrypted, err := c.transformWithURLWrapper(wrapperCode, wrapperName, sig, "s")
+				if err == nil {
+					preferredCode := wrapperCode
+					if len(c.playerJS) > 0 {
+						fullPlayerJS := string(c.playerJS)
+						if wrapperCode == fullPlayerJS {
+							if built := buildWrapperRuntimeJS(fullPlayerJS, wrapperName); built != "" {
+								preferredCode = built
+							} else if extracted, extractErr := extractWithAST(fullPlayerJS, wrapperName); extractErr == nil && extracted != "" {
+								preferredCode = extracted
+							}
+						}
+					}
+
+					c.lazyMu.Lock()
+					c.sigFunctionName = wrapperName
+					c.sigParam = 0
+					c.jsCode = preferredCode
+					c.isBytecode = false
+					c.lazyMu.Unlock()
+					return decrypted, nil
+				}
+				lastErr = err
+			}
 		}
 		if lastErr != nil {
 			return "", lastErr
 		}
 		return "", errors.New("url wrapper function unavailable in current player JS")
+	}
+
+	if err := c.ensureSignatureReady(); err != nil {
+		return "", err
 	}
 
 	// Try pre-warmed context first or create one if not pre-warmed
@@ -1118,20 +1316,24 @@ func (c *Cipher) DecryptSignature(sig string) (string, error) {
 		callCode = fmt.Sprintf("%s('%s')", c.sigFunctionName, escapeJSString(sig))
 	}
 
+	c.lazyMu.Lock()
 	result := ctx.Eval(callCode, quickjs.EvalFlagGlobal(true))
 	if ctx.HasException() {
 		exc := ctx.Exception()
 		result.Free()
+		c.lazyMu.Unlock()
 		return "", fmt.Errorf("failed to call %s: %v", c.sigFunctionName, exc)
 	}
 
 	if result.IsUndefined() || result.IsNull() {
 		result.Free()
+		c.lazyMu.Unlock()
 		return "", errors.New("sig function returned null/undefined")
 	}
 
 	resultStr := result.String()
 	result.Free()
+	c.lazyMu.Unlock()
 	return resultStr, nil
 }
 
@@ -1155,6 +1357,12 @@ func (c *Cipher) TransformN(n string) (string, error) {
 func (c *Cipher) TransformNContext(ctx context.Context, n string) (string, error) {
 	if c.nFunctionName == "" {
 		if c.sigUsesURLWrapper {
+			if c.sigFunctionName != "" && c.jsCode != "" {
+				if transformed, wrapperErr := c.transformWithURLWrapper(c.jsCode, c.sigFunctionName, n, "n"); wrapperErr == nil && transformed != "" && transformed != n {
+					return transformed, nil
+				}
+			}
+
 			var lastErr error
 			for _, wrapperCode := range c.wrapperCodeCandidates() {
 				transformed, wrapperErr := c.transformWithURLWrapper(wrapperCode, c.sigFunctionName, n, "n")
@@ -1233,7 +1441,7 @@ func (c *Cipher) TransformNBatchContext(ctx context.Context, nValues []string) (
 }
 
 func (c *Cipher) wrapperCodeCandidates() []string {
-	candidates := make([]string, 0, 2)
+	candidates := make([]string, 0, 8)
 	seen := map[string]struct{}{}
 	add := func(code string) {
 		if code == "" {
@@ -1248,10 +1456,43 @@ func (c *Cipher) wrapperCodeCandidates() []string {
 
 	add(c.jsCode)
 	if len(c.playerJS) > 0 {
-		add(string(c.playerJS))
+		playerJS := string(c.playerJS)
+		for _, name := range c.wrapperFunctionCandidates() {
+			if built := buildWrapperRuntimeJS(playerJS, name); built != "" {
+				add(built)
+			}
+			if extracted, err := extractWithAST(playerJS, name); err == nil {
+				add(extracted)
+			}
+		}
+		add(playerJS)
 	}
 
 	return candidates
+}
+
+func (c *Cipher) wrapperFunctionCandidates() []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 4)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || !isValidIdentifier(name) {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+
+	add(c.sigFunctionName)
+	if len(c.playerJS) > 0 {
+		for _, name := range findURLTransformFunctionNames(c.playerJS) {
+			add(name)
+		}
+	}
+	return out
 }
 
 // ensureWrapperContext bootstraps a QuickJS runtime with the given jsCode,
@@ -1275,8 +1516,12 @@ func (c *Cipher) ensureWrapperContext(jsCode string) (*quickjs.Context, error) {
 	c.wrapperReady = false
 
 	rt := quickjs.NewRuntime(
-		quickjs.WithMemoryLimit(256*1024*1024),
-		quickjs.WithMaxStackSize(8*1024*1024),
+		quickjs.WithMemoryLimit(256 * 1024 * 1024),
+		// Stack size 0 = disable check. Required because the runtime may be
+		// bootstrapped in one goroutine (prewarm) and used from another
+		// (DecryptSignature). QuickJS's JS_SetMaxStackSize compares the current
+		// C stack pointer against the initial thread's stack base, which produces
+		// false "stack overflow" when goroutines migrate between OS threads.
 	)
 	ctx := rt.NewContext()
 
@@ -1292,10 +1537,10 @@ func (c *Cipher) ensureWrapperContext(jsCode string) (*quickjs.Context, error) {
 
 	// Evaluate context payloads
 	var val *quickjs.Value
-	if c.isBytecode {
-		val = ctx.EvalBytecode([]byte(c.jsCode))
+	if c.isBytecode && jsCode == c.jsCode {
+		val = ctx.EvalBytecode([]byte(jsCode))
 	} else {
-		val = ctx.Eval(c.jsCode, quickjs.EvalFlagGlobal(true))
+		val = ctx.Eval(jsCode, quickjs.EvalFlagGlobal(true))
 	}
 
 	if ctx.HasException() {
@@ -1329,38 +1574,18 @@ if(typeof g.qJ!=='function'){
   if(typeof qJ==='function'){g.qJ=qJ;}
   else if(typeof globalThis.qJ==='function'){g.qJ=globalThis.qJ;}
 }
-var __fn=null;
-try{
-  if(typeof %s==='function'){
-    __fn=%s;
-  }
-}catch(e){}
-if(typeof globalThis['%s']==='function'){
-  __fn=globalThis['%s'];
-}else{
-  for(var __gk in globalThis){
-    try{
-      var __gv=globalThis[__gk];
-      if(__gv&&typeof __gv==='object'&&typeof __gv['%s']==='function'){
-        __fn=__gv['%s'];
-        break;
-      }
-    }catch(e){}
-  }
+var __fn=globalThis['%s'];
+if(typeof __fn!=='function'){
+  try{if(typeof %s==='function'){__fn=%s;}}catch(e){}
 }
 if(typeof __fn!=='function')throw new Error('wrapper function not found: %s');
-var __u=__fn('https://www.youtube.com/watch?v=ytx','s',encodeURIComponent('%s'));
+var __u;
+for(var __a=0;__a<3;__a++){try{__u=__fn('https://www.youtube.com/watch?v=ytx','s',encodeURIComponent('%s'));break;}catch(e){if(__a===2)throw e;}}
 if(!__u||typeof __u.get!=='function')return '';
-var __p=Object.getPrototypeOf(__u)||{};
-var __keys=Object.keys(__p).concat(Object.getOwnPropertyNames(__p));
-for(var __i=0;__i<__keys.length;__i++){
-  var __k=__keys[__i];
-  if(__k==='constructor'||__k==='set'||__k==='get'||__k==='clone')continue;
-  try{if(typeof __u[__k]==='function'){__u[__k]();break;}}catch(e){}
-}
+if(typeof __u.update==='function'){try{__u.update();}catch(e){}}
 var __s=__u.get('s');
 return __s?decodeURIComponent(__s):'';
-})()`, functionName, functionName, escapedName, escapedName, escapedName, escapedName, escapedName, escapedValue)
+})()`, escapedName, functionName, functionName, escapedName, escapedValue)
 	} else {
 		script = fmt.Sprintf(`(function(){
 if(typeof g==='undefined'){var g={};}
@@ -1368,39 +1593,19 @@ if(typeof g.qJ!=='function'){
   if(typeof qJ==='function'){g.qJ=qJ;}
   else if(typeof globalThis.qJ==='function'){g.qJ=globalThis.qJ;}
 }
-var __fn=null;
-try{
-  if(typeof %s==='function'){
-    __fn=%s;
-  }
-}catch(e){}
-if(typeof globalThis['%s']==='function'){
-  __fn=globalThis['%s'];
-}else{
-  for(var __gk in globalThis){
-    try{
-      var __gv=globalThis[__gk];
-      if(__gv&&typeof __gv==='object'&&typeof __gv['%s']==='function'){
-        __fn=__gv['%s'];
-        break;
-      }
-    }catch(e){}
-  }
+var __fn=globalThis['%s'];
+if(typeof __fn!=='function'){
+  try{if(typeof %s==='function'){__fn=%s;}}catch(e){}
 }
 if(typeof __fn!=='function')return '%s';
-var __u=__fn('https://www.youtube.com/watch?v=ytx','s',undefined);
+var __u;
+for(var __a=0;__a<3;__a++){try{__u=__fn('https://www.youtube.com/watch?v=ytx','s',undefined);break;}catch(e){if(__a===2)return '%s';}}
 if(!__u||typeof __u.set!=='function'||typeof __u.get!=='function')return '%s';
 __u.set('n','%s');
-var __p=Object.getPrototypeOf(__u)||{};
-var __keys=Object.keys(__p).concat(Object.getOwnPropertyNames(__p));
-for(var __i=0;__i<__keys.length;__i++){
-  var __k=__keys[__i];
-  if(__k==='constructor'||__k==='set'||__k==='get'||__k==='clone')continue;
-  try{if(typeof __u[__k]==='function'){__u[__k]();break;}}catch(e){}
-}
+if(typeof __u.update==='function'){try{__u.update();}catch(e){}}
 var __n=__u.get('n');
 return __n||'%s';
-})()`, functionName, functionName, escapedName, escapedName, escapedName, escapedName, escapedValue, escapedValue, escapedValue, escapedValue)
+})()`, escapedName, functionName, functionName, escapedValue, escapedValue, escapedValue, escapedValue, escapedValue)
 	}
 
 	c.lazyMu.Lock()
@@ -1440,51 +1645,56 @@ func (c *Cipher) TransformNBatch(nValues []string) ([]string, error) {
 	return c.TransformNBatchContext(context.Background(), nValues)
 }
 
-// findSigFunctionName finds the signature function name and optional param
+// findSigFunctionName finds the signature function name and optional param.
+// It tries all tiers: primary → windowed fallback → global fallback.
 func findSigFunctionName(js []byte) (string, int, error) {
-	for _, p := range sigFunctionPatterns {
-		m := p.regex.FindSubmatch(js)
-		if len(m) <= p.sigIdx {
-			continue
-		}
-
-		funcName := strings.TrimSpace(string(m[p.sigIdx]))
-		if !isValidIdentifier(funcName) {
-			continue
-		}
-
-		param := 0
-		if p.paramIdx > 0 && len(m) > p.paramIdx {
-			numStr := strings.TrimSpace(string(m[p.paramIdx]))
-			if isNumericStr(numStr) {
-				param, _ = strconv.Atoi(numStr)
-			}
-		}
-
-		return funcName, param, nil
+	name, param, err := findSigFunctionNameFast(js)
+	if err == nil {
+		return name, param, nil
 	}
+	return findSigFunctionNameGlobal(js)
+}
 
+// findSigFunctionNameFast tries primary decodeURIComponent detection and
+// windowed regex fallback only. Does NOT run expensive global regex scan.
+func findSigFunctionNameFast(js []byte) (string, int, error) {
+	// PRIMARY: original decodeURIComponent-based detection (proven in v1.1.1)
 	marker := []byte(",decodeURIComponent(")
 	idx := bytes.Index(js, marker)
+
+	var cachedWrappers []string
+	var wrappersFetched bool
+	isWrapper := func(name string) bool {
+		if !wrappersFetched {
+			cachedWrappers = findURLTransformFunctionNames(js)
+			wrappersFetched = true
+		}
+		for _, w := range cachedWrappers {
+			if w == name {
+				return true
+			}
+		}
+		return false
+	}
 
 	for idx != -1 {
 		start := idx - 60
 		if start < 0 {
 			start = 0
 		}
-		context := string(js[start:idx])
+		contextStr := string(js[start:idx])
 
-		eqIdx := strings.LastIndex(context, "=")
+		eqIdx := strings.LastIndex(contextStr, "=")
 		if eqIdx != -1 {
-			afterEq := context[eqIdx+1:]
+			afterEq := contextStr[eqIdx+1:]
 			parenIdx := strings.Index(afterEq, "(")
 			if parenIdx != -1 {
 				funcName := strings.TrimSpace(afterEq[:parenIdx])
 				numStr := strings.TrimSpace(afterEq[parenIdx+1:])
 
-				if isValidIdentifier(funcName) && isNumericStr(numStr) {
-					beforeEq := context[:eqIdx]
-					if strings.Contains(beforeEq, "&&(") {
+				if isValidIdentifier(funcName) && isNumericStr(numStr) && !isWrapper(funcName) {
+					beforeEq := contextStr[:eqIdx]
+					if strings.Contains(beforeEq, "&&(") || strings.Contains(beforeEq, "||(") {
 						param, _ := strconv.Atoi(numStr)
 						return funcName, param, nil
 					}
@@ -1499,60 +1709,321 @@ func findSigFunctionName(js []byte) (string, int, error) {
 		idx = idx + len(marker) + nextIdx
 	}
 
-	return "", 0, errors.New("could not find signature function name")
-}
+	// WINDOWED FALLBACK: broader regex patterns on small chunks
+	// Only use patterns with discriminating markers — skip those that would
+	// match thousands of times (e.g., "function(" has 9000+ hits in player.js).
+	for _, p := range sigFunctionPatterns {
+		var markers [][]byte
+		if strings.Contains(p.regex.String(), "split") {
+			markers = [][]byte{[]byte(`split("")`), []byte(`split('')`)}
+		} else if strings.Contains(p.regex.String(), "decodeURIComponent") {
+			markers = [][]byte{[]byte("decodeURIComponent(")}
+		} else if strings.Contains(p.regex.String(), "signature") {
+			markers = [][]byte{[]byte(`"signature"`), []byte(`'signature'`)}
+		} else if strings.Contains(p.regex.String(), ".sig||") {
+			markers = [][]byte{[]byte(".sig||")}
+		} else if strings.Contains(p.regex.String(), ".set(") {
+			markers = [][]byte{[]byte("encodeURIComponent(")}
+		} else {
+			// Patterns without a discriminating marker (e.g., generic function patterns)
+			// are too expensive for windowed scan. Let them fall through to global fallback.
+			continue
+		}
 
-func findURLTransformFunctionName(js []byte) string {
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
-		regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
-		regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
-		regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
-	}
-
-	invalidPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`\.call\(this\)`),
-		regexp.MustCompile(`\.policy\s*=`),
-	}
-
-	for _, p := range patterns {
-		matches := p.FindAllSubmatchIndex(js, -1)
-		for _, idx := range matches {
-			if len(idx) < 4 {
-				continue
-			}
-			fullMatch := js[idx[0]:idx[1]]
-			name := strings.TrimSpace(string(js[idx[2]:idx[3]]))
-
-			// Skip invalid constructor matches (like Xo)
-			invalid := false
-			for _, invalidP := range invalidPatterns {
-				if invalidP.Match(fullMatch) {
-					invalid = true
+		for _, marker := range markers {
+			offset := 0
+			for {
+				idx := bytes.Index(js[offset:], marker)
+				if idx == -1 {
 					break
 				}
-			}
-			if invalid {
-				continue
-			}
+				absIdx := offset + idx
+				offset = absIdx + len(marker)
 
-			if isValidIdentifier(name) {
-				return name
+				start := absIdx - 4000
+				if start < 0 {
+					start = 0
+				}
+				end := absIdx + 4000
+				if end > len(js) {
+					end = len(js)
+				}
+				chunk := js[start:end]
+
+				m := p.regex.FindSubmatch(chunk)
+				if len(m) <= p.sigIdx {
+					continue
+				}
+
+				funcName := strings.TrimSpace(string(m[p.sigIdx]))
+				if !isValidIdentifier(funcName) {
+					continue
+				}
+				if isWrapper(funcName) {
+					continue
+				}
+
+				param := 0
+				if p.paramIdx > 0 && len(m) > p.paramIdx {
+					numStr := strings.TrimSpace(string(m[p.paramIdx]))
+					if isNumericStr(numStr) {
+						param, _ = strconv.Atoi(numStr)
+					}
+				}
+
+				return funcName, param, nil
 			}
 		}
 	}
 
+	return "", 0, errors.New("could not find signature function name (fast)")
+}
+
+// findSigFunctionNameGlobal runs all regex patterns on the full player.js (slow but correct).
+func findSigFunctionNameGlobal(js []byte) (string, int, error) {
+	var cachedWrappers []string
+	var wrappersFetched bool
+	isWrapper := func(name string) bool {
+		if !wrappersFetched {
+			cachedWrappers = findURLTransformFunctionNames(js)
+			wrappersFetched = true
+		}
+		for _, w := range cachedWrappers {
+			if w == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, p := range sigFunctionPatterns {
+		m := p.regex.FindSubmatch(js)
+		if len(m) <= p.sigIdx {
+			continue
+		}
+		funcName := strings.TrimSpace(string(m[p.sigIdx]))
+		if !isValidIdentifier(funcName) {
+			continue
+		}
+		if isWrapper(funcName) {
+			continue
+		}
+		param := 0
+		if p.paramIdx > 0 && len(m) > p.paramIdx {
+			numStr := strings.TrimSpace(string(m[p.paramIdx]))
+			if isNumericStr(numStr) {
+				param, _ = strconv.Atoi(numStr)
+			}
+		}
+		return funcName, param, nil
+	}
+
+	return "", 0, errors.New("could not find signature function name")
+}
+
+func findURLTransformFunctionName(js []byte) string {
+	names := findURLTransformFunctionNames(js)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+var urlTransformPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
+	regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
+	regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
+	regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
+}
+
+var urlTransformInvalidPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\.call\(this\)`),
+	regexp.MustCompile(`\.policy\s*=`),
+}
+
+func findURLTransformFunctionNames(js []byte) []string {
+	if out := findURLTransformFunctionNamesWindowed(js); len(out) > 0 {
+		return out
+	}
+	// Fallback: markers not found or changed — full global scan (slower but correct)
+	return findURLTransformFunctionNamesGlobal(js)
+}
+
+// findURLTransformFunctionNamesWindowed uses marker-based windowing for fast extraction.
+func findURLTransformFunctionNamesWindowed(js []byte) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 4)
+
+	markers := [][]byte{[]byte(`set("alr"`), []byte(`set('alr'`)}
+
+	for _, marker := range markers {
+		offset := 0
+		for {
+			idx := bytes.Index(js[offset:], marker)
+			if idx == -1 {
+				break
+			}
+			absIdx := offset + idx
+			offset = absIdx + len(marker)
+
+			start := absIdx - 4000
+			if start < 0 {
+				start = 0
+			}
+			end := absIdx + 4000
+			if end > len(js) {
+				end = len(js)
+			}
+			chunk := js[start:end]
+
+			for _, p := range urlTransformPatterns {
+				matches := p.FindAllSubmatchIndex(chunk, -1)
+				for _, mIdx := range matches {
+					if len(mIdx) < 4 {
+						continue
+					}
+					fullMatch := chunk[mIdx[0]:mIdx[1]]
+					absStart := start + mIdx[0]
+					if absStart > 0 && isJSIdentifierByte(js[absStart-1]) {
+						continue
+					}
+					name := strings.TrimSpace(string(chunk[mIdx[2]:mIdx[3]]))
+
+					invalid := false
+					for _, invalidP := range urlTransformInvalidPatterns {
+						if invalidP.MatchString(string(fullMatch)) {
+							invalid = true
+							break
+						}
+					}
+					if invalid || name == "" || !isValidIdentifier(name) {
+						continue
+					}
+					if _, ok := seen[name]; !ok {
+						seen[name] = struct{}{}
+						out = append(out, name)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// findURLTransformFunctionNamesGlobal is the slow but robust global scan fallback.
+func findURLTransformFunctionNamesGlobal(js []byte) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 4)
+	for _, p := range urlTransformPatterns {
+		matches := p.FindAllSubmatchIndex(js, -1)
+		for _, mIdx := range matches {
+			if len(mIdx) < 4 {
+				continue
+			}
+			fullMatch := js[mIdx[0]:mIdx[1]]
+			if mIdx[0] > 0 && isJSIdentifierByte(js[mIdx[0]-1]) {
+				continue
+			}
+			name := strings.TrimSpace(string(js[mIdx[2]:mIdx[3]]))
+
+			invalid := false
+			for _, invalidP := range urlTransformInvalidPatterns {
+				if invalidP.MatchString(string(fullMatch)) {
+					invalid = true
+					break
+				}
+			}
+			if invalid || name == "" || !isValidIdentifier(name) {
+				continue
+			}
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+var nTransformIndexPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\.get\(["']n["']\)\)&&\(b=([a-zA-Z0-9$_]+)\[(\d+)\]`),
+	regexp.MustCompile(`([a-zA-Z0-9$_]+)\[(\d+)\]\(\s*[a-zA-Z0-9$_]+\.get\(["']n["']\)\s*\)`),
+	regexp.MustCompile(`\.get\(["']n["']\)[^\n]{0,120}?\b([a-zA-Z0-9$_]+)\[(\d+)\]`),
+}
+
+var nTransformDirectPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\bb\s*=\s*([a-zA-Z0-9$_]+)(?:\.call\([^,]+,\s*|\()\s*[a-zA-Z0-9$_]+\.get\(["']n["']\)`),
+	regexp.MustCompile(`\bb\s*=\s*([a-zA-Z0-9$_]+)\s*\(\s*[a-zA-Z0-9$_]+\.get\(["']n["']\)`),
+}
+
+var nTransformLegacyPattern = regexp.MustCompile(`(?:var|let|const)?\s*([a-zA-Z0-9$_]{2,})\s*=\s*\[([a-zA-Z0-9$_]{2,})\]`)
+
+func findNFunctionName(js []byte) string {
+	if name := findNFunctionNameWindowed(js); name != "" {
+		return name
+	}
+	// Fallback: markers not found or changed — full global scan (slower but correct)
+	return findNFunctionNameGlobal(js)
+}
+
+// findNFunctionNameWindowed uses marker-based windowing for fast extraction.
+func findNFunctionNameWindowed(js []byte) string {
+	markers := [][]byte{[]byte(`get("n")`), []byte(`get('n')`)}
+
+	for _, marker := range markers {
+		offset := 0
+		for {
+			idx := bytes.Index(js[offset:], marker)
+			if idx == -1 {
+				break
+			}
+			absIdx := offset + idx
+			offset = absIdx + len(marker)
+
+			start := absIdx - 4000
+			if start < 0 {
+				start = 0
+			}
+			end := absIdx + 4000
+			if end > len(js) {
+				end = len(js)
+			}
+			chunk := js[start:end]
+
+			for _, p := range nTransformIndexPatterns {
+				matches := p.FindAllSubmatch(chunk, -1)
+				for _, m := range matches {
+					if len(m) < 3 {
+						continue
+					}
+					arrName := string(m[1])
+					idx, err := strconv.Atoi(string(m[2]))
+					if err != nil {
+						continue
+					}
+					if fn := resolveArrayFunctionName(js, arrName, idx); fn != "" {
+						return fn
+					}
+				}
+			}
+
+			for _, p := range nTransformDirectPatterns {
+				m := p.FindSubmatch(chunk)
+				if len(m) >= 2 {
+					name := string(m[1])
+					if isValidIdentifier(name) {
+						return name
+					}
+				}
+			}
+		}
+	}
 	return ""
 }
 
-// findNFunctionName finds the n-parameter function name
-func findNFunctionName(js []byte) string {
-	indexPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`\.get\("n"\)\)&&\(b=([a-zA-Z0-9$_]+)\[(\d+)\]`),
-		regexp.MustCompile(`([a-zA-Z0-9$_]+)\[(\d+)\]\(\s*[a-zA-Z0-9$_]+\.get\("n"\)\s*\)`),
-	}
-
-	for _, p := range indexPatterns {
+// findNFunctionNameGlobal is the slow but robust global scan fallback.
+func findNFunctionNameGlobal(js []byte) string {
+	for _, p := range nTransformIndexPatterns {
 		matches := p.FindAllSubmatch(js, -1)
 		for _, m := range matches {
 			if len(m) < 3 {
@@ -1569,24 +2040,19 @@ func findNFunctionName(js []byte) string {
 		}
 	}
 
-	directPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`\bb\s*=\s*([a-zA-Z0-9$_]+)(?:\.call\([^,]+,\s*|\()\s*[a-zA-Z0-9$_]+\.get\("n"\)`),
-	}
-	for _, p := range directPatterns {
+	for _, p := range nTransformDirectPatterns {
 		m := p.FindSubmatch(js)
-		if len(m) < 2 {
-			continue
-		}
-		name := string(m[1])
-		if isValidIdentifier(name) {
-			return name
+		if len(m) >= 2 {
+			name := string(m[1])
+			if isValidIdentifier(name) {
+				return name
+			}
 		}
 	}
 
-	legacyPattern := regexp.MustCompile(`var\s+[a-zA-Z0-9$_]{2,}\s*=\s*\[([a-zA-Z0-9$_]{2,})\]`)
-	legacy := legacyPattern.FindSubmatch(js)
-	if len(legacy) >= 2 && isValidIdentifier(string(legacy[1])) {
-		return string(legacy[1])
+	legacy := nTransformLegacyPattern.FindSubmatch(js)
+	if len(legacy) >= 3 && isValidIdentifier(string(legacy[2])) {
+		return string(legacy[2])
 	}
 
 	return ""
@@ -1597,13 +2063,19 @@ func resolveArrayFunctionName(js []byte, arrName string, idx int) string {
 		return ""
 	}
 
-	arrayPattern := regexp.MustCompile(fmt.Sprintf(`(?:var|let|const)\s+%s\s*=\s*\[([^\]]+)\]`, regexp.QuoteMeta(arrName)))
+	arrayPattern := regexp.MustCompile(fmt.Sprintf(`(?:var|let|const)\s+%s\s*=\s*\[([^\]]+)\]|\b%s\s*=\s*\[([^\]]+)\]`, regexp.QuoteMeta(arrName), regexp.QuoteMeta(arrName)))
 	match := arrayPattern.FindSubmatch(js)
 	if len(match) < 2 {
 		return ""
 	}
 
-	elements := strings.Split(string(match[1]), ",")
+	arrayText := ""
+	if len(match) > 1 && len(match[1]) > 0 {
+		arrayText = string(match[1])
+	} else if len(match) > 2 {
+		arrayText = string(match[2])
+	}
+	elements := strings.Split(arrayText, ",")
 	if idx >= len(elements) {
 		return ""
 	}
@@ -1614,6 +2086,21 @@ func resolveArrayFunctionName(js []byte, arrName string, idx int) string {
 		return ""
 	}
 	return candidate
+}
+
+func isWrapperSignatureCandidate(js []byte, funcName string) bool {
+	if funcName == "" {
+		return false
+	}
+	// Instead of evaluating back-tracking regexes on every occurrence of the funcName,
+	// just look up the definite wrapper names and compare.
+	wrappers := findURLTransformFunctionNames(js)
+	for _, w := range wrappers {
+		if w == funcName {
+			return true
+		}
+	}
+	return false
 }
 
 // findSignatureTimestamp extracts the signatureTimestamp (STS) from player.js
@@ -1759,19 +2246,41 @@ func fetchPlayerJS(videoID string, httpClient *http.Client, playerBaseURL string
 	return fetchPlayerJSContext(context.Background(), videoID, httpClient, playerBaseURL)
 }
 
-func fetchPlayerJSContext(ctx context.Context, videoID string, httpClient *http.Client, playerBaseURL string) (string, []byte, error) {
+func playerPageURLs(videoID, playerBaseURL string, embedFirst bool) []string {
 	pageURLs := make([]string, 0, 4)
-	addPageURL := func(base string) {
+	addPageURL := func(base string, first string, second string) {
 		pageURLs = append(pageURLs,
-			fmt.Sprintf("%s/embed/%s?hl=en", base, videoID),
-			fmt.Sprintf("%s/watch?v=%s", base, videoID),
+			fmt.Sprintf(first, base, videoID),
+			fmt.Sprintf(second, base, videoID),
 		)
 	}
-	addPageURL(playerBaseURL)
-	if playerBaseURL != PlayerJSURLBase {
-		addPageURL(PlayerJSURLBase)
+
+	if embedFirst {
+		addPageURL(playerBaseURL, "%s/embed/%s?hl=en", "%s/watch?v=%s")
+		if playerBaseURL != PlayerJSURLBase {
+			addPageURL(PlayerJSURLBase, "%s/embed/%s?hl=en", "%s/watch?v=%s")
+		}
+		return pageURLs
 	}
 
+	addPageURL(playerBaseURL, "%s/watch?v=%s", "%s/embed/%s?hl=en")
+	if playerBaseURL != PlayerJSURLBase {
+		addPageURL(PlayerJSURLBase, "%s/watch?v=%s", "%s/embed/%s?hl=en")
+	}
+	return pageURLs
+}
+
+func fetchPlayerJSContext(ctx context.Context, videoID string, httpClient *http.Client, playerBaseURL string) (string, []byte, error) {
+	pageURLs := playerPageURLs(videoID, playerBaseURL, true)
+
+	return fetchPlayerJSFromPageURLsContext(ctx, httpClient, playerBaseURL, pageURLs)
+}
+
+func fetchPlayerJSWatchFirstContext(ctx context.Context, videoID string, httpClient *http.Client, playerBaseURL string) (string, []byte, error) {
+	return fetchPlayerJSFromPageURLsContext(ctx, httpClient, playerBaseURL, playerPageURLs(videoID, playerBaseURL, false))
+}
+
+func fetchPlayerJSFromPageURLsContext(ctx context.Context, httpClient *http.Client, playerBaseURL string, pageURLs []string) (string, []byte, error) {
 	var lastErr error
 	for _, pageURL := range pageURLs {
 		body, err := httpGetBytesContext(ctx, httpClient, pageURL)

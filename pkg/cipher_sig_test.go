@@ -29,10 +29,21 @@ func TestFindSigFunctionName(t *testing.T) {
 			wantParam: 0,
 		},
 		{
+			name:      "detects double-parenthesized self-reference decodeURIComponent pattern",
+			js:        `c&&((c)=Ab(decodeURIComponent(c)));`,
+			wantName:  "Ab",
+			wantParam: 0,
+		},
+		{
 			name:      "detects encodeURIComponent set pattern",
 			js:        `c&&d.set("sig",encodeURIComponent(Qq(a)))`,
 			wantName:  "Qq",
 			wantParam: 0,
+		},
+		{
+			name:    "rejects url wrapper candidate without direct signature match",
+			js:      `function LI(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;};x&&(x=LI(decodeURIComponent(x)))`,
+			wantErr: true,
 		},
 		{
 			name:    "returns error when no pattern matches",
@@ -144,6 +155,195 @@ var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;
 
 	if decrypted != "cba" {
 		t.Fatalf("unexpected decrypted signature: got %q want %q", decrypted, "cba")
+	}
+}
+
+func TestDecryptSignatureWrapperUsesArrowFunctionAssignment(t *testing.T) {
+	playerJS := `
+(function(){
+function URLObj(sig){this.map={s:sig};}
+URLObj.prototype.get=function(k){return this.map[k];};
+URLObj.prototype.set=function(k,v){this.map[k]=v;};
+URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+var kS = (url, mode, sig) => { var o = new URLObj(sig); o.set("alr", "yes"); return o; };
+})();
+`
+
+	cipher := &Cipher{
+		sigFunctionName:   "kS",
+		sigUsesURLWrapper: true,
+		jsCode:            buildWrapperRuntimeJS(playerJS, "kS"),
+		playerJS:          []byte(playerJS),
+	}
+
+	decrypted, err := cipher.DecryptSignature("abc")
+	if err != nil {
+		t.Fatalf("DecryptSignature returned error: %v", err)
+	}
+
+	if decrypted != "cba" {
+		t.Fatalf("unexpected decrypted signature: got %q want %q", decrypted, "cba")
+	}
+}
+
+func TestDecryptSignatureWrapperSkipsDollarPrefixedFalsePositive(t *testing.T) {
+	playerJS := `
+(function(){
+function URLObj(sig){this.map={s:sig};}
+URLObj.prototype.get=function(k){return this.map[k];};
+URLObj.prototype.set=function(k,v){this.map[k]=v;};
+URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+$LI=function(url,mode,sig){ return { bogus: sig }; };
+LI=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;};
+})();
+`
+
+	if got := findURLTransformFunctionName([]byte(playerJS)); got != "LI" {
+		t.Fatalf("unexpected wrapper name: got %q want %q", got, "LI")
+	}
+
+	cipher := &Cipher{
+		sigFunctionName:   "LI",
+		sigUsesURLWrapper: true,
+		jsCode:            buildWrapperRuntimeJS(playerJS, "LI"),
+		playerJS:          []byte(playerJS),
+	}
+
+	decrypted, err := cipher.DecryptSignature("abc")
+	if err != nil {
+		t.Fatalf("DecryptSignature returned error: %v", err)
+	}
+
+	if decrypted != "cba" {
+		t.Fatalf("unexpected decrypted signature: got %q want %q", decrypted, "cba")
+	}
+}
+
+func TestEnsureSignatureReadyRejectsWrapperPrecompute(t *testing.T) {
+	cipher := &Cipher{
+		sigFunctionName:   "LI",
+		sigUsesURLWrapper: true,
+		playerJS:          []byte(`function LI(url,mode,sig){return sig}`),
+	}
+
+	err := cipher.ensureSignatureReady()
+	if err == nil {
+		t.Fatal("expected ensureSignatureReady to reject wrapper precompute")
+	}
+	if !strings.Contains(err.Error(), "runtime-only") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cipher.jsCode != "" {
+		t.Fatalf("wrapper precompute should not set jsCode, got len=%d", len(cipher.jsCode))
+	}
+}
+
+func TestToCacheKeepsWrapperSignatureArtifactsWhenNFunctionExists(t *testing.T) {
+	cipher := &Cipher{
+		sigFunctionName:    "LI",
+		sigParam:           7,
+		sigUsesURLWrapper:  true,
+		isBytecode:         true,
+		nFunctionName:      "nFn",
+		signatureTimestamp: 12345,
+		jsCode:             "",
+		playerURL:          "/s/player/demo/base.js",
+		playerFingerprint:  "fp-demo",
+	}
+
+	cache := cipher.ToCache()
+
+	if cache.SigFunction != "LI" {
+		t.Fatalf("expected wrapper sig function to be preserved, got %q", cache.SigFunction)
+	}
+	if cache.SigParam != 7 {
+		t.Fatalf("expected wrapper sig param to be preserved, got %d", cache.SigParam)
+	}
+	if !cache.SigUsesURLWrapper {
+		t.Fatal("expected wrapper flag to be preserved in cache")
+	}
+	if !cache.IsBytecode {
+		t.Fatal("expected wrapper bytecode flag to be preserved in cache")
+	}
+	if cache.JSCode != "" {
+		t.Fatalf("expected empty wrapper jsCode to remain empty, got len=%d", len(cache.JSCode))
+	}
+
+	if cache.NFunction != "nFn" {
+		t.Fatalf("expected n function to be preserved, got %q", cache.NFunction)
+	}
+	if cache.SignatureTimestamp != 12345 {
+		t.Fatalf("expected signature timestamp to be preserved, got %d", cache.SignatureTimestamp)
+	}
+	if cache.PlayerURL != "/s/player/demo/base.js" {
+		t.Fatalf("expected player URL to be preserved, got %q", cache.PlayerURL)
+	}
+	if cache.PlayerFingerprint != "fp-demo" {
+		t.Fatalf("expected player fingerprint to be preserved, got %q", cache.PlayerFingerprint)
+	}
+}
+
+func TestToCacheKeepsWrapperArtifactsWithoutNFunction(t *testing.T) {
+	cipher := &Cipher{
+		sigFunctionName:    "LI",
+		sigParam:           7,
+		sigUsesURLWrapper:  true,
+		isBytecode:         true,
+		nFunctionName:      "",
+		signatureTimestamp: 12345,
+		jsCode:             "wrapper-runtime",
+		playerURL:          "/s/player/demo/base.js",
+		playerFingerprint:  "fp-demo",
+	}
+
+	cache := cipher.ToCache()
+
+	if cache.SigFunction != "LI" {
+		t.Fatalf("expected wrapper sig function to be preserved, got %q", cache.SigFunction)
+	}
+	if cache.SigParam != 7 {
+		t.Fatalf("expected wrapper sig param to be preserved, got %d", cache.SigParam)
+	}
+	if !cache.SigUsesURLWrapper {
+		t.Fatal("expected wrapper flag to be preserved")
+	}
+	if !cache.IsBytecode {
+		t.Fatal("expected bytecode flag to be preserved")
+	}
+	if cache.JSCode != "wrapper-runtime" {
+		t.Fatalf("expected wrapper runtime to be preserved, got %q", cache.JSCode)
+	}
+	if cache.NFunction != "" {
+		t.Fatalf("expected n function to remain empty, got %q", cache.NFunction)
+	}
+}
+
+func TestToCacheKeepsValidatedWrapperSignatureArtifacts(t *testing.T) {
+	cipher := &Cipher{
+		sigFunctionName:    "LI",
+		sigParam:           7,
+		sigUsesURLWrapper:  true,
+		isBytecode:         false,
+		nFunctionName:      "nFn",
+		signatureTimestamp: 12345,
+		jsCode:             "wrapper-runtime",
+		playerURL:          "/s/player/demo/base.js",
+		playerFingerprint:  "fp-demo",
+	}
+
+	cache := cipher.ToCache()
+
+	if cache.SigFunction != "LI" {
+		t.Fatalf("expected validated wrapper sig function to persist, got %q", cache.SigFunction)
+	}
+	if cache.SigParam != 7 {
+		t.Fatalf("expected validated wrapper sig param to persist, got %d", cache.SigParam)
+	}
+	if !cache.SigUsesURLWrapper {
+		t.Fatal("expected validated wrapper flag to persist in cache")
+	}
+	if cache.JSCode != "wrapper-runtime" {
+		t.Fatalf("expected validated wrapper jsCode to persist, got %q", cache.JSCode)
 	}
 }
 

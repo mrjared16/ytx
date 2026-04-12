@@ -42,6 +42,7 @@ Options:
     --max-height HEIGHT Maximum video height in pixels (e.g., 1080, 720, 480)
     --cookies PATH      Path to Netscape-format cookies.txt (optional, defaults to ~/.config/ytx/cookies.txt)
     --bulk IDS          Comma-separated video IDs for bulk extraction
+    --po                Enable explicit PO-mode extraction path (music mode only)
     --js-engine ENGINE  bun|node|auto (default: auto, tries Bun → Node)
     --profile           Output timing breakdown for each extraction stage
 
@@ -182,6 +183,7 @@ func handleMusicMode() {
 	var isBulk bool
 	var jsEngine string
 	var profile bool
+	var poMode bool
 
 	// Parse arguments
 	for i := 0; i < len(args); i++ {
@@ -204,6 +206,8 @@ func handleMusicMode() {
 			}
 		case "--profile":
 			profile = true
+		case "--po":
+			poMode = true
 		default:
 			if !strings.HasPrefix(args[i], "-") && len(videoIDs) == 0 {
 				videoIDs = []string{ytxpkg.ExtractVideoID(args[i])}
@@ -238,7 +242,12 @@ func handleMusicMode() {
 	}
 
 	// Create extractor
-	extractor, err := ytxpkg.NewExtractor(ytxpkg.ModeMusic, cookieFile)
+	var opts []ytxpkg.ExtractorOption
+	if poMode {
+		opts = append(opts, ytxpkg.WithPOMode(true))
+	}
+
+	extractor, err := ytxpkg.NewExtractor(ytxpkg.ModeMusic, cookieFile, opts...)
 	if err != nil {
 		printError("BAD_COOKIES", err.Error(), "")
 		os.Exit(1)
@@ -263,7 +272,11 @@ func handleMusicMode() {
 		result, err := extractor.Extract(videoID)
 		if err != nil {
 			errCode := categorizeError(err)
-			printError(errCode, err.Error(), "")
+			message := err.Error()
+			if ytxpkg.IsLikelyPORequiredError(err) && !poMode {
+				message += " (hint: try rerunning with --po)"
+			}
+			printError(errCode, message, "")
 			os.Exit(1)
 		}
 

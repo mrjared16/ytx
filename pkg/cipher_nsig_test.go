@@ -22,8 +22,13 @@ func TestFindNFunctionName(t *testing.T) {
 		},
 		{
 			name:     "falls back to direct call pattern",
-			js:       `if(q.get("n")){b=QnR(q.get("n"));}`,
+			js:       `if(q.get('n')){b=QnR(q.get('n'));}`,
 			wantName: "QnR",
+		},
+		{
+			name:     "resolves bare array assignment",
+			js:       `RDD=[A0x,AbC,Z9k];if((new g.qJ(R,!0)).get('n')&&(b=RDD[1](q.get('n'))||x))return b;`,
+			wantName: "AbC",
 		},
 		{
 			name:     "ignores unrelated Array fallback",

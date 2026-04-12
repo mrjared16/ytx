@@ -59,6 +59,11 @@ func main() {
 	ytxResult, ytxErr := getYtxResult(videoID)
 	if ytxErr != nil {
 		fmt.Printf("    ERROR: %v\n", ytxErr)
+		classification := ytx.ClassifyPOFailure(ytxErr)
+		fmt.Printf("    classification: %s\n", classification)
+		if ytx.IsLikelyPORequiredError(ytxErr) {
+			fmt.Println("    hint: likely PO-gated; retry with explicit --po")
+		}
 	} else {
 		fmt.Printf("    itag=%d, bitrate=%d\n", ytxResult.Itag, ytxResult.Bitrate)
 		ytxParams := parseURLParams(ytxResult.URL)
@@ -91,7 +96,12 @@ func main() {
 		fmt.Println("  Both fail - YouTube likely changed something fundamental")
 		fmt.Println("  Check yt-dlp commits for recent fixes")
 	} else if ytdlpErr == nil && ytxErr != nil {
-		fmt.Println("  yt-dlp works, ytx fails - check ytx implementation")
+		if ytx.IsLikelyPORequiredError(ytxErr) {
+			fmt.Println("  yt-dlp works, ytx likely hit PO gating")
+			fmt.Println("  Retry ytx with explicit --po")
+		} else {
+			fmt.Println("  yt-dlp works, ytx fails - check ytx implementation")
+		}
 	} else if ytdlpErr == nil && ytxResult != nil {
 		if ytxResult.Itag == 141 {
 			fmt.Println("  Both return itag 141 - extraction working")

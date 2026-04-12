@@ -56,7 +56,13 @@ func (e *Extractor) bulkExtractWithEmitterContext(ctx context.Context, videoIDs 
 func (e *Extractor) extractBulkResultContext(ctx context.Context, videoID string) BulkResult {
 	result, err := e.ExtractContext(ctx, videoID)
 	if err != nil {
-		return BulkResult{ID: videoID, Error: err.Error()}
+		errMsg := err.Error()
+		if !e.poMode {
+			if IsLikelyPORequiredError(err) {
+				errMsg += " (hint: try rerunning with --po)"
+			}
+		}
+		return BulkResult{ID: videoID, Error: errMsg}
 	}
 
 	return BulkResult{
