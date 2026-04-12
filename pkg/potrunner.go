@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	_ "embed"
@@ -28,10 +31,46 @@ type poMintResponse struct {
 	Error       string `json:"error,omitempty"`
 }
 
-func mintPOTokenWithBun(ctx context.Context, challenge *POTokenChallenge) (string, string, time.Duration, error) {
-	bunPath, err := exec.LookPath("bun")
+var poRuntimeProbe struct {
+	once sync.Once
+	bun  string
+	node string
+}
+
+func resolvePORuntimeBinary(engineType EngineType) (string, error) {
+	poRuntimeProbe.once.Do(func() {
+		poRuntimeProbe.bun, _ = exec.LookPath("bun")
+		poRuntimeProbe.node, _ = exec.LookPath("node")
+	})
+
+	switch engineType {
+	case EngineBun:
+		if poRuntimeProbe.bun == "" {
+			return "", fmt.Errorf("bun not found in PATH")
+		}
+		return poRuntimeProbe.bun, nil
+	case EngineNode:
+		if poRuntimeProbe.node == "" {
+			return "", fmt.Errorf("node not found in PATH")
+		}
+		return poRuntimeProbe.node, nil
+	case EngineAuto:
+		if poRuntimeProbe.bun != "" {
+			return poRuntimeProbe.bun, nil
+		}
+		if poRuntimeProbe.node != "" {
+			return poRuntimeProbe.node, nil
+		}
+		return "", fmt.Errorf("no supported PO runtime found (need bun or node)")
+	default:
+		return "", fmt.Errorf("unsupported JS engine for PO minting: %s", engineType)
+	}
+}
+
+func mintPOTokenWithEngine(ctx context.Context, engineType EngineType, challenge *POTokenChallenge) (string, string, time.Duration, error) {
+	runtimePath, err := resolvePORuntimeBinary(engineType)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("bun not found in PATH")
+		return "", "", 0, err
 	}
 
 	tmpPath := filepath.Join(os.TempDir(), "ytx-po-minter.mjs")
@@ -45,7 +84,7 @@ func mintPOTokenWithBun(ctx context.Context, challenge *POTokenChallenge) (strin
 		return "", "", 0, fmt.Errorf("failed to write po minter script: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, bunPath, tmpPath)
+	cmd := exec.CommandContext(ctx, runtimePath, tmpPath)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return "", "", 0, err
@@ -54,7 +93,11 @@ func mintPOTokenWithBun(ctx context.Context, challenge *POTokenChallenge) (strin
 	if err != nil {
 		return "", "", 0, err
 	}
-	cmd.Stderr = os.Stderr
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", "", 0, err
+	}
+
 	if err := cmd.Start(); err != nil {
 		return "", "", 0, err
 	}
@@ -71,7 +114,11 @@ func mintPOTokenWithBun(ctx context.Context, challenge *POTokenChallenge) (strin
 		_ = cmd.Wait()
 		return "", "", 0, err
 	}
+	stderrBytes, _ := io.ReadAll(stderr)
 	if err := cmd.Wait(); err != nil {
+		if len(stderrBytes) > 0 {
+			return "", "", 0, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(stderrBytes)))
+		}
 		return "", "", 0, err
 	}
 	if resp.Error != "" {

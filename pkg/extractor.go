@@ -1490,7 +1490,7 @@ func (e *Extractor) requestPOTokenChallengeViaAttGetContext(ctx context.Context,
 }
 
 func (e *Extractor) mintPOTokenContext(ctx context.Context, challenge *POTokenChallenge) (string, string, time.Duration, error) {
-	playerToken, urlToken, ttl, err := mintPOTokenWithBun(ctx, challenge)
+	playerToken, urlToken, ttl, err := mintPOTokenWithEngine(ctx, e.runtime.GetEngineType(), challenge)
 	if err != nil {
 		return "", "", 0, NewPOError(POFailureRuntimeMint, "failed to mint po token", err)
 	}

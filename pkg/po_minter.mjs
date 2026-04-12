@@ -1,7 +1,7 @@
 import { BG, buildURL, GOOG_API_KEY, USER_AGENT } from 'bgutils-js';
 import { JSDOM } from 'jsdom';
 
-const input = await Bun.stdin.text();
+const input = await new Response(process.stdin).text();
 let req;
 try {
   req = JSON.parse(input);
