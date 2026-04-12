@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-03-28T20:38:18+07:00",
+  "generated_at": "2026-04-11T17:40:11+07:00",
   "version": 3,
   "results": [
     {
@@ -11,13 +11,13 @@
       "quality_label": "1920x1080",
       "http_status": 200,
       "timings": {
-        "total_extract": "623.822486ms",
-        "url_validation": "855.619395ms",
-        "visitor_data_ms": 403,
-        "player_api_ms": 220,
-        "total_ms": 623
+        "total_extract": "319.176372ms",
+        "url_validation": "40.895968ms",
+        "visitor_data_ms": 186,
+        "player_api_ms": 132,
+        "total_ms": 319
       },
-      "total_duration": "1.479447898s"
+      "total_duration": "360.085654ms"
     },
     {
       "mode": "video",
@@ -28,12 +28,12 @@
       "quality_label": "1920x1080",
       "http_status": 200,
       "timings": {
-        "total_extract": "285.467477ms",
-        "url_validation": "1.604714732s",
-        "player_api_ms": 285,
-        "total_ms": 285
+        "total_extract": "192.610424ms",
+        "url_validation": "7.041306ms",
+        "player_api_ms": 192,
+        "total_ms": 192
       },
-      "total_duration": "1.890188429s"
+      "total_duration": "199.659513ms"
     },
     {
       "mode": "music",
@@ -45,14 +45,14 @@
       "http_status": 200,
       "n_transformed": true,
       "timings": {
-        "total_extract": "3.011123272s",
-        "url_validation": "469.758152ms",
-        "visitor_data_ms": 695,
-        "player_api_ms": 245,
-        "n_transform_ms": 40,
-        "total_ms": 3011
+        "total_extract": "1.345452148s",
+        "url_validation": "8.604277ms",
+        "visitor_data_ms": 512,
+        "player_api_ms": 178,
+        "cipher_init_ms": 402,
+        "total_ms": 1345
       },
-      "total_duration": "3.480944746s"
+      "total_duration": "1.354103794s"
     },
     {
       "mode": "music",
@@ -64,13 +64,13 @@
       "http_status": 200,
       "n_transformed": true,
       "timings": {
-        "total_extract": "262.584874ms",
-        "url_validation": "454.056478ms",
-        "player_api_ms": 187,
+        "total_extract": "263.232303ms",
+        "url_validation": "7.162959ms",
+        "player_api_ms": 261,
         "n_transform_ms": 1,
-        "total_ms": 262
+        "total_ms": 263
       },
-      "total_duration": "716.703519ms"
+      "total_duration": "270.445849ms"
     }
   ]
 }
