@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	gruntime "runtime"
+	rdebug "runtime/debug"
 	"sort"
 	"strconv"
 
@@ -145,7 +147,7 @@ var sigFunctionPatterns = []sigFunctionPattern{
 		paramIdx: 0,
 	},
 	{
-		regex:    regexp.MustCompile(`\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*([a-zA-Z0-9$]+)\(`),
+		regex:    regexp.MustCompile(`\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*(?:encodeURIComponent\s*\(\s*)?([a-zA-Z0-9$]+)\(`),
 		sigIdx:   1,
 		paramIdx: 0,
 	},
@@ -259,7 +261,7 @@ func newCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 			tSigRetry := time.Now()
 			result.SigName, result.SigParam, err = findSigFunctionName(playerJS)
 			detail.SigMs += time.Since(tSigRetry).Milliseconds()
-			
+
 			if err == nil {
 				detail.SigName = result.SigName
 				detail.SigTier = "refetch"
@@ -271,7 +273,7 @@ func newCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 					result.SigParam = 0
 					result.SigUsesURLWrapper = true
 					result.WrapperRuntimeJS = buildWrapperRuntimeJS(string(playerJS), result.SigName)
-					
+
 					detail.SigName = result.SigName
 					detail.SigTier = "refetch_wrapper"
 					err = nil
@@ -299,7 +301,7 @@ func newCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 	nRuntimeJS := buildNTransformRuntime(playerJS, result.NName)
 	tAnalyze := time.Since(t2).Milliseconds()
 
-	return &Cipher{
+	cipher := &Cipher{
 		runtime:            runtime,
 		sigFunctionName:    result.SigName,
 		sigParam:           result.SigParam,
@@ -315,7 +317,30 @@ func newCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 		PlayerJSFetchMs:    tFetch,
 		CipherAnalyzeMs:    tAnalyze,
 		AnalyzeDetail:      detail,
-	}, playerPath, nil
+	}
+
+	// Surface detection degradation as a visible warning so operators
+	// notice marker drift before extraction actually breaks.
+	if detail.SigTier == "global_fallback" || detail.NFuncTier == "global_fallback" {
+		cipher.warnings = append(cipher.warnings, fmt.Sprintf(
+			"cipher detection degraded (sig=%s nfunc=%s markers_missed=%v) — consider updating patterns",
+			detail.SigTier, detail.NFuncTier, detail.MarkerMiss))
+	}
+
+	// Pre-compile wrapper runtime to bytecode for reliable cold-start eval.
+	// Text eval of the full ~1.67MB wrapper runtime in a 256MB-limited QuickJS
+	// context intermittently exceeds the memory limit. The AST representation adds
+	// ~15-20MB on top of the text + bytecode + runtime objects, tipping over the
+	// limit. Bytecode eval (EvalBytecode) skips AST construction entirely, staying
+	// well within limits and also reducing Prewarm from ~1375ms to ~320ms.
+	if cipher.sigUsesURLWrapper && cipher.jsCode != "" {
+		if bytecode, err := compileToQuickJSBytecode(cipher.jsCode); err == nil {
+			cipher.jsCode = string(bytecode)
+			cipher.isBytecode = true
+		}
+	}
+
+	return cipher, playerPath, nil
 }
 
 // NewCipherFromCache reconstructs a Cipher from cached data
@@ -349,6 +374,9 @@ func (c *Cipher) ToCache() *CipherCache {
 	sigUsesURLWrapper := c.sigUsesURLWrapper
 	isBytecode := c.isBytecode
 	jsCode := c.jsCode
+	if sigUsesURLWrapper {
+		jsCode = ""
+	}
 
 	return &CipherCache{
 		Version:            currentCacheVersion,
@@ -371,7 +399,96 @@ func (c *Cipher) canPrecomputeSignatureRuntime() bool {
 }
 
 func (c *Cipher) canPersistSignatureRuntime() bool {
-	return c.sigFunctionName != "" && c.jsCode != ""
+	if c.sigFunctionName == "" {
+		return false
+	}
+	if c.sigUsesURLWrapper {
+		return len(c.playerJS) > 0
+	}
+	return c.jsCode != ""
+}
+
+const wrapperBytecodeBuildVersion = "wrapper-bytecode-v2"
+const quickJSModulePath = "github.com/buke/quickjs-go/v0"
+
+func quickJSBytecodeABIComponent() string {
+	buildInfo, ok := rdebug.ReadBuildInfo()
+	if !ok || buildInfo == nil {
+		return quickJSModulePath + "@unknown"
+	}
+
+	for _, dep := range buildInfo.Deps {
+		if dep.Path != quickJSModulePath {
+			continue
+		}
+
+		version := dep.Version
+		if dep.Replace != nil {
+			if dep.Replace.Version != "" {
+				version = dep.Replace.Version
+			} else if dep.Replace.Path != "" {
+				version = "replace:" + dep.Replace.Path
+			}
+		}
+		if version == "" {
+			version = "unknown"
+		}
+
+		sum := dep.Sum
+		if sum == "" {
+			sum = "nosum"
+		}
+
+		return dep.Path + "@" + version + "+" + sum
+	}
+
+	return quickJSModulePath + "@unknown"
+}
+
+func currentWrapperBytecodeBuildID() string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(wrapperBytecodeBuildVersion))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(quickJSBytecodeABIComponent()))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(gruntime.GOOS))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(gruntime.GOARCH))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(browserStubsJS))
+	return fmt.Sprintf("%s-%016x", wrapperBytecodeBuildVersion, h.Sum64())
+}
+
+func compileToQuickJSBytecode(jsCode string) ([]byte, error) {
+	if jsCode == "" {
+		return nil, errors.New("empty js code")
+	}
+	rt := quickjs.NewRuntime()
+	defer rt.Close()
+	ctx := rt.NewContext()
+	defer ctx.Close()
+	return ctx.Compile(jsCode, quickjs.EvalFlagGlobal(true))
+}
+
+func (c *Cipher) wrapperRuntimeBytecode() ([]byte, error) {
+	if !c.sigUsesURLWrapper {
+		return nil, errors.New("wrapper runtime bytecode requested for non-wrapper cipher")
+	}
+	if c.isBytecode && c.jsCode != "" {
+		return []byte(c.jsCode), nil
+	}
+	runtimeJS := c.jsCode
+	if runtimeJS == "" {
+		if len(c.playerJS) == 0 {
+			return nil, errors.New("no player.js available for wrapper runtime")
+		}
+		built, err := buildURLWrapperCode(string(c.playerJS), c.sigFunctionName)
+		if err != nil {
+			return nil, err
+		}
+		runtimeJS = built
+	}
+	return compileToQuickJSBytecode(runtimeJS)
 }
 
 func (c *Cipher) canPrewarmSignatureRuntime() bool {
@@ -445,14 +562,10 @@ func (c *Cipher) ensureSignatureReady() error {
 
 	// Fast Boot Optimization: Automatically compile to QuickJS bytecode.
 	if !c.isBytecode && len(c.jsCode) > 0 {
-		rt := quickjs.NewRuntime()
-		ctx := rt.NewContext()
-		if bytecode, err := ctx.Compile(c.jsCode, quickjs.EvalFlagGlobal(true)); err == nil {
+		if bytecode, err := compileToQuickJSBytecode(c.jsCode); err == nil {
 			c.jsCode = string(bytecode)
 			c.isBytecode = true
 		}
-		ctx.Close()
-		rt.Close()
 	}
 
 	return nil
@@ -694,22 +807,21 @@ func emitCodeFromIndex(segIDs []int, idx *definitionIndex, jsCode string) string
 	return buf.String()
 }
 
-func buildWrapperRuntimeJS(jsCode, functionName string) string {
-	if result := buildWrapperRuntimeJSWindowed(jsCode, functionName); result != "" {
-		return result
-	}
-	return buildWrapperRuntimeJSGlobal(jsCode, functionName)
-}
-
 type wrapperReplacement struct {
 	pattern *regexp.Regexp
 	replace string
 	arrow   bool
 }
 
+var wrapperReplacementsPatternCache sync.Map
+
 func buildWrapperReplacements(functionName string) []wrapperReplacement {
+	if cached, ok := wrapperReplacementsPatternCache.Load(functionName); ok {
+		return cached.([]wrapperReplacement)
+	}
+
 	quotedName := regexp.QuoteMeta(functionName)
-	return []wrapperReplacement{
+	replacements := []wrapperReplacement{
 		{
 			pattern: regexp.MustCompile(`\bvar\s+` + quotedName + `\s*=\s*function\s*\(`),
 			replace: `var ` + functionName + `=globalThis["` + functionName + `"]=function(`,
@@ -738,98 +850,65 @@ func buildWrapperReplacements(functionName string) []wrapperReplacement {
 			arrow:   true,
 		},
 		{
-			pattern: regexp.MustCompile(`\b` + quotedName + `\s*=\s*function\s*\(`),
+			pattern: regexp.MustCompile(quotedName + `\s*=\s*function\s*\(`),
 			replace: `globalThis["` + functionName + `"]=` + functionName + `=function(`,
-		},
-		{
-			pattern: regexp.MustCompile(`\b` + quotedName + `\s*=\s*`),
-			replace: `globalThis["` + functionName + `"]=` + functionName + `=`,
-			arrow:   true,
 		},
 		{
 			pattern: regexp.MustCompile(`function\s+` + quotedName + `\s*\(`),
 			replace: `globalThis["` + functionName + `"]=function ` + functionName + `(`,
 		},
+		{
+			pattern: regexp.MustCompile(quotedName + `\s*=\s*\(`),
+			replace: "globalThis[\"" + functionName + "\"]=" + functionName + "=(",
+			arrow:   true,
+		},
 	}
+	wrapperReplacementsPatternCache.Store(functionName, replacements)
+	return replacements
 }
 
-// buildWrapperRuntimeJSWindowed uses string index to find function name occurrences,
-// then applies regex on small windows around each occurrence.
-func buildWrapperRuntimeJSWindowed(jsCode, functionName string) string {
+func buildWrapperRuntimeJS(jsCode, functionName string) string {
 	if jsCode == "" || functionName == "" {
 		return ""
 	}
 	replacements := buildWrapperReplacements(functionName)
 
-	var indices []int
-	offset := 0
-	for {
-		idx := strings.Index(jsCode[offset:], functionName)
-		if idx == -1 {
-			break
-		}
-		absIdx := offset + idx
-		indices = append(indices, absIdx)
-		offset = absIdx + len(functionName)
-	}
-
-	for _, absIdx := range indices {
-		start := absIdx - 30
-		if start < 0 {
-			start = 0
-		}
-		end := absIdx + len(functionName) + 30
-		if end > len(jsCode) {
-			end = len(jsCode)
-		}
-		chunk := jsCode[start:end]
-
-		for _, candidate := range replacements {
-			matches := candidate.pattern.FindAllStringIndex(chunk, -1)
-			for _, loc := range matches {
-				absLoc0 := start + loc[0]
-				absLoc1 := start + loc[1]
-
-				if !hasSafeJSIdentifierBoundary(jsCode, absLoc0, absLoc1) {
-					continue
-				}
-				if candidate.arrow && !strings.HasPrefix(strings.TrimSpace(jsCode[absLoc1:]), "(") {
-					continue
-				}
-				return jsCode[:absLoc0] + candidate.replace + jsCode[absLoc1:]
-			}
-		}
-	}
-
-	return ""
-}
-
-// buildWrapperRuntimeJSGlobal runs regex patterns on the entire file (slow but correct fallback).
-func buildWrapperRuntimeJSGlobal(jsCode, functionName string) string {
-	if jsCode == "" || functionName == "" {
-		return ""
-	}
-	replacements := buildWrapperReplacements(functionName)
-
+	replaced := false
 	for _, candidate := range replacements {
 		matches := candidate.pattern.FindAllStringIndex(jsCode, -1)
-		for _, loc := range matches {
+		// Iterate backwards so we can mutate jsCode without invalidating earlier match indices
+		for i := len(matches) - 1; i >= 0; i-- {
+			loc := matches[i]
 			if !hasSafeJSIdentifierBoundary(jsCode, loc[0], loc[1]) {
 				continue
 			}
 			if candidate.arrow && !strings.HasPrefix(strings.TrimSpace(jsCode[loc[1]:]), "(") {
 				continue
 			}
-			return jsCode[:loc[0]] + candidate.replace + jsCode[loc[1]:]
+
+			jsCode = jsCode[:loc[0]] + candidate.replace + jsCode[loc[1]:]
+			replaced = true
 		}
 	}
 
+	if replaced {
+		return jsCode
+	}
 	return ""
 }
 
 func hasSafeJSIdentifierBoundary(s string, start, end int) bool {
-	if start > 0 && isJSIdentifierByte(s[start-1]) {
-		return false
+	if start > 0 {
+		prev := s[start-1]
+		// Reject if preceded by an identifier char (part of a longer name)
+		if isJSIdentifierByte(prev) {
+			return false
+		}
+		// Reject if preceded by '.' — this is a property access (e.g. g.aO=function)
+		// and the replacement would produce invalid JS: g.globalThis["aO"]=...
+		if prev == '.' {
+			return false
+		}
 	}
 	return true
 }
@@ -837,8 +916,6 @@ func hasSafeJSIdentifierBoundary(s string, start, end int) bool {
 func isJSIdentifierByte(b byte) bool {
 	return b == '$' || b == '_' || ('0' <= b && b <= '9') || ('A' <= b && b <= 'Z') || ('a' <= b && b <= 'z')
 }
-
-
 
 // extractWithAST uses goja parser to extract a function and its dependencies.
 func extractWithAST(jsCode string, funcName string) (string, error) {
@@ -1253,24 +1330,38 @@ this.crypto = {
 
 func (c *Cipher) DecryptSignature(sig string) (string, error) {
 	if c.sigUsesURLWrapper {
+		var lastErr error
+
 		if c.sigFunctionName != "" && c.jsCode != "" {
-			if decrypted, err := c.transformWithURLWrapper(c.jsCode, c.sigFunctionName, sig, "s"); err == nil {
-				return decrypted, nil
+			decrypted, err := c.transformWithURLWrapper(c.jsCode, c.sigFunctionName, sig, "s")
+			if err == nil {
+				if !saneDecryptedSignature(sig, decrypted) {
+					err = fmt.Errorf("invalid decrypted signature shape from cached wrapper runtime: %q", decrypted)
+				} else {
+					return decrypted, nil
+				}
 			}
+			lastErr = err
 		}
 
 		codes := c.wrapperCodeCandidates()
 		wrapperNames := c.wrapperFunctionCandidates()
-		var lastErr error
+
 		for _, wrapperName := range wrapperNames {
 			for _, wrapperCode := range codes {
 				decrypted, err := c.transformWithURLWrapper(wrapperCode, wrapperName, sig, "s")
 				if err == nil {
+					if !saneDecryptedSignature(sig, decrypted) {
+						err = fmt.Errorf("invalid decrypted signature shape from wrapper %s", wrapperName)
+						lastErr = err
+						continue
+					}
+
 					preferredCode := wrapperCode
 					if len(c.playerJS) > 0 {
 						fullPlayerJS := string(c.playerJS)
 						if wrapperCode == fullPlayerJS {
-							if built := buildWrapperRuntimeJS(fullPlayerJS, wrapperName); built != "" {
+							if built, err := buildURLWrapperCode(fullPlayerJS, wrapperName); err == nil && built != "" {
 								preferredCode = built
 							} else if extracted, extractErr := extractWithAST(fullPlayerJS, wrapperName); extractErr == nil && extracted != "" {
 								preferredCode = extracted
@@ -1373,10 +1464,10 @@ func (c *Cipher) TransformNContext(ctx context.Context, n string) (string, error
 					lastErr = wrapperErr
 				}
 			}
-			if len(n) > 1 {
-				return n[1:], nil
+			if lastErr != nil {
+				return n, lastErr
 			}
-			return n, lastErr
+			return n, errors.New("unable to transform n with wrapper candidates")
 		}
 		return n, nil
 	}
@@ -1454,11 +1545,15 @@ func (c *Cipher) wrapperCodeCandidates() []string {
 		candidates = append(candidates, code)
 	}
 
+	// Priority order:
+	// 1) Current in-memory wrapper runtime first for same-process hot reuse.
+	// 2) Rebuild from raw cached player.js next; this is the authoritative source.
+	// 3) AST extraction and raw player JS last as compatibility fallbacks.
 	add(c.jsCode)
 	if len(c.playerJS) > 0 {
 		playerJS := string(c.playerJS)
 		for _, name := range c.wrapperFunctionCandidates() {
-			if built := buildWrapperRuntimeJS(playerJS, name); built != "" {
+			if built, err := buildURLWrapperCode(playerJS, name); err == nil && built != "" {
 				add(built)
 			}
 			if extracted, err := extractWithAST(playerJS, name); err == nil {
@@ -1469,6 +1564,49 @@ func (c *Cipher) wrapperCodeCandidates() []string {
 	}
 
 	return candidates
+}
+
+func buildURLWrapperCode(jsCode, functionName string) (string, error) {
+	if jsCode == "" || functionName == "" {
+		return "", errors.New("url wrapper function unavailable in current player JS")
+	}
+
+	if built := buildWrapperRuntimeJS(jsCode, functionName); built != "" {
+		if built != jsCode {
+			return built, nil
+		}
+		return jsCode, nil
+	}
+
+	if strings.Contains(jsCode, `globalThis["`+functionName+`"]`) || strings.Contains(jsCode, `globalThis['`+functionName+`']`) {
+		return jsCode, nil
+	}
+
+	if extracted, err := extractWithAST(jsCode, functionName); err == nil && extracted != "" {
+		return extracted, nil
+	} else if err != nil {
+		return "", fmt.Errorf("malformed JS for url wrapper %s: %w", functionName, err)
+	}
+
+	return "", fmt.Errorf("url wrapper function %s unavailable in current player JS", functionName)
+}
+
+// saneDecryptedSignature performs minimal sanity checks on decrypted output.
+// YouTube signatures vary in character set (hex, base64-like, URL-encoded)
+// so we only reject obviously truncated or no-op outputs.
+func saneDecryptedSignature(input, output string) bool {
+	if len(input) < 80 {
+		return true
+	}
+	if len(output) < 90 {
+		return false
+	}
+	// Reject identity transforms — the wrapper became a pass-through.
+	// This forces fallthrough to the next candidate in the retry chain.
+	if output == input {
+		return false
+	}
+	return true
 }
 
 func (c *Cipher) wrapperFunctionCandidates() []string {
@@ -1830,10 +1968,17 @@ func findURLTransformFunctionName(js []byte) string {
 }
 
 var urlTransformPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
-	regexp.MustCompile(`\b([a-zA-Z0-9_$]{2,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
-	regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\("alr","yes"\)`),
-	regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{2,})\([^)]*\)\{[^\{\}]{0,800}\.set\('alr','yes'\)`),
+	// Marker-specific patterns: fast, preferred — match the known "alr"/"yes" sentinel.
+	regexp.MustCompile(`(?:^|[^a-zA-Z0-9_$])([a-zA-Z0-9_$]{1,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}(?:[^.a-zA-Z0-9_$]|^)[a-zA-Z0-9_$]+\.set\("alr","yes"\)`),
+	regexp.MustCompile(`(?:^|[^a-zA-Z0-9_$])([a-zA-Z0-9_$]{1,})\s*=\s*function\([^)]*\)\{[^\{\}]{0,800}(?:[^.a-zA-Z0-9_$]|^)[a-zA-Z0-9_$]+\.set\('alr','yes'\)`),
+	regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{1,})\([^)]*\)\{[^\{\}]{0,800}(?:[^.a-zA-Z0-9_$]|^)[a-zA-Z0-9_$]+\.set\("alr","yes"\)`),
+	regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{1,})\([^)]*\)\{[^\{\}]{0,800}(?:[^.a-zA-Z0-9_$]|^)[a-zA-Z0-9_$]+\.set\('alr','yes'\)`),
+	// Structural fallback patterns: marker-agnostic.
+	// Matches 3-arg functions that call .set() and read back .get("s") — the shape
+	// of a URL-transform wrapper. Survives marker value changes (e.g. "alr" → "rdy")
+	// because "s" is the URL signature parameter baked into the streaming URL format.
+	regexp.MustCompile(`(?:^|[^a-zA-Z0-9_$])([a-zA-Z0-9_$]{1,})\s*=\s*function\([^)]*,[^)]*,[^)]*\)\{[^\{\}]{0,1000}\.set\([^)]+\)[^\{\}]{0,800}\.get\(["']s["']\)`),
+	regexp.MustCompile(`function\s+([a-zA-Z0-9_$]{1,})\([^)]*,[^)]*,[^)]*\)\{[^\{\}]{0,1000}\.set\([^)]+\)[^\{\}]{0,800}\.get\(["']s["']\)`),
 }
 
 var urlTransformInvalidPatterns = []*regexp.Regexp{
@@ -1854,7 +1999,12 @@ func findURLTransformFunctionNamesWindowed(js []byte) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, 4)
 
-	markers := [][]byte{[]byte(`set("alr"`), []byte(`set('alr'`)}
+	markers := [][]byte{
+		[]byte(`set("alr"`), []byte(`set('alr'`),
+		// Structural fallback: the wrapper must read back "s" from the URL object.
+		// If YouTube changes the "alr" marker, this still locates the right window.
+		[]byte(`.get("s")`), []byte(`.get('s')`),
+	}
 
 	for _, marker := range markers {
 		offset := 0

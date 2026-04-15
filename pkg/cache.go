@@ -12,12 +12,13 @@ import (
 )
 
 const (
-	cacheFileName     = "cipher.json"
-	playerCacheFile   = "player.js.gz" // Compressed player.js for n-transform
-	nRuntimeCacheFile = "n_runtime.js"
-	visitorCacheFile  = "visitor.json"
-	poCacheFile       = "po_token.json"
-	cacheTTL          = 6 * time.Hour
+	cacheFileName        = "cipher.json"
+	playerCacheFile      = "player.js.gz" // Compressed player.js for n-transform
+	nRuntimeCacheFile    = "n_runtime.js"
+	wrapperCodeCacheFile = "wrapper_code.bin"
+	visitorCacheFile     = "visitor.json"
+	poCacheFile          = "po_token.json"
+	cacheTTL             = 6 * time.Hour
 )
 
 // CipherCache represents the persisted cipher data
@@ -34,6 +35,7 @@ type CipherCache struct {
 	NFunction          string    `json:"n_function"`
 	SignatureTimestamp int       `json:"signature_timestamp"` // STS for API requests
 	IsBytecode         bool      `json:"is_bytecode,omitempty"`
+	WrapperBuildID     string    `json:"wrapper_build_id,omitempty"`
 	JSCode             string    `json:"js_code,omitempty"`
 }
 
@@ -100,10 +102,14 @@ func (cm *CacheManager) Load() (*CipherCache, error) {
 		return nil, err
 	}
 
-	// Fast load the raw bytecode/js payload avoiding JSON overhead
-	codePath := cm.codeCachePath()
-	if codeData, err := os.ReadFile(codePath); err == nil {
-		cache.JSCode = string(codeData)
+	// Fast load the raw bytecode/js payload avoiding JSON overhead.
+	// Wrapper-mode caches use raw player.js as the source of truth and must
+	// never hydrate wrapper-mutated runtime code from cipher_code.bin.
+	if !cache.SigUsesURLWrapper {
+		codePath := cm.codeCachePath()
+		if codeData, err := os.ReadFile(codePath); err == nil {
+			cache.JSCode = string(codeData)
+		}
 	}
 
 	return &cache, nil
@@ -134,13 +140,17 @@ func (cm *CacheManager) Save(cache *CipherCache) error {
 		return err
 	}
 
-	// Write the massive JS payload atomically to a raw binary file
-	if jsCode != "" {
+	// Write the massive JS payload atomically to a raw binary file.
+	// Wrapper-mode caches intentionally do not persist wrapper runtime here;
+	// raw player.js.gz is the authoritative cached source instead.
+	if jsCode != "" && !cache.SigUsesURLWrapper {
 		codePath := cm.codeCachePath()
 		tmpCodePath := codePath + fmt.Sprintf(".%d.tmp", os.Getpid())
 		if err := os.WriteFile(tmpCodePath, []byte(jsCode), 0644); err == nil {
 			_ = os.Rename(tmpCodePath, codePath)
 		}
+	} else {
+		_ = os.Remove(cm.codeCachePath())
 	}
 
 	return nil
@@ -185,6 +195,10 @@ func (cm *CacheManager) poCachePath() string {
 
 func (cm *CacheManager) codeCachePath() string {
 	return filepath.Join(cm.cacheDir, "cipher_code.bin")
+}
+
+func (cm *CacheManager) wrapperCodeCachePath() string {
+	return filepath.Join(cm.cacheDir, wrapperCodeCacheFile)
 }
 
 // LoadVisitorData reads the visitor cache from disk
@@ -419,12 +433,16 @@ func (cm *CacheManager) InvalidateCipherArtifacts() error {
 		lastErr = err
 	}
 
+	if err := os.Remove(cm.wrapperCodeCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
 	return lastErr
 }
 
 // currentCacheVersion is the current cache format version
 // Increment when cache structure changes to invalidate old caches
-const currentCacheVersion = 6
+const currentCacheVersion = 7
 
 // IsValid checks if a cache entry is still valid (not expired and correct version)
 func (cm *CacheManager) IsValid(cache *CipherCache) bool {
@@ -502,6 +520,23 @@ func (cm *CacheManager) LoadNRuntimeJS() ([]byte, error) {
 	return os.ReadFile(cm.NRuntimeCachePath())
 }
 
+// SaveWrapperRuntimeBytecode saves the compiled wrapper artifact.
+func (cm *CacheManager) SaveWrapperRuntimeBytecode(bytecode []byte) error {
+	if len(bytecode) == 0 {
+		return nil
+	}
+	tmpPath := cm.wrapperCodeCachePath() + ".tmp"
+	if err := os.WriteFile(tmpPath, bytecode, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, cm.wrapperCodeCachePath())
+}
+
+// LoadWrapperRuntimeBytecode loads the compiled wrapper artifact.
+func (cm *CacheManager) LoadWrapperRuntimeBytecode() ([]byte, error) {
+	return os.ReadFile(cm.wrapperCodeCachePath())
+}
+
 func (cm *CacheManager) Purge() error {
 	var lastErr error
 
@@ -522,6 +557,10 @@ func (cm *CacheManager) Purge() error {
 	}
 
 	if err := os.Remove(cm.NRuntimeCachePath()); err != nil && !os.IsNotExist(err) {
+		lastErr = err
+	}
+
+	if err := os.Remove(cm.wrapperCodeCachePath()); err != nil && !os.IsNotExist(err) {
 		lastErr = err
 	}
 

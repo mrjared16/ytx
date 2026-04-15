@@ -564,13 +564,11 @@ func checkNTransformed(url string) bool {
 	return true // No n-param means no transformation needed
 }
 
-// validateURL makes a HEAD request to check if URL is accessible
+// validateURL checks if URL is accessible.
+// It follows redirects and falls back to a tiny ranged GET when HEAD is not accepted.
 func validateURL(url string) int {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
 	}
 
 	resp, err := client.Head(url)
@@ -578,6 +576,31 @@ func validateURL(url string) int {
 		return 0
 	}
 	defer resp.Body.Close()
+
+	status := resp.StatusCode
+	if status == http.StatusPartialContent {
+		return http.StatusOK
+	}
+
+	if status != http.StatusMethodNotAllowed && status != http.StatusForbidden {
+		return status
+	}
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return status
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return status
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusPartialContent {
+		return http.StatusOK
+	}
 
 	return resp.StatusCode
 }
@@ -1577,6 +1600,199 @@ func TestGetCachedCipherPersistsPreparedSigArtifactOnInitialFetch(t *testing.T) 
 	}
 	if cache.JSCode == "" {
 		t.Fatal("expected prepared signature JS to be persisted on initial fetch")
+	}
+}
+
+func TestGetCachedCipherLoadsPlayerJSForWrapperCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeVideo, "")
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	playerJS := `
+(function(){
+function URLObj(sig){this.map={s:sig};}
+URLObj.prototype.get=function(k){return this.map[k];};
+URLObj.prototype.set=function(k,v){this.map[k]=v;};
+URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");o.apply();return o;};
+})();`
+
+	cache := &CipherCache{
+		Version:            currentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cacheTTL),
+		PlayerURL:          "/s/player/test123/player_ias.vflset/en_US/base.js",
+		PlayerFingerprint:  computePlayerFingerprint([]byte(playerJS)),
+		SigFunction:        "kS",
+		SigUsesURLWrapper:  true,
+		SignatureTimestamp: 12345,
+		JSCode:             "stale-wrapper-runtime-should-not-load",
+	}
+	if err := ext.cacheManager.Save(cache); err != nil {
+		t.Fatalf("failed to save wrapper cache: %v", err)
+	}
+	if err := ext.cacheManager.SavePlayerJS([]byte(playerJS)); err != nil {
+		t.Fatalf("failed to save player.js: %v", err)
+	}
+
+	cipher, err := ext.getCachedCipher("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("getCachedCipher returned error: %v", err)
+	}
+	if cipher == nil {
+		t.Fatal("expected cipher")
+	}
+	if len(cipher.playerJS) == 0 {
+		t.Fatal("expected wrapper cache load to hydrate raw player.js")
+	}
+	if cipher.jsCode != "" {
+		t.Fatalf("expected wrapper cache load to avoid persisted wrapper runtime, got %q", cipher.jsCode)
+	}
+
+	decrypted, err := cipher.DecryptSignature("abc")
+	if err != nil {
+		t.Fatalf("DecryptSignature returned error: %v", err)
+	}
+	if decrypted != "cba" {
+		t.Fatalf("unexpected decrypted signature: got %q want %q", decrypted, "cba")
+	}
+}
+
+func TestGetCachedCipherLoadsWrapperBytecodeArtifact(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeVideo, "")
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	playerJS := `
+(function(){
+function URLObj(sig){this.map={s:sig};}
+URLObj.prototype.get=function(k){return this.map[k];};
+URLObj.prototype.set=function(k,v){this.map[k]=v;};
+URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+URLObj.prototype.update=function(){this.apply();};
+var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;};
+})();`
+
+	wrapperRuntime := buildWrapperRuntimeJS(playerJS, "kS")
+	wrapperBytecode, err := compileToQuickJSBytecode(wrapperRuntime)
+	if err != nil {
+		t.Fatalf("compileToQuickJSBytecode returned error: %v", err)
+	}
+
+	cache := &CipherCache{
+		Version:            currentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cacheTTL),
+		PlayerURL:          "/s/player/test123/player_ias.vflset/en_US/base.js",
+		PlayerFingerprint:  computePlayerFingerprint([]byte(playerJS)),
+		SigFunction:        "kS",
+		SigUsesURLWrapper:  true,
+		SignatureTimestamp: 12345,
+		WrapperBuildID:     currentWrapperBytecodeBuildID(),
+	}
+	if err := ext.cacheManager.Save(cache); err != nil {
+		t.Fatalf("failed to save wrapper cache: %v", err)
+	}
+	if err := ext.cacheManager.SavePlayerJS([]byte(playerJS)); err != nil {
+		t.Fatalf("failed to save player.js: %v", err)
+	}
+	if err := ext.cacheManager.SaveWrapperRuntimeBytecode(wrapperBytecode); err != nil {
+		t.Fatalf("failed to save wrapper bytecode: %v", err)
+	}
+
+	cipher, err := ext.getCachedCipher("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("getCachedCipher returned error: %v", err)
+	}
+	if cipher == nil {
+		t.Fatal("expected cipher")
+	}
+	if !cipher.isBytecode {
+		t.Fatal("expected wrapper bytecode artifact to load as bytecode")
+	}
+	if cipher.jsCode == "" {
+		t.Fatal("expected wrapper bytecode artifact to populate jsCode")
+	}
+	if len(cipher.playerJS) == 0 {
+		t.Fatal("expected raw player.js to remain loaded for fallback")
+	}
+
+	decrypted, err := cipher.DecryptSignature("abc")
+	if err != nil {
+		t.Fatalf("DecryptSignature returned error: %v", err)
+	}
+	if decrypted != "cba" {
+		t.Fatalf("unexpected decrypted signature: got %q want %q", decrypted, "cba")
+	}
+}
+
+func TestPersistCipherArtifactsWritesWrapperBytecode(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	ext, err := NewExtractor(ModeVideo, "")
+	if err != nil {
+		t.Fatalf("failed to create extractor: %v", err)
+	}
+	ext.cacheManager = &CacheManager{cacheDir: cacheDir}
+	defer ext.invalidateCipherCache()
+
+	playerJS := []byte(`
+(function(){
+function URLObj(sig){this.map={s:sig};}
+URLObj.prototype.get=function(k){return this.map[k];};
+URLObj.prototype.set=function(k,v){this.map[k]=v;};
+URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+URLObj.prototype.update=function(){this.apply();};
+var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;};
+})();`)
+
+	ext.cipher = &Cipher{
+		sigFunctionName:   "kS",
+		sigUsesURLWrapper: true,
+		jsCode:            buildWrapperRuntimeJS(string(playerJS), "kS"),
+		playerJS:          playerJS,
+		playerURL:         "/s/player/test123/player_ias.vflset/en_US/base.js",
+		playerFingerprint: computePlayerFingerprint(playerJS),
+	}
+
+	ext.persistCipherArtifacts()
+
+	cache, err := ext.cacheManager.Load()
+	if err != nil {
+		t.Fatalf("failed to load persisted cache: %v", err)
+	}
+	if cache.WrapperBuildID != currentWrapperBytecodeBuildID() {
+		t.Fatalf("unexpected wrapper build id: got %q want %q", cache.WrapperBuildID, currentWrapperBytecodeBuildID())
+	}
+	if cache.JSCode != "" {
+		t.Fatalf("expected wrapper runtime text to stay out of cache metadata, got len=%d", len(cache.JSCode))
+	}
+	if _, err := ext.cacheManager.LoadWrapperRuntimeBytecode(); err != nil {
+		t.Fatalf("expected wrapper bytecode artifact: %v", err)
 	}
 }
 

@@ -65,16 +65,12 @@ func detectWrapperSignature(js []byte, detail *CipherAnalyzeDetail) (cipherDetec
 	result.SigUsesURLWrapper = true
 	detail.SigName = result.SigName
 	detail.SigTier = "wrapper"
+	detail.WrapperBuildTier = "unified"
 
 	tBuild := time.Now()
-	wrapperRuntimeJS := buildWrapperRuntimeJSWindowed(string(js), result.SigName)
-	if wrapperRuntimeJS != "" {
-		detail.WrapperBuildTier = "windowed"
-	} else {
-		wrapperRuntimeJS = buildWrapperRuntimeJSGlobal(string(js), result.SigName)
-		if wrapperRuntimeJS != "" {
-			detail.WrapperBuildTier = "global_fallback"
-		}
+	wrapperRuntimeJS := buildWrapperRuntimeJS(string(js), result.SigName)
+	if wrapperRuntimeJS == "" {
+		wrapperRuntimeJS = string(js)
 	}
 	detail.WrapperBuildMs += time.Since(tBuild).Milliseconds()
 
@@ -107,28 +103,20 @@ func detectGlobalSignature(js []byte, detail *CipherAnalyzeDetail) (cipherDetect
 
 // detectNFunction runs the universal N-function detection
 func detectNFunction(js []byte, isWrapper bool, detail *CipherAnalyzeDetail) string {
+	_ = isWrapper // historically used to skip global fallback; now both paths are identical
 	tN := time.Now()
 	var nName string
 
-	if isWrapper {
-		nName = findNFunctionNameWindowed(js)
-		if nName != "" {
-			detail.NFuncTier = "windowed"
-		} else {
-			detail.NFuncTier = "skipped_wrapper"
-		}
+	nName = findNFunctionNameWindowed(js)
+	if nName != "" {
+		detail.NFuncTier = "windowed"
 	} else {
-		nName = findNFunctionNameWindowed(js)
+		nName = findNFunctionNameGlobal(js)
 		if nName != "" {
-			detail.NFuncTier = "windowed"
+			detail.NFuncTier = "global_fallback"
+			detail.MarkerMiss = append(detail.MarkerMiss, `get("n")`)
 		} else {
-			nName = findNFunctionNameGlobal(js)
-			if nName != "" {
-				detail.NFuncTier = "global_fallback"
-				detail.MarkerMiss = append(detail.MarkerMiss, `get("n")`)
-			} else {
-				detail.NFuncTier = "not_found"
-			}
+			detail.NFuncTier = "not_found"
 		}
 	}
 

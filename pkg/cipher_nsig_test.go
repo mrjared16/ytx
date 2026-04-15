@@ -45,3 +45,18 @@ func TestFindNFunctionName(t *testing.T) {
 		})
 	}
 }
+
+func TestDetectNFunctionWrapperUsesGlobalFallback(t *testing.T) {
+	js := []byte(`var RDD=[a0x];function noop(){return RDD[0]}`)
+	detail := &CipherAnalyzeDetail{}
+
+	if got := detectNFunction(js, true, detail); got != "a0x" {
+		t.Fatalf("unexpected n function: got %q want %q", got, "a0x")
+	}
+	if detail.NFuncTier != "global_fallback" {
+		t.Fatalf("unexpected tier: got %q want %q", detail.NFuncTier, "global_fallback")
+	}
+	if len(detail.MarkerMiss) != 1 || detail.MarkerMiss[0] != `get("n")` {
+		t.Fatalf("unexpected marker miss: %#v", detail.MarkerMiss)
+	}
+}

@@ -1049,11 +1049,21 @@ func (e *Extractor) getCachedCipherContext(ctx context.Context, videoID string) 
 						cipher.nRuntimeJS = nRuntimeJS
 					}
 
-					needPlayerJS := cache.JSCode == "" || (cache.NFunction != "" && len(cipher.nRuntimeJS) == 0)
+					needPlayerJS := cache.SigUsesURLWrapper || cache.JSCode == "" || (cache.NFunction != "" && len(cipher.nRuntimeJS) == 0)
 					if needPlayerJS {
 						if playerJS, err := e.cacheManager.LoadPlayerJS(); err == nil {
 							cipher.playerJS = playerJS
 						}
+					}
+					if cache.SigUsesURLWrapper && cache.WrapperBuildID == currentWrapperBytecodeBuildID() {
+						if wrapperBytecode, err := e.cacheManager.LoadWrapperRuntimeBytecode(); err == nil && len(wrapperBytecode) > 0 {
+							cipher.jsCode = string(wrapperBytecode)
+							cipher.isBytecode = true
+						}
+					}
+					if cache.SigUsesURLWrapper && len(cipher.playerJS) == 0 {
+						_ = e.cacheManager.InvalidateCipherArtifacts()
+						goto fetchFreshCipher
 					}
 
 					e.storeCipherCache(cipher, cache.ExpiresAt)
@@ -1068,6 +1078,7 @@ func (e *Extractor) getCachedCipherContext(ctx context.Context, videoID string) 
 	}
 
 	// 3. Fetch fresh cipher (singleflighted).
+fetchFreshCipher:
 	v, err, _ := e.runtime.cipherGroup.Do("shared", func() (any, error) {
 		return e.fetchAndCacheCipherContext(ctx, videoID)
 	})
@@ -1162,6 +1173,12 @@ func (e *Extractor) fetchAndCacheCipherContext(ctx context.Context, videoID stri
 	if e.cacheManager != nil {
 		cacheData := cipher.ToCache()
 		cacheData.BaseJSPath = playerPath // Store base.js path for next time
+		if cipher.sigUsesURLWrapper {
+			if wrapperBytecode, err := cipher.wrapperRuntimeBytecode(); err == nil && len(wrapperBytecode) > 0 {
+				cacheData.WrapperBuildID = currentWrapperBytecodeBuildID()
+				_ = e.cacheManager.SaveWrapperRuntimeBytecode(wrapperBytecode)
+			}
+		}
 		_ = e.cacheManager.Save(cacheData)
 		// Also save player.js (compressed) for n-transform
 		if len(cipher.playerJS) > 0 {
@@ -1661,6 +1678,12 @@ func (e *Extractor) persistCipherArtifacts() {
 
 	cacheData := e.cipher.ToCache()
 	cacheData.BaseJSPath = e.cipher.playerURL
+	if e.cipher.sigUsesURLWrapper {
+		if wrapperBytecode, err := e.cipher.wrapperRuntimeBytecode(); err == nil && len(wrapperBytecode) > 0 {
+			cacheData.WrapperBuildID = currentWrapperBytecodeBuildID()
+			_ = e.cacheManager.SaveWrapperRuntimeBytecode(wrapperBytecode)
+		}
+	}
 	_ = e.cacheManager.Save(cacheData)
 	_ = e.cacheManager.SavePlayerJS(e.cipher.playerJS)
 	if len(e.cipher.nRuntimeJS) > 0 {

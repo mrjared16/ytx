@@ -203,7 +203,7 @@ type CipherAnalyzeDetail struct {
 	StsMs int64 `json:"sts_ms"`
 
 	// Diagnostics
-	PlayerJSBytes int    `json:"player_js_bytes"`
+	PlayerJSBytes int      `json:"player_js_bytes"`
 	MarkerMiss    []string `json:"marker_miss,omitempty"` // which marker failed (when global fallback triggered)
 }
 

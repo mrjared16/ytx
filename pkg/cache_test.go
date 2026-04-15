@@ -54,6 +54,52 @@ func TestSaveAndLoadNRuntimeJS(t *testing.T) {
 	}
 }
 
+func TestWrapperCacheIgnoresPersistedCodeArtifact(t *testing.T) {
+	cm := &CacheManager{cacheDir: t.TempDir()}
+	cache := &CipherCache{
+		Version:           currentCacheVersion,
+		CreatedAt:         time.Now(),
+		ExpiresAt:         time.Now().Add(time.Hour),
+		SigFunction:       "kS",
+		SigUsesURLWrapper: true,
+		JSCode:            "wrapper-runtime-should-not-persist",
+	}
+	if err := cm.Save(cache); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cm.cacheDir, "cipher_code.bin")); !os.IsNotExist(err) {
+		t.Fatalf("expected wrapper cache save to avoid cipher_code.bin, got err=%v", err)
+	}
+
+	// Simulate a stale legacy artifact on disk; wrapper-mode loads must ignore it.
+	if err := os.WriteFile(filepath.Join(cm.cacheDir, "cipher_code.bin"), []byte("legacy-runtime"), 0644); err != nil {
+		t.Fatalf("failed to write legacy code artifact: %v", err)
+	}
+
+	loaded, err := cm.Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if loaded.JSCode != "" {
+		t.Fatalf("expected wrapper cache load to ignore code artifact, got %q", loaded.JSCode)
+	}
+}
+
+func TestSaveAndLoadWrapperRuntimeBytecode(t *testing.T) {
+	cm := &CacheManager{cacheDir: t.TempDir()}
+	want := []byte{0x01, 0x02, 0x03, 0x04}
+	if err := cm.SaveWrapperRuntimeBytecode(want); err != nil {
+		t.Fatalf("SaveWrapperRuntimeBytecode failed: %v", err)
+	}
+	got, err := cm.LoadWrapperRuntimeBytecode()
+	if err != nil {
+		t.Fatalf("LoadWrapperRuntimeBytecode failed: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("unexpected wrapper bytecode contents: got %v want %v", got, want)
+	}
+}
+
 func TestLoadPOTokenLegacyTokenFallback(t *testing.T) {
 	cm := &CacheManager{cacheDir: t.TempDir()}
 	legacy := `{"token":"LEGACY","video_id":"vid","expires_at":"2099-01-01T00:00:00Z"}`

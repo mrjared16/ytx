@@ -1,11 +1,15 @@
 package ytx
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestFindSigFunctionName(t *testing.T) {
@@ -110,6 +114,7 @@ function URLObj(sig){this.map={s:sig};}
 URLObj.prototype.get=function(k){return this.map[k];};
 URLObj.prototype.set=function(k,v){this.map[k]=v;};
 URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+URLObj.prototype.update=function(){this.apply();};
 function kS(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;}
 `
 
@@ -137,6 +142,7 @@ function URLObj(sig){this.map={s:sig};}
 URLObj.prototype.get=function(k){return this.map[k];};
 URLObj.prototype.set=function(k,v){this.map[k]=v;};
 URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+URLObj.prototype.update=function(){this.apply();};
 var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;};
 })();
 `
@@ -158,6 +164,66 @@ var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;
 	}
 }
 
+func TestDecryptSignatureColdStartRebuildsFromCachedRawPlayerJS(t *testing.T) {
+	playerJS := `
+(function(){
+function URLObj(sig){this.map={s:sig};}
+URLObj.prototype.get=function(k){return this.map[k];};
+URLObj.prototype.set=function(k,v){this.map[k]=v;};
+URLObj.prototype.apply=function(){this.map.s="ABCD"+Array(101).join("x");};
+var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");o.apply();return o;};
+})();
+`
+
+	tmpDir := t.TempDir()
+	cm := &CacheManager{cacheDir: tmpDir}
+	cache := &CipherCache{
+		Version:            currentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cacheTTL),
+		SigFunction:        "kS",
+		SigUsesURLWrapper:  true,
+		JSCode:             buildWrapperRuntimeJS(playerJS, "kS"),
+		SignatureTimestamp: 12345,
+	}
+	if err := cm.Save(cache); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if err := cm.SavePlayerJS([]byte(playerJS)); err != nil {
+		t.Fatalf("SavePlayerJS returned error: %v", err)
+	}
+
+	loaded, err := cm.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if loaded.JSCode != "" {
+		t.Fatalf("expected wrapper cache load to ignore cipher_code.bin, got len=%d", len(loaded.JSCode))
+	}
+	playerJSBytes, err := cm.LoadPlayerJS()
+	if err != nil {
+		t.Fatalf("LoadPlayerJS returned error: %v", err)
+	}
+
+	cipher := NewCipherFromCache(loaded)
+	cipher.playerJS = playerJSBytes
+	decrypted, err := cipher.DecryptSignature("abc")
+	if err != nil {
+		t.Fatalf("DecryptSignature returned error: %v", err)
+	}
+
+	if len(decrypted) != 104 {
+		t.Fatalf("unexpected decrypted signature length: got %d want 104", len(decrypted))
+	}
+	if !strings.HasPrefix(decrypted, "ABCD") {
+		t.Fatalf("unexpected decrypted signature prefix: got %q", decrypted[:4])
+	}
+
+	if _, err := os.Stat(filepath.Join(tmpDir, "cipher_code.bin")); !os.IsNotExist(err) {
+		t.Fatalf("expected wrapper cache to avoid cipher_code.bin, got err=%v", err)
+	}
+}
+
 func TestDecryptSignatureWrapperUsesArrowFunctionAssignment(t *testing.T) {
 	playerJS := `
 (function(){
@@ -165,6 +231,7 @@ function URLObj(sig){this.map={s:sig};}
 URLObj.prototype.get=function(k){return this.map[k];};
 URLObj.prototype.set=function(k,v){this.map[k]=v;};
 URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+URLObj.prototype.update=function(){this.apply();};
 var kS = (url, mode, sig) => { var o = new URLObj(sig); o.set("alr", "yes"); return o; };
 })();
 `
@@ -193,6 +260,7 @@ function URLObj(sig){this.map={s:sig};}
 URLObj.prototype.get=function(k){return this.map[k];};
 URLObj.prototype.set=function(k,v){this.map[k]=v;};
 URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+URLObj.prototype.update=function(){this.apply();};
 $LI=function(url,mode,sig){ return { bogus: sig }; };
 LI=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;};
 })();
@@ -235,6 +303,23 @@ func TestEnsureSignatureReadyRejectsWrapperPrecompute(t *testing.T) {
 	}
 	if cipher.jsCode != "" {
 		t.Fatalf("wrapper precompute should not set jsCode, got len=%d", len(cipher.jsCode))
+	}
+}
+
+func TestTransformNContextWrapperReturnsErrorWithoutTruncationFallback(t *testing.T) {
+	cipher := &Cipher{
+		sigFunctionName:   "LI",
+		sigUsesURLWrapper: true,
+		jsCode:            `function broken(`,
+		playerJS:          []byte(`function stillBroken(`),
+	}
+
+	got, err := cipher.TransformNContext(context.Background(), "abcdef")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != "abcdef" {
+		t.Fatalf("unexpected n value: got %q want %q", got, "abcdef")
 	}
 }
 
@@ -283,7 +368,7 @@ func TestToCacheKeepsWrapperSignatureArtifactsWhenNFunctionExists(t *testing.T) 
 	}
 }
 
-func TestToCacheKeepsWrapperArtifactsWithoutNFunction(t *testing.T) {
+func TestToCacheDropsWrapperArtifactsWithoutNFunction(t *testing.T) {
 	cipher := &Cipher{
 		sigFunctionName:    "LI",
 		sigParam:           7,
@@ -310,15 +395,15 @@ func TestToCacheKeepsWrapperArtifactsWithoutNFunction(t *testing.T) {
 	if !cache.IsBytecode {
 		t.Fatal("expected bytecode flag to be preserved")
 	}
-	if cache.JSCode != "wrapper-runtime" {
-		t.Fatalf("expected wrapper runtime to be preserved, got %q", cache.JSCode)
+	if cache.JSCode != "" {
+		t.Fatalf("expected wrapper runtime to be omitted from cache, got %q", cache.JSCode)
 	}
 	if cache.NFunction != "" {
 		t.Fatalf("expected n function to remain empty, got %q", cache.NFunction)
 	}
 }
 
-func TestToCacheKeepsValidatedWrapperSignatureArtifacts(t *testing.T) {
+func TestToCacheDropsValidatedWrapperSignatureArtifacts(t *testing.T) {
 	cipher := &Cipher{
 		sigFunctionName:    "LI",
 		sigParam:           7,
@@ -342,8 +427,8 @@ func TestToCacheKeepsValidatedWrapperSignatureArtifacts(t *testing.T) {
 	if !cache.SigUsesURLWrapper {
 		t.Fatal("expected validated wrapper flag to persist in cache")
 	}
-	if cache.JSCode != "wrapper-runtime" {
-		t.Fatalf("expected validated wrapper jsCode to persist, got %q", cache.JSCode)
+	if cache.JSCode != "" {
+		t.Fatalf("expected validated wrapper jsCode to be omitted, got %q", cache.JSCode)
 	}
 }
 
