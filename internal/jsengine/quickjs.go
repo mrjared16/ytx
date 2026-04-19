@@ -1,4 +1,4 @@
-package ytx
+package jsengine
 
 import (
 	"encoding/base64"
@@ -46,7 +46,7 @@ func NewQuickJSRunner(playerJS []byte, nFuncName string) (*QuickJSRunner, error)
 		return nil, fmt.Errorf("quickjs: failed to inject atob/btoa: %w", err)
 	}
 
-	stubsVal := ctx.Eval(browserStubsJS, quickjs.EvalFlagGlobal(true))
+	stubsVal := ctx.Eval(BrowserStubsJS, quickjs.EvalFlagGlobal(true))
 	if ctx.HasException() {
 		exc := ctx.Exception()
 		stubsVal.Free()

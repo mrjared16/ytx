@@ -1,7 +1,6 @@
-package ytx
+package jsengine
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -45,25 +44,8 @@ type jsBatchResponse struct {
 	Error   string          `json:"error,omitempty"`
 }
 
-// PreSpawnJSProcess starts a JS subprocess early and pre-loads the 2.6MB player.js immediately
-// This allows overlapping the massive 200ms JS JIT-compilation with the network I/O
-func PreSpawnJSProcess(engine string, playerJS []byte, nFuncName string) error {
-	return defaultRuntime.PreSpawnJSProcess(context.Background(), engine, playerJS, nFuncName)
-}
-
-func (r *Runtime) PreSpawnJSProcess(ctx context.Context, engine string, playerJS []byte, nFuncName string) error {
-	if ctx != nil && ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	r.preSpawn.mu.Lock()
-	defer r.preSpawn.mu.Unlock()
-
-	// Already spawned?
-	if r.preSpawn.runner != nil && r.preSpawn.engine == engine {
-		return nil
-	}
-
+// PreSpawn creates a subprocess early to overlap JS compilation with network I/O
+func PreSpawn(engine string, playerJS []byte, nFuncName string) (*SubprocessRunner, error) {
 	var jsPath string
 	var err error
 
@@ -71,127 +53,99 @@ func (r *Runtime) PreSpawnJSProcess(ctx context.Context, engine string, playerJS
 	case "bun":
 		jsPath, err = exec.LookPath("bun")
 		if err != nil {
-			return fmt.Errorf("bun not found in PATH")
+			return nil, fmt.Errorf("bun not found in PATH")
 		}
 	case "node":
 		jsPath, err = exec.LookPath("node")
 		if err != nil {
 			jsPath, err = exec.LookPath("nodejs")
 			if err != nil {
-				return fmt.Errorf("node not found in PATH")
+				return nil, fmt.Errorf("node not found in PATH")
 			}
 		}
 	default:
-		return fmt.Errorf("unknown subprocess engine: %s", engine)
+		return nil, fmt.Errorf("unknown subprocess engine: %s", engine)
 	}
 
-	// Write runner script to temp file (small, fast)
 	tmpDir := os.TempDir()
 	runnerPath := filepath.Join(tmpDir, tempRunnerFile)
 	if err := os.WriteFile(runnerPath, []byte(nRunnerScript), 0644); err != nil {
-		return fmt.Errorf("failed to write runner script: %w", err)
+		return nil, fmt.Errorf("failed to write runner script: %w", err)
 	}
 
-	// Start process (but don't load player.js yet)
 	cmd := exec.Command(jsPath, runnerPath)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("failed to create stdin pipe: %w", err)
+		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start %s: %w", engine, err)
+		return nil, fmt.Errorf("failed to start %s: %w", engine, err)
 	}
 
-	r.preSpawn.runner = &SubprocessRunner{
+	runner := &SubprocessRunner{
 		cmd:        cmd,
 		stdin:      json.NewEncoder(stdin),
 		stdout:     json.NewDecoder(stdout),
 		engineName: engine,
 	}
-	r.preSpawn.engine = engine
 
-	// Eagerly write player.js and evaluate it to completely mask the 200ms JIT phase
 	if len(playerJS) > 0 {
 		tmpDir2 := os.TempDir()
 		playerJSPath := filepath.Join(tmpDir2, tempPlayerFile)
 		if err := os.WriteFile(playerJSPath, playerJS, 0644); err != nil {
-			return fmt.Errorf("failed to write player.js: %w", err)
+			return nil, fmt.Errorf("failed to write player.js: %w", err)
 		}
 
-		r.preSpawn.runner.funcName = nFuncName
-		// We trigger the load_file anonymously into the channel, it will buffer the STDOUT response.
-		// GetPreSpawnedRunner will later call loadFunctionFromFile safely if needed,
-		// but since we encode it now, the daemon begins crunching immediately!
-		if err := r.preSpawn.runner.stdin.Encode(jsCommand{
+		runner.funcName = nFuncName
+		if err := runner.stdin.Encode(jsCommand{
 			Type:     "load_file",
 			Path:     playerJSPath,
 			Fun:      nFuncName,
 			Prepared: true,
 		}); err != nil {
-			return fmt.Errorf("failed to send preload command: %w", err)
+			return nil, fmt.Errorf("failed to send preload command: %w", err)
 		}
-		r.preSpawn.runner.preloaded = true // Signal that we have already fired load_file
+		runner.preloaded = true
 	}
 
-	return nil
+	return runner, nil
 }
 
-// GetPreSpawnedRunner returns a pre-spawned runner if available, loading the function
-// Returns nil if no pre-spawned runner exists for this engine
-func GetPreSpawnedRunner(engine string, runtimeJS []byte, funcName string) (*SubprocessRunner, error) {
-	return defaultRuntime.GetPreSpawnedRunner(context.Background(), engine, runtimeJS, funcName)
-}
-
-func (r *Runtime) GetPreSpawnedRunner(ctx context.Context, engine string, runtimeJS []byte, funcName string) (*SubprocessRunner, error) {
-	if ctx != nil && ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-
-	r.preSpawn.mu.Lock()
-	defer r.preSpawn.mu.Unlock()
-
-	if r.preSpawn.runner == nil || r.preSpawn.engine != engine {
-		return nil, nil // No pre-spawned runner, caller should use NewSubprocessRunner
-	}
-
-	runner := r.preSpawn.runner
-	r.preSpawn.runner = nil // Claim the runner
-	r.preSpawn.engine = ""
-
-	// If it was already preloaded by PreSpawnJSProcess, we just need to consume the stdout ack
-	if runner.preloaded {
+// FinishPreload completes the preloading process and consumes the ready signal
+func (r *SubprocessRunner) FinishPreload(runtimeJS []byte, funcName string) error {
+	if r.preloaded {
 		var resp jsStatusResponse
-		if err := runner.stdout.Decode(&resp); err != nil {
-			runner.Close()
-			return nil, fmt.Errorf("failed to read preloaded response: %w", err)
+		if err := r.stdout.Decode(&resp); err != nil {
+			r.Close()
+			return fmt.Errorf("failed to read preloaded response: %w", err)
 		}
 		if resp.Error != "" {
-			runner.Close()
-			return nil, fmt.Errorf("js preload error: %s", resp.Error)
+			r.Close()
+			return fmt.Errorf("js preload error: %s", resp.Error)
 		}
-		return runner, nil
+		return nil
 	}
 
 	// Write player.js and load function
 	tmpDir := os.TempDir()
 	playerJSPath := filepath.Join(tmpDir, tempPlayerFile)
 	if err := os.WriteFile(playerJSPath, runtimeJS, 0644); err != nil {
-		runner.Close()
-		return nil, fmt.Errorf("failed to write player.js: %w", err)
+		r.Close()
+		return fmt.Errorf("failed to write player.js: %w", err)
 	}
 
-	runner.funcName = funcName
-	if err := runner.loadFunctionFromFile(playerJSPath, funcName, true); err != nil {
-		runner.Close()
-		return nil, err
+	r.funcName = funcName
+	if err := r.loadFunctionFromFile(playerJSPath, funcName, true); err != nil {
+		r.Close()
+		return err
 	}
 
-	return runner, nil
+	return nil
 }
 
 // SubprocessRunner executes JavaScript functions via Bun/Node subprocess
