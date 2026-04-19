@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrjared16/ytx/internal/jsengine"
+
 	"golang.org/x/sync/singleflight"
 )
 
@@ -28,13 +30,13 @@ type runtimeVisitorCache struct {
 
 type runtimeEngineCache struct {
 	mu             sync.Mutex
-	cachedEngines  map[string]JSEngine
+	cachedEngines  map[string]jsengine.JSEngine
 	lastEngineName string
 }
 
 type runtimePreSpawn struct {
 	mu     sync.Mutex
-	runner *SubprocessRunner
+	runner *jsengine.SubprocessRunner
 	engine string
 }
 
@@ -43,7 +45,7 @@ type runtimePreSpawn struct {
 // singleflight guards for cold-path work.
 type Runtime struct {
 	engineMu   sync.RWMutex
-	engineType EngineType
+	engineType jsengine.EngineType
 
 	cipherCache  *runtimeCipherCache
 	visitorCache *runtimeVisitorCache
@@ -59,11 +61,11 @@ type Runtime struct {
 // singleton by default, but tests and advanced callers can inject their own.
 func NewRuntime() *Runtime {
 	return &Runtime{
-		engineType:   EngineAuto,
+		engineType:   jsengine.EngineAuto,
 		cipherCache:  &runtimeCipherCache{},
 		visitorCache: &runtimeVisitorCache{},
 		engineCache: &runtimeEngineCache{
-			cachedEngines: make(map[string]JSEngine),
+			cachedEngines: make(map[string]jsengine.JSEngine),
 		},
 		preSpawn: &runtimePreSpawn{},
 	}
