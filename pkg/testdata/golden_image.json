@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-12T12:46:02+07:00",
+  "generated_at": "2026-04-18T17:18:09+07:00",
   "version": 4,
   "results": [
     {
@@ -11,13 +11,13 @@
       "quality_label": "1920x1080",
       "http_status": 200,
       "timings": {
-        "total_extract": "473.06064ms",
-        "url_validation": "83.673615ms",
-        "visitor_data_ms": 336,
-        "player_api_ms": 136,
-        "total_ms": 473
+        "total_extract": "426.359827ms",
+        "url_validation": "83.649628ms",
+        "visitor_data_ms": 346,
+        "player_api_ms": 79,
+        "total_ms": 426
       },
-      "total_duration": "556.759221ms"
+      "total_duration": "510.018722ms"
     },
     {
       "mode": "video",
@@ -28,12 +28,12 @@
       "quality_label": "1920x1080",
       "http_status": 200,
       "timings": {
-        "total_extract": "226.359687ms",
-        "url_validation": "26.148772ms",
-        "player_api_ms": 226,
-        "total_ms": 226
+        "total_extract": "228.375365ms",
+        "url_validation": "163.173565ms",
+        "player_api_ms": 228,
+        "total_ms": 228
       },
-      "total_duration": "252.544889ms"
+      "total_duration": "391.564543ms"
     },
     {
       "mode": "music",
@@ -45,55 +45,18 @@
       "http_status": 200,
       "n_transformed": true,
       "timings": {
-        "total_extract": "1.461007723s",
-        "url_validation": "27.407504ms",
-        "visitor_data_ms": 301,
-        "player_api_ms": 136,
-        "cipher_init_ms": 694,
-        "total_ms": 1461
-      },
-      "total_duration": "1.488484066s"
-    },
-    {
-      "mode": "music",
-      "cache_state": "warm",
-      "video_id": "dQw4w9WgXcQ",
-      "success": true,
-      "itag": 774,
-      "bitrate": 270204,
-      "http_status": 200,
-      "n_transformed": true,
-      "timings": {
-        "total_extract": "326.852703ms",
-        "url_validation": "26.89553ms",
-        "player_api_ms": 249,
-        "total_ms": 326
-      },
-      "total_duration": "353.841673ms"
-    },
-    {
-      "mode": "music",
-      "po_mode": true,
-      "cache_state": "cold",
-      "video_id": "dQw4w9WgXcQ",
-      "success": true,
-      "itag": 774,
-      "bitrate": 270204,
-      "http_status": 200,
-      "n_transformed": true,
-      "timings": {
-        "total_extract": "5.048629683s",
-        "url_validation": "30.535447ms",
-        "visitor_data_ms": 285,
-        "player_api_ms": 203,
+        "total_extract": "2.593729978s",
+        "url_validation": "98.289634ms",
+        "visitor_data_ms": 349,
+        "player_api_ms": 135,
+        "cipher_init_ms": 1786,
         "n_transform_ms": 1,
-        "total_ms": 5048
+        "total_ms": 2593
       },
-      "total_duration": "5.079245489s"
+      "total_duration": "2.692077681s"
     },
     {
       "mode": "music",
-      "po_mode": true,
       "cache_state": "warm",
       "video_id": "dQw4w9WgXcQ",
       "success": true,
@@ -102,12 +65,49 @@
       "http_status": 200,
       "n_transformed": true,
       "timings": {
-        "total_extract": "342.081845ms",
-        "url_validation": "32.655223ms",
-        "player_api_ms": 257,
+        "total_extract": "342.590545ms",
+        "url_validation": "7.862772ms",
+        "player_api_ms": 272,
         "total_ms": 342
       },
-      "total_duration": "374.795929ms"
+      "total_duration": "350.510078ms"
+    },
+    {
+      "mode": "music",
+      "po_mode": true,
+      "cache_state": "cold",
+      "video_id": "dQw4w9WgXcQ",
+      "success": true,
+      "itag": 774,
+      "bitrate": 270204,
+      "http_status": 200,
+      "n_transformed": true,
+      "timings": {
+        "total_extract": "4.9125256s",
+        "url_validation": "8.104248ms",
+        "visitor_data_ms": 315,
+        "player_api_ms": 279,
+        "total_ms": 4912
+      },
+      "total_duration": "4.9206909s"
+    },
+    {
+      "mode": "music",
+      "po_mode": true,
+      "cache_state": "warm",
+      "video_id": "dQw4w9WgXcQ",
+      "success": true,
+      "itag": 774,
+      "bitrate": 270204,
+      "http_status": 200,
+      "n_transformed": true,
+      "timings": {
+        "total_extract": "344.145001ms",
+        "url_validation": "7.814779ms",
+        "player_api_ms": 276,
+        "total_ms": 344
+      },
+      "total_duration": "352.026143ms"
     }
   ]
 }
