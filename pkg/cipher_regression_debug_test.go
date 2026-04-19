@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mrjared16/ytx/internal/cache"
+	"github.com/mrjared16/ytx/internal/jsextract"
 )
 
 func TestDebugCipherRegressionPath(t *testing.T) {
@@ -26,7 +29,7 @@ func TestDebugCipherRegressionPath(t *testing.T) {
 		t.Fatalf("mkdir cache: %v", err)
 	}
 
-	ext, err := NewExtractor(ModeMusic, cookiePath, WithCacheManager(&CacheManager{cacheDir: cacheDir}))
+	ext, err := NewExtractor(ModeMusic, cookiePath, WithCacheManager(cache.NewCacheManagerWithDir(cacheDir)))
 	if err != nil {
 		t.Fatalf("new extractor: %v", err)
 	}
@@ -102,7 +105,7 @@ func TestDebugCipherRegressionPath(t *testing.T) {
 	t.Logf("reloaded cache: sigFunctionName=%q sigUsesURLWrapper=%v jsCodeLen=%d isBytecode=%v", reloaded.sigFunctionName, reloaded.sigUsesURLWrapper, len(reloaded.jsCode), reloaded.isBytecode)
 
 	if wrapperName != "" {
-		wrapperJS := buildWrapperRuntimeJS(string(cipher.playerJS), wrapperName)
+		wrapperJS := jsextract.BuildWrapperRuntimeJS(string(cipher.playerJS), wrapperName)
 		t.Logf("wrapper runtime candidate: wrapperName=%q wrapperJSLen=%d", wrapperName, len(wrapperJS))
 		if wrapperJS == "" {
 			t.Fatalf("wrapper runtime candidate unexpectedly empty")

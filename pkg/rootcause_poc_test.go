@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/mrjared16/ytx/internal/cache"
+	"github.com/mrjared16/ytx/internal/jsextract"
 )
 
 func TestPOCWrapperBootstrapCost(t *testing.T) {
@@ -34,7 +37,7 @@ func TestPOCWrapperBootstrapCost(t *testing.T) {
 		t.Fatalf("mkdir cache: %v", err)
 	}
 
-	ext, err := NewExtractor(ModeMusic, cookiePath, WithCacheManager(&CacheManager{cacheDir: cacheDir}))
+	ext, err := NewExtractor(ModeMusic, cookiePath, WithCacheManager(cache.NewCacheManagerWithDir(cacheDir)))
 	if err != nil {
 		t.Fatalf("new extractor: %v", err)
 	}
@@ -51,8 +54,8 @@ func TestPOCWrapperBootstrapCost(t *testing.T) {
 
 	wrapperName := cipher.sigFunctionName
 	playerJS := string(cipher.playerJS)
-	built := buildWrapperRuntimeJS(playerJS, wrapperName)
-	extracted, _ := extractWithAST(playerJS, wrapperName)
+	built := jsextract.BuildWrapperRuntimeJS(playerJS, wrapperName)
+	extracted, _ := jsextract.ExtractWithAST(playerJS, wrapperName)
 
 	t.Logf("detected wrapper mode: sigFunction=%q nFunction=%q playerJSLen=%d builtLen=%d extractedLen=%d cacheJSLen=%d", wrapperName, cipher.nFunctionName, len(playerJS), len(built), len(extracted), len(cipher.jsCode))
 

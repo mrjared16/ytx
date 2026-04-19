@@ -98,8 +98,8 @@ func TestSelfRepairCandidateLoopRejectsNoOp(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected DecryptSignature to return error when all candidates produce no-op transforms")
 	}
-	if !strings.Contains(err.Error(), "invalid decrypted signature shape") {
-		t.Fatalf("expected 'invalid decrypted signature shape' error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid decrypted s shape") {
+		t.Fatalf("expected 'invalid decrypted s shape' error, got: %v", err)
 	}
 }
 

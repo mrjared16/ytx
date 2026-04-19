@@ -10,6 +10,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mrjared16/ytx/internal/cache"
+	"github.com/mrjared16/ytx/internal/jsextract"
 )
 
 func TestFindSigFunctionName(t *testing.T) {
@@ -150,7 +153,7 @@ var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;
 	cipher := &Cipher{
 		sigFunctionName:   "kS",
 		sigUsesURLWrapper: true,
-		jsCode:            buildWrapperRuntimeJS(playerJS, "kS"),
+		jsCode:            jsextract.BuildWrapperRuntimeJS(playerJS, "kS"),
 		playerJS:          []byte(playerJS),
 	}
 
@@ -176,14 +179,14 @@ var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");o.apply()
 `
 
 	tmpDir := t.TempDir()
-	cm := &CacheManager{cacheDir: tmpDir}
-	cache := &CipherCache{
-		Version:            currentCacheVersion,
+	cm := cache.NewCacheManagerWithDir(tmpDir)
+	cache := &cache.CipherCache{
+		Version:            cache.CurrentCacheVersion,
 		CreatedAt:          time.Now(),
-		ExpiresAt:          time.Now().Add(cacheTTL),
+		ExpiresAt:          time.Now().Add(cache.CacheTTL),
 		SigFunction:        "kS",
 		SigUsesURLWrapper:  true,
-		JSCode:             buildWrapperRuntimeJS(playerJS, "kS"),
+		JSCode:             jsextract.BuildWrapperRuntimeJS(playerJS, "kS"),
 		SignatureTimestamp: 12345,
 	}
 	if err := cm.Save(cache); err != nil {
@@ -239,7 +242,7 @@ var kS = (url, mode, sig) => { var o = new URLObj(sig); o.set("alr", "yes"); ret
 	cipher := &Cipher{
 		sigFunctionName:   "kS",
 		sigUsesURLWrapper: true,
-		jsCode:            buildWrapperRuntimeJS(playerJS, "kS"),
+		jsCode:            jsextract.BuildWrapperRuntimeJS(playerJS, "kS"),
 		playerJS:          []byte(playerJS),
 	}
 
@@ -273,7 +276,7 @@ LI=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");return o;};
 	cipher := &Cipher{
 		sigFunctionName:   "LI",
 		sigUsesURLWrapper: true,
-		jsCode:            buildWrapperRuntimeJS(playerJS, "LI"),
+		jsCode:            jsextract.BuildWrapperRuntimeJS(playerJS, "LI"),
 		playerJS:          []byte(playerJS),
 	}
 
