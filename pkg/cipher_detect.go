@@ -3,6 +3,8 @@ package ytx
 import (
 	"bytes"
 	"time"
+
+	"github.com/mrjared16/ytx/internal/jsextract"
 )
 
 type cipherDetectionResult struct {
@@ -68,7 +70,7 @@ func detectWrapperSignature(js []byte, detail *CipherAnalyzeDetail) (cipherDetec
 	detail.WrapperBuildTier = "unified"
 
 	tBuild := time.Now()
-	wrapperRuntimeJS := buildWrapperRuntimeJS(string(js), result.SigName)
+	wrapperRuntimeJS := jsextract.BuildWrapperRuntimeJS(string(js), result.SigName)
 	if wrapperRuntimeJS == "" {
 		wrapperRuntimeJS = string(js)
 	}

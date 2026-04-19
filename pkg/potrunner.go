@@ -13,6 +13,8 @@ import (
 	"time"
 
 	_ "embed"
+
+	"github.com/mrjared16/ytx/internal/jsengine"
 )
 
 //go:embed po_minter.mjs
@@ -37,24 +39,24 @@ var poRuntimeProbe struct {
 	node string
 }
 
-func resolvePORuntimeBinary(engineType EngineType) (string, error) {
+func resolvePORuntimeBinary(engineType jsengine.EngineType) (string, error) {
 	poRuntimeProbe.once.Do(func() {
 		poRuntimeProbe.bun, _ = exec.LookPath("bun")
 		poRuntimeProbe.node, _ = exec.LookPath("node")
 	})
 
 	switch engineType {
-	case EngineBun:
+	case jsengine.EngineBun:
 		if poRuntimeProbe.bun == "" {
 			return "", fmt.Errorf("bun not found in PATH")
 		}
 		return poRuntimeProbe.bun, nil
-	case EngineNode:
+	case jsengine.EngineNode:
 		if poRuntimeProbe.node == "" {
 			return "", fmt.Errorf("node not found in PATH")
 		}
 		return poRuntimeProbe.node, nil
-	case EngineAuto:
+	case jsengine.EngineAuto:
 		if poRuntimeProbe.bun != "" {
 			return poRuntimeProbe.bun, nil
 		}
@@ -67,7 +69,7 @@ func resolvePORuntimeBinary(engineType EngineType) (string, error) {
 	}
 }
 
-func mintPOTokenWithEngine(ctx context.Context, engineType EngineType, challenge *POTokenChallenge) (string, string, time.Duration, error) {
+func mintPOTokenWithEngine(ctx context.Context, engineType jsengine.EngineType, challenge *POTokenChallenge) (string, string, time.Duration, error) {
 	runtimePath, err := resolvePORuntimeBinary(engineType)
 	if err != nil {
 		return "", "", 0, err

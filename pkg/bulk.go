@@ -78,10 +78,15 @@ func (e *Extractor) prefetchBatchSharedState(ctx context.Context, videoID string
 	go func() {
 		prefetchCtx, cancel := backgroundRefreshContext(ctx, backgroundWarmupTTL)
 		defer cancel()
-		_ = e.fetchVisitorDataContext(prefetchCtx, videoID)
+		if err := e.fetchVisitorDataContext(prefetchCtx, videoID); err != nil {
+			return
+		}
 		cipher, err := e.ensureCipherContext(prefetchCtx, videoID)
-		if err == nil && cipher != nil {
-			_ = cipher.WarmNTransformEngineContext(prefetchCtx)
+		if err != nil || cipher == nil {
+			return
+		}
+		if err := cipher.WarmNTransformEngineContext(prefetchCtx); err != nil {
+			return
 		}
 	}()
 }

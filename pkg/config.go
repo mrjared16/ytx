@@ -43,11 +43,26 @@ func GetDefaultCookiePath() (string, error) {
 
 // CookieFileExists checks if the default cookie file exists
 func CookieFileExists() bool {
-	path, err := GetDefaultCookiePath()
+	exists, err := CookieFileExistsWithError()
 	if err != nil {
 		return false
 	}
+	return exists
+}
+
+// CookieFileExistsWithError checks if the default cookie file exists and returns underlying errors.
+func CookieFileExistsWithError() (bool, error) {
+	path, err := GetDefaultCookiePath()
+	if err != nil {
+		return false, err
+	}
 
 	_, err = os.Stat(path)
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }

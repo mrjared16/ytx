@@ -145,12 +145,28 @@ func testAPIDirectly(videoID, cookieFile string) {
 
 	// Get visitorData
 	watchURL := fmt.Sprintf("https://music.youtube.com/watch?v=%s", videoID)
-	req, _ := http.NewRequest("GET", watchURL, nil)
+	req, err := http.NewRequest(http.MethodGet, watchURL, nil)
+	if err != nil {
+		fmt.Printf("    Failed to build watch request: %v\n", err)
+		return
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Cookie", ytx.BuildCookieHeader(cookies))
-	resp, _ := client.Do(req)
-	body, _ := io.ReadAll(resp.Body)
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("    Watch request failed: %v\n", err)
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		fmt.Printf("    Failed reading watch response: %v\n", err)
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("    Watch returned %d: %s\n", resp.StatusCode, truncate(string(body), 120))
+		return
+	}
 
 	visitorDataRegex := regexp.MustCompile(`"visitorData"\s*:\s*"([^"]+)"`)
 	var visitorData string
@@ -159,15 +175,43 @@ func testAPIDirectly(videoID, cookieFile string) {
 	}
 
 	// Get signatureTimestamp from player.js
-	embedResp, _ := client.Get(fmt.Sprintf("https://www.youtube.com/embed/%s?hl=en", videoID))
-	embedBody, _ := io.ReadAll(embedResp.Body)
+	embedResp, err := client.Get(fmt.Sprintf("https://www.youtube.com/embed/%s?hl=en", videoID))
+	if err != nil {
+		fmt.Printf("    Embed request failed: %v\n", err)
+		return
+	}
+	embedBody, err := io.ReadAll(embedResp.Body)
 	embedResp.Body.Close()
+	if err != nil {
+		fmt.Printf("    Failed reading embed response: %v\n", err)
+		return
+	}
+	if embedResp.StatusCode != http.StatusOK {
+		fmt.Printf("    Embed returned %d: %s\n", embedResp.StatusCode, truncate(string(embedBody), 120))
+		return
+	}
 
 	basejsPattern := regexp.MustCompile(`/s/player/[\w-]+/[\w./-]+/base\.js`)
 	playerPath := basejsPattern.FindString(string(embedBody))
-	playerResp, _ := client.Get("https://www.youtube.com" + playerPath)
-	playerJS, _ := io.ReadAll(playerResp.Body)
+	if playerPath == "" {
+		fmt.Println("    Failed to locate player path in embed response")
+		return
+	}
+	playerResp, err := client.Get("https://www.youtube.com" + playerPath)
+	if err != nil {
+		fmt.Printf("    Player JS request failed: %v\n", err)
+		return
+	}
+	playerJS, err := io.ReadAll(playerResp.Body)
 	playerResp.Body.Close()
+	if err != nil {
+		fmt.Printf("    Failed reading player JS response: %v\n", err)
+		return
+	}
+	if playerResp.StatusCode != http.StatusOK {
+		fmt.Printf("    Player JS returned %d: %s\n", playerResp.StatusCode, truncate(string(playerJS), 120))
+		return
+	}
 
 	stsPattern := regexp.MustCompile(`["']?signatureTimestamp["']?\s*[=:]\\s*(\d+)`)
 	stsMatch := stsPattern.FindSubmatch(playerJS)
@@ -202,10 +246,18 @@ func testAPIDirectly(videoID, cookieFile string) {
 		},
 	}
 
-	jsonBody, _ := json.Marshal(reqBody)
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		fmt.Printf("    Failed to marshal API request: %v\n", err)
+		return
+	}
 	apiURL := "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
 
-	apiReq, _ := http.NewRequest("POST", apiURL, bytes.NewReader(jsonBody))
+	apiReq, err := http.NewRequest(http.MethodPost, apiURL, bytes.NewReader(jsonBody))
+	if err != nil {
+		fmt.Printf("    Failed to build API request: %v\n", err)
+		return
+	}
 	apiReq.Header.Set("Content-Type", "application/json")
 	apiReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	apiReq.Header.Set("Origin", origin)
@@ -218,9 +270,21 @@ func testAPIDirectly(videoID, cookieFile string) {
 	apiReq.Header.Set("X-Youtube-Bootstrap-Logged-In", "true")
 	apiReq.Header.Set("X-Goog-Visitor-Id", visitorData)
 
-	apiResp, _ := client.Do(apiReq)
-	respBody, _ := io.ReadAll(apiResp.Body)
+	apiResp, err := client.Do(apiReq)
+	if err != nil {
+		fmt.Printf("    API request failed: %v\n", err)
+		return
+	}
+	respBody, err := io.ReadAll(apiResp.Body)
 	apiResp.Body.Close()
+	if err != nil {
+		fmt.Printf("    Failed reading API response: %v\n", err)
+		return
+	}
+	if apiResp.StatusCode != http.StatusOK {
+		fmt.Printf("    API returned %d: %s\n", apiResp.StatusCode, truncate(string(respBody), 120))
+		return
+	}
 
 	var result struct {
 		StreamingData struct {
@@ -231,7 +295,10 @@ func testAPIDirectly(videoID, cookieFile string) {
 			} `json:"adaptiveFormats"`
 		} `json:"streamingData"`
 	}
-	json.Unmarshal(respBody, &result)
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		fmt.Printf("    Failed to parse API response: %v\n", err)
+		return
+	}
 
 	fmt.Printf("    Audio itags: ")
 	has141 := false
@@ -301,7 +368,10 @@ func checkCookieStatus(cookieFile string) string {
 
 	// Check for premium by looking at YouTube response
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, _ := http.NewRequest("GET", "https://www.youtube.com/", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://www.youtube.com/", nil)
+	if err != nil {
+		return fmt.Sprintf("REQUEST BUILD ERROR: %v", err)
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Cookie", ytx.BuildCookieHeader(cookies))
 
@@ -310,8 +380,14 @@ func checkCookieStatus(cookieFile string) string {
 		return fmt.Sprintf("REQUEST ERROR: %v", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Sprintf("REQUEST ERROR: status %d", resp.StatusCode)
+	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Sprintf("RESPONSE READ ERROR: %v", err)
+	}
 	bodyStr := string(body)
 
 	if strings.Contains(bodyStr, "YOUTUBE_PREMIUM_LOGO") {
