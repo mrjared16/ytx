@@ -39,6 +39,18 @@ Thumbs.db
 cookie.txt
 cookies.txt
 
+# Local agent/config state
+.codex/
+.env
+.env.*
+!.env.example
+
+# Private keys and cert material
+*.pem
+*.key
+*.p12
+*.pfx
+
 # Temporary files
 *.tmp
 *.log
@@ -48,3 +60,4 @@ release/
 .claude
 .serena
 /.agents/skills
+/.codex
