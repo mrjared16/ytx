@@ -279,15 +279,20 @@ func (e *Extractor) ExtractVideoContext(ctx context.Context, videoID string) (*V
 	}
 
 	result := &VideoResult{
-		VideoURL:  video.URL,
-		AudioURL:  audio.URL,
-		VideoItag: video.Itag,
-		AudioItag: audio.Itag,
-		Width:     video.Width,
-		Height:    video.Height,
-		Title:     playerResp.VideoDetails.Title,
-		Author:    playerResp.VideoDetails.Author,
-		Warnings:  e.warningsForResult(),
+		VideoURL:          video.URL,
+		AudioURL:          audio.URL,
+		VideoItag:         video.Itag,
+		AudioItag:         audio.Itag,
+		Width:             video.Width,
+		Height:            video.Height,
+		Title:             playerResp.VideoDetails.Title,
+		Author:            playerResp.VideoDetails.Author,
+		Warnings:          e.warningsForResult(),
+		chaptersRequested: e.fetchChapters,
+	}
+
+	if e.fetchChapters {
+		result.Chapters = extractChapters(playerResp)
 	}
 
 	// Extract subtitles if requested (from same response - zero extra latency)

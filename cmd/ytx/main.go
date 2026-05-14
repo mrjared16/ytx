@@ -39,6 +39,7 @@ Modes:
 Options:
     --subs              Include subtitles in output (video mode only)
     --sub-langs LANGS   Subtitle languages: "en" (default), "all", or comma-separated (e.g., "en,es,ja")
+    --chapters          Include chapter metadata in output (video mode only)
     --max-height HEIGHT Maximum video height in pixels (e.g., 1080, 720, 480)
     --cookies PATH      Path to Netscape-format cookies.txt (optional, defaults to ~/.config/ytx/cookies.txt)
     --bulk IDS          Comma-separated video IDs for bulk extraction
@@ -49,6 +50,7 @@ Options:
 Output:
     video mode: {"video_url":"...","audio_url":"...","video_itag":137,"audio_itag":251}
     with --subs: {"video_url":"...","audio_url":"...","sub_url":"...","subtitles":[{"url":"...","lang":"en","name":"English"}]}
+    with --chapters: {"video_url":"...","audio_url":"...","chapters":[{"start_time":0,"end_time":150,"title":"Intro"}]}
     music mode: {"url":"...","itag":141,"bitrate":256000,"title":"..."}
     bulk mode:  NDJSON (one JSON per line, streamed)
 
@@ -56,6 +58,7 @@ Examples:
     ytx video hbl2Cuw75oE
     ytx video hbl2Cuw75oE --max-height 1080
     ytx video hbl2Cuw75oE --subs
+    ytx video hbl2Cuw75oE --chapters
     ytx video hbl2Cuw75oE --sub-langs all
     ytx video hbl2Cuw75oE --sub-langs ja,ko
     ytx music hbl2Cuw75oE --cookies ~/cookies.txt
@@ -92,6 +95,7 @@ func handleVideoMode() {
 	var videoID string
 	var profile bool
 	var fetchSubs bool
+	var fetchChapters bool
 	var subLangs string
 	var maxHeight int
 
@@ -102,6 +106,8 @@ func handleVideoMode() {
 			profile = true
 		case "--subs":
 			fetchSubs = true
+		case "--chapters":
+			fetchChapters = true
 		case "--sub-langs":
 			fetchSubs = true // implies --subs
 			if i+1 < len(args) {
@@ -126,7 +132,7 @@ func handleVideoMode() {
 	}
 
 	if videoID == "" {
-		printError("MISSING_VIDEO_ID", "Usage: ytx video VIDEO_ID [--subs] [--sub-langs LANGS] [--max-height HEIGHT] [--profile]", "")
+		printError("MISSING_VIDEO_ID", "Usage: ytx video VIDEO_ID [--subs] [--sub-langs LANGS] [--chapters] [--max-height HEIGHT] [--profile]", "")
 		os.Exit(1)
 	}
 
@@ -157,6 +163,10 @@ func handleVideoMode() {
 		}
 		// nil/empty = use default language (en)
 		extractor.SetFetchSubtitles(langs)
+	}
+
+	if fetchChapters {
+		extractor.SetFetchChapters(true)
 	}
 
 	// Set max height limit if specified

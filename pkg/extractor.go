@@ -37,6 +37,7 @@ type Extractor struct {
 	profile          bool                // enable profiling
 	timings          Timings             // profiling timers
 	fetchSubs        bool                // whether to include subtitles in output
+	fetchChapters    bool                // whether to include chapters in output
 	subLangs         []string            // subtitle languages to fetch (nil = default, empty = all)
 	maxHeight        int                 // max video height (0 = no limit)
 	audioFormat      AudioFormat         // preferred audio format (default: AudioFormatWebm)
@@ -159,6 +160,11 @@ func (e *Extractor) SetProfile(enabled bool) {
 func (e *Extractor) SetFetchSubtitles(langs []string) {
 	e.fetchSubs = true
 	e.subLangs = langs
+}
+
+// SetFetchChapters enables chapter extraction for video mode.
+func (e *Extractor) SetFetchChapters(enabled bool) {
+	e.fetchChapters = enabled
 }
 
 // SetMaxHeight sets the maximum video height (e.g., 1080 for 1080p).

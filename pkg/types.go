@@ -69,6 +69,8 @@ type PlayerResponse struct {
 	PlayabilityStatus PlayabilityStatus `json:"playabilityStatus"`
 	StreamingData     StreamingData     `json:"streamingData"`
 	VideoDetails      VideoDetails      `json:"videoDetails"`
+	PlayerOverlays    json.RawMessage   `json:"playerOverlays,omitempty"`
+	EngagementPanels  json.RawMessage   `json:"engagementPanels,omitempty"`
 	Captions          *CaptionsRenderer `json:"captions,omitempty"`
 }
 
@@ -153,6 +155,13 @@ type Subtitle struct {
 	Lang   string `json:"lang"`
 	Name   string `json:"name"`
 	IsAuto bool   `json:"is_auto,omitempty"`
+}
+
+// Chapter is the ytdl-compatible output format consumed by mpv's ytdl hook.
+type Chapter struct {
+	StartTime float64 `json:"start_time"`
+	EndTime   float64 `json:"end_time,omitempty"`
+	Title     string  `json:"title,omitempty"`
 }
 
 // === CLI OUTPUT ===
@@ -262,9 +271,12 @@ type VideoResult struct {
 	Height    int        `json:"height"`
 	Title     string     `json:"title"`
 	Author    string     `json:"author"`
+	Chapters  []Chapter  `json:"chapters,omitempty"`
 	Subtitles []Subtitle `json:"subtitles,omitempty"`
 	Warnings  []string   `json:"warnings,omitempty"`
 	Timings   *Timings   `json:"timings,omitempty"`
+
+	chaptersRequested bool `json:"-"`
 }
 
 // BulkResult for streaming output

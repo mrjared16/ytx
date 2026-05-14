@@ -67,16 +67,17 @@ ytx video VIDEO_ID
 ytx video VIDEO_ID --max-height 1080    # Limit to 1080p (saves bandwidth)
 ytx video VIDEO_ID --max-height 720     # Limit to 720p
 ytx video VIDEO_ID --subs               # Include subtitles (en by default)
+ytx video VIDEO_ID --chapters           # Include chapter metadata for mpv/players
 ytx video VIDEO_ID --sub-langs all      # Include all available subtitles
 ytx video VIDEO_ID --sub-langs en,es    # Include specific languages
 ```
 
 **Example:**
 ```bash
-ytx video hbl2Cuw75oE --subs
+ytx video VIDEO_ID_WITH_CHAPTERS --subs --chapters
 ```
 
-**Output:**
+**Illustrative output:**
 ```json
 {
   "video_url": "https://...",
@@ -88,6 +89,10 @@ ytx video hbl2Cuw75oE --subs
   "height": 1080,
   "title": "Rick Astley - Never Gonna Give You Up",
   "author": "Rick Astley",
+  "chapters": [
+    {"start_time": 0, "end_time": 42.5, "title": "Intro"},
+    {"start_time": 42.5, "end_time": 95.0, "title": "Verse 1"}
+  ],
   "subtitles": [
     {"url": "https://...", "lang": "en", "name": "English"},
     {"url": "https://...", "lang": "en", "name": "English", "is_auto": true}
@@ -108,6 +113,10 @@ result=$(ytx video hbl2Cuw75oE --subs)
 mpv "$(echo $result | jq -r '.video_url')" \
     --audio-file="$(echo $result | jq -r '.audio_url')" \
     --sub-file="$(echo $result | jq -r '.sub_url')"
+
+# Print chapter metadata for external player integration
+result=$(ytx video MR6KSB6I_60 --chapters)
+echo "$result" | jq '.chapters'
 
 # Load all subtitle tracks
 result=$(ytx video VIDEO_ID --subs)
