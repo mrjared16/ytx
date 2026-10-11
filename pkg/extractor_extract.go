@@ -60,7 +60,11 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 		}
 		cipher, err := e.getCachedCipherContext(ctx, videoID)
 		if err == nil && cipher != nil {
-			// Signal STS as soon as cipher is available (even from cache)
+			// Signal STS as soon as cipher is available (even from cache).
+			// NO extractor diagnostics are written here: this prefetch can
+			// outlive the main goroutine after cancellation, so warnings and
+			// timings ride on the returned cipher and are published by the
+			// main consumer only after it receives the cipher result.
 			select {
 			case stsCh <- cipher.SignatureTimestamp():
 			default:
@@ -113,7 +117,10 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 		}()
 	}
 
-	// Wait briefly for STS (not full cipher) — allows API call to start sooner
+	// Wait for positive STS (not full cipher): the player API may start before
+	// the full cipher init completes. The wait is bound by the caller context;
+	// a 0 signal means the cipher fetch failed, which surfaces the cipher
+	// error below instead of a zero-STS POST.
 	var stsWaitStart time.Time
 	if e.profile {
 		stsWaitStart = time.Now()
@@ -126,9 +133,23 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 	} else {
 		select {
 		case sts = <-stsCh:
-			stsReady = true
-		case <-time.After(stsWaitBudget):
-			sts = 0
+			stsReady = sts > 0
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if !stsReady && e.config.NeedsCookies {
+		// The shared cipher fetch failed (0 signal): propagate its error
+		// instead of POSTing with a zero/invalid signatureTimestamp. The
+		// cipher result is consumed exactly once, here.
+		select {
+		case cipherRes := <-cipherCh:
+			if cipherRes.err != nil {
+				return nil, cipherRes.err
+			}
+			return nil, fmt.Errorf("cipher produced no signatureTimestamp")
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	if e.profile {
@@ -152,17 +173,6 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 	e.earlySTSOverride = sts
 	playerResp, err := e.callPlayerAPIContext(ctx, videoID)
 	e.earlySTSOverride = 0
-	if err != nil && !stsReady {
-		select {
-		case sts = <-stsCh:
-			if sts > 0 {
-				e.earlySTSOverride = sts
-				playerResp, err = e.callPlayerAPIContext(ctx, videoID)
-				e.earlySTSOverride = 0
-			}
-		default:
-		}
-	}
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
 	}
@@ -170,17 +180,41 @@ func (e *Extractor) ExtractContext(ctx context.Context, videoID string) (*Result
 		e.timings.PlayerAPIMs = time.Since(apiStart).Milliseconds()
 	}
 
-	// NOW wait for full cipher (needed for sig/n decryption)
+	// NOW wait for full cipher (needed for sig/n decryption). The receive
+	// always selects the caller context: cancellation stays prompt and never
+	// blocks behind the shared flight.
 	var cipherWaitStart time.Time
 	if e.profile {
 		cipherWaitStart = time.Now()
 	}
-	cipherRes := <-cipherCh
+	var cipherRes cipherResult
+	select {
+	case cipherRes = <-cipherCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if e.profile {
 		e.timings.CipherInitMs = time.Since(cipherWaitStart).Milliseconds()
 		e.timings.CipherPrewarmMs = cipherRes.prewarmMs
 	}
 	if cipherRes.err == nil {
+		// The detached prefetch never writes extractor diagnostics; the
+		// completed cipher carries its creation warnings/timings. Publish
+		// them HERE exactly once, from the main consumer, only after this
+		// receive succeeded — so a canceled extractor never leaves partial
+		// writes and the concurrently-written visitor warning stays race-free.
+		if cipherRes.cipher != nil {
+			e.absorbCipherWarnings(cipherRes.cipher)
+			if cipherRes.cipher.PlayerJSFetchMs > 0 {
+				e.timings.PlayerJSFetchMs = cipherRes.cipher.PlayerJSFetchMs
+			}
+			if cipherRes.cipher.CipherAnalyzeMs > 0 {
+				e.timings.CipherAnalyzeMs = cipherRes.cipher.CipherAnalyzeMs
+			}
+			if cipherRes.cipher.AnalyzeDetail != nil {
+				e.timings.CipherDetail = cipherRes.cipher.AnalyzeDetail
+			}
+		}
 		e.cipherMu.Lock()
 		e.cipher = cipherRes.cipher
 		e.cipherMu.Unlock()

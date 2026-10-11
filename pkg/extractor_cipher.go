@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mrjared16/ytx/internal/cache"
+	"github.com/mrjared16/ytx/internal/jsengine"
 )
 
 // getCachedCipher returns a cached cipher or creates a new one
@@ -44,23 +45,84 @@ func (e *Extractor) getCachedCipherContext(ctx context.Context, videoID string) 
 				fresh := e.cacheManager.IsFresh(cache)
 				staleWithinGrace := !fresh && now.Before(cache.ExpiresAt.Add(cipherSWRGrace))
 				if fresh || staleWithinGrace {
+					// Load the cached bundle EXACTLY ONCE: the same bytes
+					// feed the identity validation and the modern/legacy
+					// hydration below, so a validator-vs-hydrator reload can
+					// never mix bytes from two different bundles.
+					playerJS, perr := e.cacheManager.LoadPlayerJS()
+					bundleValid := perr == nil && len(playerJS) > 0
+					// Identity validation: when the cached bundle is present, it
+					// must be the exact player the metadata describes. The full-
+					// content fingerprint already derived from the bundle must
+					// match the metadata; a positive bundle STS must match the
+					// metadata STS; and URL-wrapper (music) caches additionally
+					// require positive STS corroboration, so a stale or missing
+					// STS is never used. Old sampled-region fingerprints never
+					// match the full digest and migrate with one explicit refetch;
+					// bundle-less legacy caches keep the existing gates.
+					if bundleValid {
+						fp := computePlayerFingerprint(playerJS)
+						derivedSTS := findSignatureTimestamp(playerJS)
+						identityOK := cache.PlayerFingerprint != "" && cache.PlayerFingerprint == fp
+						if identityOK && derivedSTS > 0 {
+							identityOK = cache.SignatureTimestamp == derivedSTS
+						}
+						if identityOK && cache.SigUsesURLWrapper && urlWrapperDiscover(playerJS).status != urlWrapperDiscoveryAbsent {
+							identityOK = cache.SignatureTimestamp > 0 && derivedSTS > 0
+						}
+						if !identityOK {
+							_ = e.cacheManager.InvalidateCipherArtifacts()
+							goto fetchFreshCipher
+						}
+					}
 					cipher := NewCipherFromCacheWithRuntime(e.runtime, cache)
-					if nRuntimeJS, err := e.cacheManager.LoadNRuntimeJS(); err == nil {
-						cipher.nRuntimeJS = nRuntimeJS
+
+					// Modern URL-wrapper protocol: derive and revalidate from
+					// the cached player bundle without refetch or purge.
+					// Cached n=xp values and QuickJS wrapper bytecode are
+					// discarded for this mode; the runner source is rebuilt
+					// from the cached player JS instead.
+					modern := false
+					if cache.SigUsesURLWrapper {
+						if bundleValid {
+							cipher.playerJS = playerJS
+							disc := urlWrapperDiscover(playerJS)
+							// Ambiguous candidates are fail-closed here too:
+							// do not silently reuse legacy QuickJS/global-scan
+							// paths for a suspicious player — refetch.
+							if disc.status == urlWrapperDiscoveryAmbiguous {
+								_ = e.cacheManager.InvalidateCipherArtifacts()
+								goto fetchFreshCipher
+							}
+							if disc.status == urlWrapperDiscoveryFound {
+								modern = true
+								cipher.urlWrapperProtocol = true
+								cipher.urlWrapperName = disc.name
+								cipher.sigFunctionName = disc.name // revalidate cached name
+								cipher.nFunctionName = ""          // discard cached n=xp
+								cipher.jsCode = ""
+								cipher.isBytecode = false
+							}
+						}
 					}
 
-					needPlayerJS := cache.SigUsesURLWrapper || cache.JSCode == "" || (cache.NFunction != "" && len(cipher.nRuntimeJS) == 0)
-					if needPlayerJS {
-						if playerJS, err := e.cacheManager.LoadPlayerJS(); err == nil {
+					if !modern {
+						if nRuntimeJS, err := e.cacheManager.LoadNRuntimeJS(); err == nil {
+							cipher.nRuntimeJS = nRuntimeJS
+						}
+
+						needPlayerJS := cache.SigUsesURLWrapper || cache.JSCode == "" || (cache.NFunction != "" && len(cipher.nRuntimeJS) == 0)
+						if needPlayerJS && len(cipher.playerJS) == 0 && bundleValid {
 							cipher.playerJS = playerJS
 						}
-					}
-					if cache.SigUsesURLWrapper && cache.WrapperBuildID == currentWrapperBytecodeBuildID() {
-						if wrapperBytecode, err := e.cacheManager.LoadWrapperRuntimeBytecode(); err == nil && len(wrapperBytecode) > 0 {
-							cipher.jsCode = string(wrapperBytecode)
-							cipher.isBytecode = true
+						if cache.SigUsesURLWrapper && cache.WrapperBuildID == currentWrapperBytecodeBuildID() {
+							if wrapperBytecode, err := e.cacheManager.LoadWrapperRuntimeBytecode(); err == nil && len(wrapperBytecode) > 0 {
+								cipher.jsCode = string(wrapperBytecode)
+								cipher.isBytecode = true
+							}
 						}
 					}
+
 					if cache.SigUsesURLWrapper && len(cipher.playerJS) == 0 {
 						_ = e.cacheManager.InvalidateCipherArtifacts()
 						goto fetchFreshCipher
@@ -78,15 +140,40 @@ func (e *Extractor) getCachedCipherContext(ctx context.Context, videoID string) 
 		}
 	}
 
-	// 3. Fetch fresh cipher (singleflighted).
+	// 3. Fetch fresh cipher: caller-cancel-safe, shared singleflight.
 fetchFreshCipher:
-	v, err, _ := e.runtime.cipherGroup.Do("shared", func() (any, error) {
-		return e.fetchAndCacheCipherContext(ctx, videoID)
-	})
-	if err != nil {
-		return nil, err
+	return e.sharedCipherFetch(ctx, videoID)
+}
+
+// cipherFetchTimeout bounds one shared cipher-fetch flight.
+const cipherFetchTimeout = 30 * time.Second
+
+// sharedCipherFetch starts or joins THE shared cipher-fetch flight for the
+// runtime: the flight runs exactly once under a bounded, caller-detached
+// context, so one caller's cancellation can never abort the shared work or
+// fail a joiner. Callers select on their own cancellation versus the flight
+// result and check cancellation both before registering and after receiving.
+func (e *Extractor) sharedCipherFetch(ctx context.Context, videoID string) (*Cipher, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	return v.(*Cipher), nil
+	ch := e.runtime.cipherGroup.DoChan("shared", func() (any, error) {
+		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cipherFetchTimeout)
+		defer cancel()
+		return e.fetchAndCacheCipherContext(flightCtx, videoID)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.(*Cipher), nil
+	}
 }
 
 func (e *Extractor) ensureCipherContext(ctx context.Context, videoID string) (*Cipher, error) {
@@ -144,23 +231,11 @@ func (e *Extractor) fetchAndCacheCipherContext(ctx context.Context, videoID stri
 				fmt.Sprintf("player path changed from %s to %s; cache refreshed via slow path", previousCache.BaseJSPath, playerPath))
 		}
 	}
-	e.absorbCipherWarnings(cipher)
 	if cipher.canPrecomputeSignatureRuntime() {
 		if err := cipher.ensureSignatureReady(); err != nil {
 			cipher.warnings = append(cipher.warnings,
 				fmt.Sprintf("failed to precompute signature runtime during cache warmup: %v", err))
-			e.absorbCipherWarnings(cipher)
 		}
-	}
-
-	if cipher.PlayerJSFetchMs > 0 {
-		e.timings.PlayerJSFetchMs = cipher.PlayerJSFetchMs
-	}
-	if cipher.CipherAnalyzeMs > 0 {
-		e.timings.CipherAnalyzeMs = cipher.CipherAnalyzeMs
-	}
-	if cipher.AnalyzeDetail != nil {
-		e.timings.CipherDetail = cipher.AnalyzeDetail
 	}
 
 	expiry := time.Now().Add(cache.CacheTTL)
@@ -170,7 +245,7 @@ func (e *Extractor) fetchAndCacheCipherContext(ctx context.Context, videoID stri
 	if e.cacheManager != nil {
 		cacheData := cipher.ToCache()
 		cacheData.BaseJSPath = playerPath // Store base.js path for next time
-		if cipher.sigUsesURLWrapper {
+		if cipher.sigUsesURLWrapper && !cipher.isModernURLWrapperProtocol() {
 			if wrapperBytecode, err := cipher.wrapperRuntimeBytecode(); err == nil && len(wrapperBytecode) > 0 {
 				cacheData.WrapperBuildID = currentWrapperBytecodeBuildID()
 				_ = e.cacheManager.SaveWrapperRuntimeBytecode(wrapperBytecode)
@@ -193,10 +268,10 @@ func (e *Extractor) fetchAndCacheCipherContext(ctx context.Context, videoID stri
 
 // invalidateCipherCache clears both in-memory and file caches
 func (e *Extractor) invalidateCipherCache() {
-	var oldKey string
+	var oldKeys []string
 	e.runtime.cipherCache.Lock()
 	if e.runtime.cipherCache.cipher != nil {
-		oldKey = e.runtime.cipherCache.cipher.engineCacheKey()
+		oldKeys = e.runtime.cipherCache.cipher.engineCacheKeys()
 		e.runtime.cipherCache.cipher.Close()
 	}
 	e.runtime.cipherCache.cipher = nil
@@ -204,8 +279,8 @@ func (e *Extractor) invalidateCipherCache() {
 	e.runtime.cipherCache.updated = time.Time{}
 	e.runtime.cipherCache.Unlock()
 
-	if oldKey != "" {
-		e.runtime.CloseCachedEngineKey(oldKey)
+	for _, key := range oldKeys {
+		e.runtime.CloseCachedEngineKey(key)
 	}
 
 	if e.cacheManager != nil {
@@ -231,6 +306,19 @@ func (e *Extractor) getStreamURL(videoID string, stream *Format) (string, error)
 }
 
 func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, stream *Format) (string, error) {
+	// Modern URL-wrapper protocol: a single TransformURLContext operation
+	// produces the validated signature and n (plus the alr marker), replacing
+	// the separate decrypt and n-transform loops. Only a DIRECT (non-empty)
+	// stream URL takes this early path; a signature-only Format falls through
+	// to the strict SignatureCipher parse and the equal modern branch below.
+	if e.cipher != nil && e.cipher.isModernURLWrapperProtocol() && stream.URL != "" {
+		streamURL, err := e.getStreamURLModernContext(ctx, e.cipher, stream.URL, "sig", "")
+		if err != nil {
+			return "", err
+		}
+		return e.applyPOToken(streamURL), nil
+	}
+
 	// If URL is directly available (pre-signed), use it
 	if stream.URL != "" {
 		streamURL, err := e.unthrottleContext(ctx, videoID, stream.URL)
@@ -274,6 +362,14 @@ func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, str
 		return "", fmt.Errorf("failed to initialize cipher: %w", err)
 	}
 
+	if e.cipher != nil && e.cipher.isModernURLWrapperProtocol() {
+		streamURL, err := e.getStreamURLModernContext(ctx, e.cipher, baseURL, sigParam, sig)
+		if err != nil {
+			return "", err
+		}
+		return e.applyPOToken(streamURL), nil
+	}
+
 	// Decrypt signature with fail-forward retry
 	var sigDecryptStart time.Time
 	if e.profile {
@@ -294,13 +390,18 @@ func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, str
 		e.persistCipherArtifacts()
 	}
 
-	// Add decrypted signature to URL
+	// Add decrypted signature to URL. The query is parsed STRICTLY: a
+	// malformed escape (e.g. keep=%ZZ) is an explicit error — never a
+	// silently rebuilt URL with unrelated parameters dropped.
 	parsedURL, err := url.Parse(baseURL)
 	if err != nil {
 		return "", err
 	}
 
-	query := parsedURL.Query()
+	query, err := url.ParseQuery(parsedURL.RawQuery)
+	if err != nil {
+		return "", fmt.Errorf("malformed query in stream URL: %v", err)
+	}
 	query.Set(sigParam, decryptedSig)
 	parsedURL.RawQuery = query.Encode()
 
@@ -311,6 +412,63 @@ func (e *Extractor) getStreamURLContext(ctx context.Context, videoID string, str
 	}
 
 	return e.applyPOToken(streamURL), nil
+}
+
+// getStreamURLModernContext applies the modern URL-wrapper protocol to a
+// stream URL: one TransformURLContext call, with validated Signature/N
+// applied via url.Values.Set once and the alr marker propagated when the
+// wrapper returned one. The original parsed URL/query is preserved; when
+// nothing changed the base URL is returned byte-exact. The query is parsed
+// STRICTLY BEFORE the runner call: a malformed query is an explicit error
+// and never reaches the subprocess.
+func (e *Extractor) getStreamURLModernContext(ctx context.Context, cipher *Cipher, baseURL, sigParam, sig string) (string, error) {
+	parsedURL, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	query, err := url.ParseQuery(parsedURL.RawQuery)
+	if err != nil {
+		return "", fmt.Errorf("malformed query in stream URL: %v", err)
+	}
+
+	res, err := cipher.TransformURLContext(ctx, baseURL, sigParam, sig)
+	if err != nil {
+		return "", err
+	}
+
+	changed := false
+
+	if sig != "" {
+		if res.Signature == "" {
+			return "", fmt.Errorf("url wrapper returned empty signature for input signature")
+		}
+		if !saneDecryptedSignature(sig, res.Signature) {
+			return "", fmt.Errorf("invalid decrypted signature shape from url wrapper: %q", res.Signature)
+		}
+		query.Set(sigParam, res.Signature)
+		changed = true
+	}
+	if nParam := query.Get("n"); nParam != "" {
+		if res.N == "" {
+			return "", fmt.Errorf("url wrapper returned empty n for input n parameter")
+		}
+		validated, err := jsengine.ValidateNTransformResult(nParam, res.N)
+		if err != nil {
+			return "", err
+		}
+		query.Set("n", validated)
+		changed = true
+	}
+	if res.ALR != "" {
+		query.Set("alr", res.ALR)
+		changed = true
+	}
+
+	if !changed {
+		return baseURL, nil
+	}
+	parsedURL.RawQuery = query.Encode()
+	return parsedURL.String(), nil
 }
 
 func (e *Extractor) warningsForResult() []string {
@@ -359,33 +517,46 @@ func (e *Extractor) persistCipherArtifacts() {
 }
 
 func (e *Extractor) storeCipherCache(cipher *Cipher, expiry time.Time) {
-	var oldEngineKey string
-	var newEngineKey string
+	var oldKeys []string
+	var newKeys []string
 	if cipher != nil {
-		newEngineKey = cipher.engineCacheKey()
+		newKeys = cipher.engineCacheKeys()
 	}
 
 	e.runtime.cipherCache.Lock()
 	if e.runtime.cipherCache.cipher != nil {
-		oldEngineKey = e.runtime.cipherCache.cipher.engineCacheKey()
+		oldKeys = e.runtime.cipherCache.cipher.engineCacheKeys()
 	}
 	e.runtime.cipherCache.cipher = cipher
 	e.runtime.cipherCache.expiry = expiry
 	e.runtime.cipherCache.updated = time.Now()
 	e.runtime.cipherCache.Unlock()
 
-	if oldEngineKey != "" && oldEngineKey != newEngineKey {
-		e.runtime.CloseCachedEngineKey(oldEngineKey)
+	for _, oldKey := range oldKeys {
+		stillOwned := false
+		for _, newKey := range newKeys {
+			if newKey == oldKey {
+				stillOwned = true
+				break
+			}
+		}
+		if !stillOwned {
+			e.runtime.CloseCachedEngineKey(oldKey)
+		}
 	}
 }
 
 func (e *Extractor) refreshCipherAsync(parent context.Context, videoID string) {
 	go func() {
+		// A canceled parent must not drop the scheduled refresh: derive the
+		// caller-local wait context with the parent's cancellation stripped
+		// (and warmup bounded) BEFORE the shared fetch registers, so the
+		// foreground pre-registration cancel check is never tripped by the
+		// parent's end state. The flight itself stays detached under
+		// cipherFetchTimeout inside sharedCipherFetch.
 		ctx, cancel := backgroundRefreshContext(parent, backgroundWarmupTTL)
 		defer cancel()
-		_, _, _ = e.runtime.cipherGroup.Do("shared", func() (any, error) {
-			return e.fetchAndCacheCipherContext(ctx, videoID)
-		})
+		_, _ = e.sharedCipherFetch(ctx, videoID)
 	}()
 }
 
@@ -474,9 +645,13 @@ func (e *Extractor) unthrottleContext(ctx context.Context, videoID, streamURL st
 		return "", err
 	}
 
-	query := parsedURL.Query()
-	nParam := query.Get("n")
-	if nParam == "" {
+	// Strict parse BEFORE any cipher work: a malformed query is an explicit
+	// error and never silently rebuilt.
+	query, err := url.ParseQuery(parsedURL.RawQuery)
+	if err != nil {
+		return "", fmt.Errorf("malformed query in stream URL: %v", err)
+	}
+	if query.Get("n") == "" {
 		// No n-parameter, return as-is
 		return streamURL, nil
 	}
@@ -487,12 +662,24 @@ func (e *Extractor) unthrottleContext(ctx context.Context, videoID, streamURL st
 		return streamURL, nil
 	}
 
+	// Modern URL-wrapper protocol initialized lazily by this call (e.g. a
+	// direct URL arriving before any cipher was loaded): route through the
+	// full URL transform and propagate failures strictly. There is no silent
+	// untransformed-URL output on the modern path.
+	if cipher.isModernURLWrapperProtocol() {
+		transformed, err := e.getStreamURLModernContext(ctx, cipher, streamURL, "sig", "")
+		if err != nil {
+			return "", err
+		}
+		return transformed, nil
+	}
+
 	// Transform n-parameter
 	var transformStart time.Time
 	if e.profile {
 		transformStart = time.Now()
 	}
-	transformedN, err := cipher.TransformNContext(ctx, nParam)
+	transformedN, err := cipher.TransformNContext(ctx, query.Get("n"))
 	if e.profile {
 		e.timings.NTransformMs += time.Since(transformStart).Milliseconds()
 	}

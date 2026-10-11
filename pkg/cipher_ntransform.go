@@ -2,10 +2,10 @@ package ytx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/mrjared16/ytx/internal/jsextract"
@@ -30,6 +30,9 @@ func (c *Cipher) ensureNRuntime() ([]byte, error) {
 }
 
 func (c *Cipher) WarmNTransformEngineContext(ctx context.Context) error {
+	if c.isModernURLWrapperProtocol() {
+		return nil // modern protocol warms the URL wrapper runner instead
+	}
 	if c.nFunctionName == "" {
 		return nil
 	}
@@ -47,6 +50,9 @@ func (c *Cipher) TransformN(n string) (string, error) {
 }
 
 func (c *Cipher) TransformNContext(ctx context.Context, n string) (string, error) {
+	if c.isModernURLWrapperProtocol() {
+		return c.transformNModernContext(ctx, n)
+	}
 	if c.nFunctionName == "" {
 		if c.sigUsesURLWrapper {
 			return c.tryWrapperCandidates(n, "n")
@@ -75,6 +81,19 @@ func (c *Cipher) TransformNContext(ctx context.Context, n string) (string, error
 }
 
 func (c *Cipher) TransformNBatchContext(ctx context.Context, nValues []string) ([]string, error) {
+	if c.isModernURLWrapperProtocol() {
+		// The URL-wrapper protocol has no batch IPC; transform serially and
+		// strictly (no silent passthrough of untransformed values).
+		results := make([]string, len(nValues))
+		for i, n := range nValues {
+			out, err := c.transformNModernContext(ctx, n)
+			if err != nil {
+				return nValues, err
+			}
+			results[i] = out
+		}
+		return results, nil
+	}
 	if len(nValues) == 0 {
 		return nValues, nil
 	}
@@ -152,34 +171,18 @@ func (c *Cipher) TransformNBatch(nValues []string) ([]string, error) {
 	return c.TransformNBatchContext(context.Background(), nValues)
 }
 
+// computePlayerFingerprint returns a full-content identity for the player
+// bundle: every byte is hashed, so equal-length bundles differing anywhere
+// get distinct identities. Old sampled-region fingerprints (fnv, 16 hex
+// digits) never match this 64-hex digest and migrate with one explicit
+// refetch by the cipher bootstrap gate instead of silent trust.
 func computePlayerFingerprint(playerJS []byte) string {
 	if len(playerJS) == 0 {
 		return ""
 	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(strconv.Itoa(len(playerJS))))
-	_, _ = h.Write([]byte{0})
-	sample := func(chunk []byte) {
-		if len(chunk) == 0 {
-			return
-		}
-		_, _ = h.Write(chunk)
-		_, _ = h.Write([]byte{0})
-	}
-	const edge = 2048
-	sample(playerJS[:min(len(playerJS), edge)])
-	if len(playerJS) > edge*2 {
-		mid := len(playerJS) / 2
-		start := max(0, mid-edge/2)
-		end := min(len(playerJS), start+edge)
-		sample(playerJS[start:end])
-	}
-	if len(playerJS) > edge {
-		sample(playerJS[max(0, len(playerJS)-edge):])
-	}
-	return fmt.Sprintf("%016x", h.Sum64())
+	sum := sha256.Sum256(playerJS)
+	return hex.EncodeToString(sum[:])
 }
-
 func buildNTransformRuntime(playerJS []byte, funcName string) []byte {
 	if len(playerJS) == 0 || funcName == "" {
 		return nil

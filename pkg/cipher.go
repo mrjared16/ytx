@@ -167,7 +167,18 @@ func analyzePlayerJSPhase(res *playerJSPhaseResult, detail *CipherAnalyzeDetail,
 	var ok bool
 	playerJS := res.JS
 
-	if result, ok = detectFastSignature(playerJS, detail); ok {
+	// Tier 0: modern URL-wrapper protocol (bounded marker discovery, no
+	// global scans, no AST/bytecode build). n is produced by the wrapper
+	// getter, so global n discovery is skipped for this mode. Ambiguous
+	// candidates are fail-closed: no legacy fallback, no global scan, no
+	// QuickJS for this player.
+	uw := urlWrapperDetect(playerJS, detail)
+	if uw.ambiguous {
+		return analyzePhaseResult{}, errors.New("ambiguous url wrapper protocol candidates in player JS; refusing legacy fallback")
+	}
+	if uw.detected {
+		result = uw.result
+	} else if result, ok = detectFastSignature(playerJS, detail); ok {
 
 	} else if result, ok = detectWrapperSignature(playerJS, detail); ok {
 
@@ -179,7 +190,9 @@ func analyzePlayerJSPhase(res *playerJSPhaseResult, detail *CipherAnalyzeDetail,
 		}
 	}
 
-	result.NName = detectNFunction(playerJS, result.SigUsesURLWrapper, detail)
+	if !result.URLWrapperProtocol {
+		result.NName = detectNFunction(playerJS, result.SigUsesURLWrapper, detail)
+	}
 	if result.SigName == "" && result.NName == "" {
 		return analyzePhaseResult{}, errors.New("failed to detect signature and n transform functions")
 	}
@@ -202,6 +215,27 @@ func analyzeFallbackPlayerJSPhase(res *playerJSPhaseResult, detail *CipherAnalyz
 	var result cipherDetectionResult
 	var err error
 	playerJS := res.JS
+
+	// Tier 0 also applies to the refetch path: a modern wrapper recognized
+	// here bypasses the legacy global fallbacks identically to the primary
+	// path, and ambiguity stays fail-closed.
+	uw := urlWrapperDetect(playerJS, detail)
+	if uw.ambiguous {
+		return analyzePhaseResult{}, errors.New("ambiguous url wrapper protocol candidates in player JS; refusing legacy fallback")
+	}
+	if uw.detected {
+		tSts := time.Now()
+		sts := findSignatureTimestamp(playerJS)
+		detail.StsMs = time.Since(tSts).Milliseconds()
+
+		return analyzePhaseResult{
+			Result:    uw.result,
+			JS:        playerJS,
+			Path:      res.Path,
+			STS:       sts,
+			AnalyzeMs: time.Since(t2).Milliseconds(),
+		}, nil
+	}
 
 	tSigRetry := time.Now()
 	result.SigName, result.SigParam, err = findSigFunctionName(playerJS)
@@ -323,13 +357,23 @@ func newCipherWithCachedPathContext(ctx context.Context, runtime *Runtime, video
 		AnalyzeDetail:      detail,
 	}
 
+	if analyzeRes.Result.URLWrapperProtocol {
+		cipher.urlWrapperProtocol = true
+		cipher.urlWrapperName = analyzeRes.Result.SigName
+		// The modern protocol creates its own subprocess runner and never
+		// consumes the legacy pre-spawned one; release it instead of
+		// leaving an idle process behind (overlap for legacy is preserved
+		// because only this modern outcome discards it).
+		runtime.DiscardPreSpawnedRunner()
+	}
+
 	if detail.SigTier == "global_fallback" || detail.NFuncTier == "global_fallback" {
 		cipher.warnings = append(cipher.warnings, fmt.Sprintf(
 			"cipher detection degraded (sig=%s nfunc=%s markers_missed=%v) — consider updating patterns",
 			detail.SigTier, detail.NFuncTier, detail.MarkerMiss))
 	}
 
-	if cipher.sigUsesURLWrapper && cipher.jsCode != "" {
+	if cipher.sigUsesURLWrapper && !cipher.isModernURLWrapperProtocol() && cipher.jsCode != "" {
 		if bytecode, err := compileToQuickJSBytecode(cipher.jsCode); err == nil {
 			cipher.jsCode = string(bytecode)
 			cipher.isBytecode = true
@@ -405,4 +449,19 @@ func (c *Cipher) engineCacheKey() string {
 		return c.playerURL
 	}
 	return c.playerURL + "#" + c.playerFingerprint
+}
+
+// engineCacheKeys returns every runtime engine-cache key this cipher can
+// own: the legacy player-identity key plus, for the modern URL-wrapper
+// protocol, the wrapper runner key. Used by cache rotation/eviction so a
+// closed-in or rotated-out cipher also closes its modern subprocess runner.
+func (c *Cipher) engineCacheKeys() []string {
+	keys := make([]string, 0, 2)
+	if key := c.engineCacheKey(); key != "" {
+		keys = append(keys, key)
+	}
+	if c.isModernURLWrapperProtocol() {
+		keys = append(keys, urlWrapperRunnerCacheKey(c.playerURL, c.playerFingerprint, c.urlWrapperName))
+	}
+	return keys
 }

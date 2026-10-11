@@ -1,6 +1,7 @@
 package ytx
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -110,7 +111,7 @@ func (c *Cipher) wrapperRuntimeBytecode() ([]byte, error) {
 }
 
 func (c *Cipher) canPrewarmSignatureRuntime() bool {
-	return c.jsCode != ""
+	return c.jsCode != "" && !c.isModernURLWrapperProtocol()
 }
 
 // Prewarm spins up the QuickJS runtime aggressively ahead of time.
@@ -165,6 +166,9 @@ func (c *Cipher) ensureSignatureReady() error {
 
 // DecryptSignature decrypts the signature.
 func (c *Cipher) DecryptSignature(sig string) (string, error) {
+	if c.isModernURLWrapperProtocol() {
+		return c.decryptSignatureModern(sig)
+	}
 
 	if c.sigUsesURLWrapper {
 		return c.tryWrapperCandidates(sig, "s")
@@ -217,6 +221,26 @@ func saneDecryptedSignature(input, output string) bool {
 		return false
 	}
 	return true
+}
+
+// decryptSignatureModern decrypts a signature via the modern URL-wrapper
+// protocol. Strict: failures return explicit errors — never a silent
+// passthrough and never a legacy QuickJS fallback.
+func (c *Cipher) decryptSignatureModern(sig string) (string, error) {
+	if sig == "" {
+		return "", errors.New("cannot decrypt empty signature")
+	}
+	res, err := c.TransformURLContext(context.Background(), urlWrapperSyntheticURL, "s", sig)
+	if err != nil {
+		return "", err
+	}
+	if res.Signature == "" {
+		return "", errors.New("url wrapper returned empty signature")
+	}
+	if !saneDecryptedSignature(sig, res.Signature) {
+		return "", fmt.Errorf("invalid decrypted signature shape from url wrapper")
+	}
+	return res.Signature, nil
 }
 
 // ensureWrapperContext bootstraps a QuickJS runtime with the given jsCode,
