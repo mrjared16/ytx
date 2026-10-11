@@ -88,10 +88,14 @@ function loadFunction(code, funcName, prepared = false) {
             : code.replace(/\}\)\(_yt_player\);\s*$/, `_exposed['${funcName}']=${funcName};})(_yt_player);`);
         runInContext(modifiedCode, context, { timeout: 30000 });
 
-        if (!context._exposed[funcName]) {
-            return JSON.stringify({ error: `Function ${funcName} not found after loading` });
+        // Loading must yield an actual function (unary n-transform and URL
+        // wrapper loads behave the same); a truthy non-function exposure is a
+        // load failure, never an acceptable call target.
+        const exposed = context._exposed[funcName];
+        if (typeof exposed !== 'function') {
+            return JSON.stringify({ error: `Function ${funcName} is not a function after loading (got ${typeof exposed})` });
         }
-        nFunc = context._exposed[funcName];
+        nFunc = exposed;
         return JSON.stringify({ success: true });
     } catch (err) {
         return JSON.stringify({ error: err.message });
@@ -139,6 +143,115 @@ function batchTransform(nValues) {
     }
 }
 
+// Read one field from a URL-wrapper result object. Missing fields (undefined
+// or null) are reported as null; a getter that throws is a hard failure and
+// propagates to the caller as an explicit error.
+function readWrapperKey(result, key) {
+    const v = result.get(key);
+    if (v === undefined || v === null) {
+        return null;
+    }
+    if (typeof v !== 'string') {
+        throw new Error(`wrapper get('${key}') returned non-string value`);
+    }
+    return v;
+}
+
+// URL-wrapper protocol limits: individual result fields and the whole frame
+// are capped here, always below the Go-side frame cap (urlResponseMaxFrame),
+// so the runner never emits an over-long or unterminated line. The Go side
+// keeps its cap as a defense-in-depth termination bound.
+const URL_FIELD_MAX = 16 * 1024;
+const URL_FRAME_MAX = 60 * 1024;
+
+// Build a byte-bounded error frame. A length-only cap is not enough:
+// JSON.stringify expands control characters to six-byte \uXXXX escapes and
+// multibyte characters beyond their string length, so a message sliced to
+// URL_FIELD_MAX can still serialize over the wire limit — and a frame over
+// the Go-side cap terminates the runner, turning a plain JS error into a
+// fatal one. Halve the message until the serialized frame fits URL_FRAME_MAX
+// (kept under the Go cap with room for the trailing newline); the '...'
+// marker keeps truncation visible while the message head preserves the
+// original error context.
+function boundedErrorFrame(msg) {
+    let text = (msg && msg.message !== undefined) ? msg.message : String(msg);
+    if (text.length > URL_FIELD_MAX) {
+        text = text.slice(0, URL_FIELD_MAX) + '...';
+    }
+    let frame = JSON.stringify({ error: text });
+    while (Buffer.byteLength(frame, 'utf8') > URL_FRAME_MAX) {
+        text = text.slice(0, Math.floor(text.length / 2)) + '...';
+        frame = JSON.stringify({ error: text });
+    }
+    return frame;
+}
+
+// URL-wrapper protocol call. Invokes the loaded wrapper as
+// wrapper(streamURL, signatureParam, sig) where sig is encodeURIComponent'd
+// exactly once (or undefined when the signature is absent). Reads get('n')
+// only when the input URL carries an n parameter, get(signatureParam) only
+// when a signature was passed, and decodes the returned signature exactly
+// once with decodeURIComponent. get('alr') is always read (YouTube always
+// provides it). Optional missing fields are omitted; a requested signature
+// that the wrapper fails to return is an explicit error, as are failed
+// getters and fields over the size limit.
+function urlCall(streamURL, signatureParam, signature) {
+    try {
+        if (typeof nFunc !== 'function') {
+            return JSON.stringify({ error: 'No function loaded' });
+        }
+        const hasSig = (typeof signature === 'string') && signature !== '';
+        const third = hasSig ? encodeURIComponent(signature) : undefined;
+        const result = nFunc(streamURL, signatureParam, third);
+        if (result === null || typeof result !== 'object') {
+            return JSON.stringify({ error: 'URL wrapper returned non-object result' });
+        }
+        if (typeof result.get !== 'function') {
+            return JSON.stringify({ error: 'URL wrapper object lacks getter' });
+        }
+
+        let parsed;
+        try {
+            parsed = new URL(streamURL);
+        } catch (err) {
+            return JSON.stringify({ error: `Invalid stream URL: ${err.message}` });
+        }
+
+        const out = {};
+        if (parsed.searchParams.has('n')) {
+            const nValue = readWrapperKey(result, 'n');
+            if (nValue !== null) {
+                out.n = nValue;
+            }
+        }
+        if (hasSig) {
+            const sigValue = readWrapperKey(result, signatureParam);
+            if (sigValue === null || sigValue === '') {
+                throw new Error(`URL wrapper did not return signature under '${signatureParam}'`);
+            }
+            out.sig = decodeURIComponent(sigValue);
+        }
+        const alrValue = readWrapperKey(result, 'alr');
+        if (alrValue !== null) {
+            out.alr = alrValue;
+        }
+        for (const key of Object.keys(out)) {
+            if (out[key].length > URL_FIELD_MAX) {
+                throw new Error(`wrapper get('${key}') value exceeds field limit`);
+            }
+        }
+        const frame = JSON.stringify(out);
+        // Byte-bound the serialized frame: .length counts UTF-16 units, so
+        // multibyte fields within the field cap can still exceed the wire cap.
+        if (Buffer.byteLength(frame, 'utf8') > URL_FRAME_MAX) {
+            throw new Error('url response exceeds frame limit');
+        }
+        return frame;
+    } catch (err) {
+        return boundedErrorFrame(err);
+    }
+}
+
 // Handle stdin/stdout communication
 const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 
@@ -154,6 +267,8 @@ rl.on('line', (line) => {
             result = callFunction(data.args || []);
         } else if (data.type === 'batch') {
             result = batchTransform(data.values || []);
+        } else if (data.type === 'url_call') {
+            result = urlCall(data.path || '', data.fun || '', (data.values && data.values.length > 0) ? data.values[0] : '');
         } else {
             result = JSON.stringify({ error: 'Unknown command' });
         }
