@@ -13,6 +13,50 @@ type cipherDetectionResult struct {
 	SigUsesURLWrapper bool
 	WrapperRuntimeJS  string
 	NName             string
+	// Modern URL-wrapper protocol marker: set only when the player carries
+	// the recognized, unambiguous URL-wrapper family. This mode bypasses
+	// global n discovery and QuickJS bytecode compilation.
+	URLWrapperProtocol bool
+}
+
+// urlWrapperDetectOutcome distinguishes the three discovery outcomes:
+// detected (unique qualifying wrapper), ambiguous (fail-closed, never a
+// legacy fallback), or absent (legacy tier policy applies).
+type urlWrapperDetectOutcome struct {
+	detected  bool
+	ambiguous bool
+	result    cipherDetectionResult
+}
+
+// urlWrapperDetect runs the modern URL-wrapper protocol detection and
+// records diagnostics on detail. Callers must handle the ambiguous outcome
+// as fail-closed: NO legacy global scan and NO QuickJS fallback.
+func urlWrapperDetect(js []byte, detail *CipherAnalyzeDetail) urlWrapperDetectOutcome {
+	tWrapper := time.Now()
+	var out urlWrapperDetectOutcome
+
+	disc := urlWrapperDiscover(js)
+	detail.WrapperMs += time.Since(tWrapper).Milliseconds()
+
+	switch disc.status {
+	case urlWrapperDiscoveryFound:
+		out.detected = true
+		out.result.SigName = disc.name
+		out.result.SigParam = 0
+		out.result.SigUsesURLWrapper = true
+		out.result.URLWrapperProtocol = true
+		detail.SigName = disc.name
+		detail.SigTier = "urlwrapper"
+		detail.WrapperTier = "protocol"
+		detail.WrapperBuildTier = "source-expose"
+		detail.NFuncTier = "skipped_protocol"
+	case urlWrapperDiscoveryAmbiguous:
+		out.ambiguous = true
+		detail.WrapperTier = "ambiguous"
+	default:
+		detail.WrapperTier = "skipped"
+	}
+	return out
 }
 
 // detectFastSignature attempts Tier 1 detection (fast windowed/primary logic)

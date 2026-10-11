@@ -36,6 +36,13 @@ type Cipher struct {
 	isBytecode         bool
 	lazyMu             sync.Mutex
 
+	// Modern URL-wrapper protocol recognition. When set, the player carries
+	// the validated `set("alr","yes")` wrapper family; signature/n/alr are
+	// produced by a single subprocess URL transform (Bun/Node only) and the
+	// legacy QuickJS/bytecode and global n-discovery paths are bypassed.
+	urlWrapperProtocol bool
+	urlWrapperName     string
+
 	// Cached QuickJS wrapper runtime — reused for both sig and n calls.
 	// Instead of creating a fresh runtime per call (~540ms each for 2.7MB eval),
 	// we bootstrap once and call the wrapper function multiple times.
