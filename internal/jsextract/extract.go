@@ -438,8 +438,10 @@ func collectIdentifiers(node ast.Node, deps map[string]bool) {
 			collectIdentifiers(n.Function, deps)
 		}
 	case *ast.FunctionLiteral:
-		for _, stmt := range n.Body.List {
-			collectIdentifiers(stmt, deps)
+		if n.Body != nil {
+			for _, stmt := range n.Body.List {
+				collectIdentifiers(stmt, deps)
+			}
 		}
 	case *ast.ExpressionStatement:
 		collectIdentifiers(n.Expression, deps)
@@ -465,6 +467,9 @@ func collectIdentifiers(node ast.Node, deps map[string]bool) {
 		collectIdentifiers(n.Alternate, deps)
 	case *ast.VariableStatement:
 		for _, decl := range n.List {
+			if decl == nil || decl.Initializer == nil {
+				continue
+			}
 			collectIdentifiers(decl.Initializer, deps)
 		}
 	case *ast.IfStatement:
@@ -477,11 +482,33 @@ func collectIdentifiers(node ast.Node, deps map[string]bool) {
 		collectIdentifiers(n.Update, deps)
 		collectIdentifiers(n.Body, deps)
 	case *ast.BlockStatement:
+		if n == nil {
+			return
+		}
 		for _, stmt := range n.List {
 			collectIdentifiers(stmt, deps)
 		}
 	case *ast.ReturnStatement:
 		collectIdentifiers(n.Argument, deps)
+	case *ast.LabelledStatement:
+		collectIdentifiers(n.Statement, deps)
+	case *ast.TryStatement:
+		if n.Body != nil {
+			collectIdentifiers(n.Body, deps)
+		}
+		if n.Catch != nil {
+			collectIdentifiers(n.Catch, deps)
+		}
+		if n.Finally != nil {
+			collectIdentifiers(n.Finally, deps)
+		}
+	case *ast.CatchStatement:
+		if n == nil {
+			return
+		}
+		if n.Body != nil {
+			collectIdentifiers(n.Body, deps)
+		}
 	case *ast.ArrayLiteral:
 		for _, elem := range n.Value {
 			collectIdentifiers(elem, deps)
