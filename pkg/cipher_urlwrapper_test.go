@@ -3,10 +3,15 @@ package ytx
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mrjared16/ytx/internal/cache"
 	"github.com/mrjared16/ytx/internal/jsengine"
 )
 
@@ -705,3 +710,475 @@ func TestURLWrapperCloseThenGetPositiveSync(t *testing.T) {
 		t.Fatal("expected a fresh live runner after the cache was closed")
 	}
 }
+
+func urlWrapperTestCipher(t *testing.T, engineType jsengine.EngineType, playerJS []byte, wrapperName string) (*Cipher, *Runtime) {
+	t.Helper()
+	runtime := NewRuntime()
+	runtime.SetEngineType(engineType)
+	cipher := &Cipher{
+		runtime:            runtime,
+		sigFunctionName:    wrapperName,
+		sigUsesURLWrapper:  true,
+		urlWrapperProtocol: true,
+		urlWrapperName:     wrapperName,
+		playerJS:           playerJS,
+		playerURL:          "/s/player/urlwtest/base.js",
+		playerFingerprint:  "urlwtest-fp",
+	}
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+	return cipher, runtime
+}
+
+func TestURLWrapperModernNeverUsesQuickJS(t *testing.T) {
+	cipher, _ := urlWrapperTestCipher(t, jsengine.EngineQuickJS, urlWrapperTestPlayer("ok"), "jW")
+
+	if err := cipher.WarmURLTransformContext(context.Background()); err == nil {
+		t.Fatal("expected QuickJS engine to be rejected for the url wrapper protocol")
+	} else if !strings.Contains(err.Error(), "QuickJS") && !strings.Contains(err.Error(), "bun") {
+		t.Fatalf("unexpected rejection reason: %v", err)
+	}
+
+	// Strict failure semantics: no silent n passthrough.
+	if out, err := cipher.TransformN("abc"); err == nil {
+		t.Fatalf("expected modern TransformN to fail without a runtime, got %q", out)
+	}
+	if out, err := cipher.DecryptSignature("abc"); err == nil {
+		t.Fatalf("expected modern DecryptSignature to fail without a runtime, got %q", out)
+	}
+}
+
+func TestURLWrapperAnalyzeSkipsLegacyNFuncAndBuild(t *testing.T) {
+	js := urlWrapperTestPlayer("ok")
+	detail := &CipherAnalyzeDetail{PlayerJSBytes: len(js)}
+
+	ar, err := analyzePlayerJSPhase(
+		&playerJSPhaseResult{Path: "/s/player/urlwtest/base.js", JS: js},
+		detail,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("analyzePlayerJSPhase: %v", err)
+	}
+	if !ar.Result.URLWrapperProtocol {
+		t.Fatal("expected URL-wrapper protocol recognition")
+	}
+	if ar.Result.SigName != "jW" {
+		t.Fatalf("unexpected sig name: got %q want %q", ar.Result.SigName, "jW")
+	}
+	if ar.Result.WrapperRuntimeJS != "" {
+		t.Fatalf("expected no legacy wrapper runtime build for the recognized protocol, got %d bytes", len(ar.Result.WrapperRuntimeJS))
+	}
+	if ar.Result.NName != "" {
+		t.Fatalf("expected global n discovery to be skipped, got %q", ar.Result.NName)
+	}
+	if detail.SigTier != "urlwrapper" {
+		t.Fatalf("unexpected sig tier: got %q want %q", detail.SigTier, "urlwrapper")
+	}
+	if detail.NFuncTier != "skipped_protocol" {
+		t.Fatalf("unexpected nfunc tier: got %q want %q", detail.NFuncTier, "skipped_protocol")
+	}
+
+	// The modern protocol never prewarms the QuickJS signature runtime.
+	cipher := &Cipher{runtime: NewRuntime(), urlWrapperProtocol: true, urlWrapperName: "jW", jsCode: "bytecode"}
+	defer cipher.runtimeOrDefault().CloseCachedEngine()
+	if cipher.canPrewarmSignatureRuntime() {
+		t.Fatal("expected modern protocol to refuse QuickJS signature prewarm")
+	}
+}
+
+func TestURLWrapperAnalyzeFailsClosedOnAmbiguous(t *testing.T) {
+	js := urlWrapperAmbiguousPlayer()
+	_, err := analyzePlayerJSPhase(
+		&playerJSPhaseResult{Path: "/s/player/amb/base.js", JS: js},
+		&CipherAnalyzeDetail{PlayerJSBytes: len(js)},
+		"",
+	)
+	if err == nil {
+		t.Fatal("expected ambiguous candidates to fail closed instead of falling back to legacy")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+func TestURLWrapperAnalyzeUnsupportedFallsBackToLegacy(t *testing.T) {
+	// No modern pattern at all: the explicit legacy policy applies.
+	js := []byte(`var signatureTimestamp=12345;x&&(x=AbC(decodeURIComponent(x)));function AbC(a){a=a.split("");a.reverse();return a.join("")}`)
+	ar, err := analyzePlayerJSPhase(
+		&playerJSPhaseResult{Path: "/s/player/legacy/base.js", JS: js},
+		&CipherAnalyzeDetail{PlayerJSBytes: len(js)},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("analyzePlayerJSPhase: %v", err)
+	}
+	if ar.Result.URLWrapperProtocol {
+		t.Fatal("expected unsupported player to stay on the legacy policy")
+	}
+	if ar.Result.SigName != "AbC" {
+		t.Fatalf("unexpected legacy sig name: got %q want %q", ar.Result.SigName, "AbC")
+	}
+}
+
+func TestURLWrapperFallbackAnalyzeRecognizesModern(t *testing.T) {
+	js := urlWrapperTestPlayer("ok")
+	detail := &CipherAnalyzeDetail{PlayerJSBytes: len(js)}
+	ar, err := analyzeFallbackPlayerJSPhase(
+		&playerJSPhaseResult{Path: "/s/player/urlwtest/base.js", JS: js},
+		detail,
+	)
+	if err != nil {
+		t.Fatalf("analyzeFallbackPlayerJSPhase: %v", err)
+	}
+	if !ar.Result.URLWrapperProtocol || ar.Result.SigName != "jW" {
+		t.Fatalf("expected refetch path to recognize the modern protocol: proto=%v name=%q", ar.Result.URLWrapperProtocol, ar.Result.SigName)
+	}
+	if ar.Result.NName != "" {
+		t.Fatalf("expected no global n discovery on the refetch path, got %q", ar.Result.NName)
+	}
+	if detail.NFuncTier != "skipped_protocol" {
+		t.Fatalf("unexpected nfunc tier: got %q want %q", detail.NFuncTier, "skipped_protocol")
+	}
+}
+
+func urlWrapperTestExtractor(t *testing.T) (*Extractor, *Cipher, *Runtime) {
+	t.Helper()
+	_ = urlWrapperTestEngine(t)
+	runtime := NewRuntime() // EngineAuto: bun -> node only, never QuickJS
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+	cipher := &Cipher{
+		runtime:            runtime,
+		sigFunctionName:    "jW",
+		sigUsesURLWrapper:  true,
+		urlWrapperProtocol: true,
+		urlWrapperName:     "jW",
+		playerURL:          "/s/player/urlwtest/base.js",
+		playerFingerprint:  "urlwtest-fp",
+	}
+	// RAW (unexposed) bundle: the production path prepares the exposure
+	// inside GetURLWrapperRunner, exactly like WarmURLTransformContext does.
+	cipher.playerJS = urlWrapperTestPlayer("ok")
+
+	if err := cipher.WarmURLTransformContext(context.Background()); err != nil {
+		t.Fatalf("WarmURLTransformContext: %v", err)
+	}
+
+	ext := &Extractor{runtime: runtime, config: GetClientConfig(ModeVideo)}
+	return ext, cipher, runtime
+}
+
+func TestGetStreamURLModernContextAppliesSignature(t *testing.T) {
+	ext, cipher, _ := urlWrapperTestExtractor(t)
+
+	const rawSig = "sig%2Fpart x!~"
+	baseURL := "https://rr.example.com/videoplayback?keep=keepme&pot=xy"
+	got, err := ext.getStreamURLModernContext(context.Background(), cipher, baseURL, "sp", rawSig)
+	if err != nil {
+		t.Fatalf("getStreamURLModernContext: %v", err)
+	}
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("malformed result URL: %v (%q)", err, got)
+	}
+	q := u.Query()
+	if q.Get("sp") != rawSig {
+		t.Fatalf("unexpected signature: got %q want %q", q.Get("sp"), rawSig)
+	}
+	if q.Get("keep") != "keepme" || q.Get("pot") != "xy" {
+		t.Fatalf("unrelated params lost: %q", got)
+	}
+	if q.Get("alr") != "yes" {
+		t.Fatalf("expected alr=yes propagation, got %q", got)
+	}
+}
+
+func TestGetStreamURLModernContextStrictEmptyN(t *testing.T) {
+	_ = urlWrapperTestEngine(t)
+	runtime := NewRuntime()
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+	cipher := &Cipher{
+		runtime:            runtime,
+		sigFunctionName:    "jW",
+		sigUsesURLWrapper:  true,
+		urlWrapperProtocol: true,
+		urlWrapperName:     "jW",
+		playerURL:          "/s/player/urlwtest/base.js",
+		playerFingerprint:  "urlwtest-fp",
+	}
+	// RAW (unexposed) bundle: production path prepares the exposure.
+	cipher.playerJS = urlWrapperTestPlayer("emptyn")
+	if err := cipher.WarmURLTransformContext(context.Background()); err != nil {
+		t.Fatalf("WarmURLTransformContext: %v", err)
+	}
+	ext := &Extractor{runtime: runtime, config: GetClientConfig(ModeVideo)}
+
+	baseURL := "https://rr.example.com/videoplayback?n=abc123&keep=keepme"
+	var uerr error
+	_, uerr = ext.getStreamURLModernContext(context.Background(), cipher, baseURL, "sig", "")
+	if uerr == nil {
+		t.Fatal("expected empty transformed n to be an explicit error (no silent passthrough)")
+	}
+}
+
+func TestGetStreamURLModernContextStrictUnchangedN(t *testing.T) {
+	_ = urlWrapperTestEngine(t)
+	runtime := NewRuntime()
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+	cipher := &Cipher{
+		runtime:            runtime,
+		sigFunctionName:    "jW",
+		sigUsesURLWrapper:  true,
+		urlWrapperProtocol: true,
+		urlWrapperName:     "jW",
+		playerURL:          "/s/player/urlwtest/base.js",
+		playerFingerprint:  "urlwtest-fp",
+	}
+	// RAW (unexposed) bundle: production path prepares the exposure.
+	cipher.playerJS = urlWrapperTestPlayer("unchanged")
+	if err := cipher.WarmURLTransformContext(context.Background()); err != nil {
+		t.Fatalf("WarmURLTransformContext: %v", err)
+	}
+	ext := &Extractor{runtime: runtime, config: GetClientConfig(ModeVideo)}
+
+	// A realistic-length n that comes back byte-identical must be rejected:
+	// an unchanged modern n is never a silently successful passthrough.
+	const realisticN = "nY9oQ2vL7kM3xZ8wP5rT6uJ1sD4fG9hK0jA2sD5fG7hJ3"
+	baseURL := "https://rr.example.com/videoplayback?n=" + realisticN + "&keep=keepme"
+	var uerr error
+	_, uerr = ext.getStreamURLModernContext(context.Background(), cipher, baseURL, "sig", "")
+	if uerr == nil {
+		t.Fatal("expected unchanged transformed n to be an explicit error (no silent passthrough)")
+	}
+}
+
+func urlWrapperAmbiguousPlayer() []byte {
+	return []byte(`
+(function(_yt_player){
+var g={};
+jW=function(T,M,q){M=M===void 0?"":M;q=q===void 0?"":q;T=new g.$I(T,!0);T.set("alr","yes");q&&(q=Qe(q),T[S[21]](M,q));return T};
+Qe=function(x){return x};
+var signatureTimestamp=20726;
+xx=function(a,b,c){c=c===void 0?"":c;a=new g.zz(a,!0);a.set('alr','yes');c&&(c=HH(c),a[K1[3]](b,c));return a};
+HH=function(x){return x};
+g.zc=function(T,M,q){var Q=new g.$I(M,!0);Q.get("alr")||Q.set("alr","yes");T.K&&Q.set("x",1);return Q};
+})(_yt_player);
+`)
+}
+
+func realisticSig(t *testing.T) string {
+	t.Helper()
+	var sb strings.Builder
+	for i := 0; i < 300; i++ {
+		sb.WriteString("Af5Hk9LpQ2zXwBvR1")
+	}
+	return sb.String()[:300]
+}
+
+func TestURLWrapperPublicAdaptersExactOutputs(t *testing.T) {
+	_ = urlWrapperTestEngine(t)
+	runtime := NewRuntime()
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+	cipher := &Cipher{
+		runtime:            runtime,
+		sigFunctionName:    "jW",
+		sigUsesURLWrapper:  true,
+		urlWrapperProtocol: true,
+		urlWrapperName:     "jW",
+		playerURL:          "/s/player/urlwtest/base.js",
+		playerFingerprint:  "urlwtest-fp",
+	}
+	cipher.playerJS = urlWrapperTestPlayer("ok")
+	if err := cipher.WarmURLTransformContext(context.Background()); err != nil {
+		t.Fatalf("WarmURLTransformContext: %v", err)
+	}
+
+	// Public TransformN: n inserted before the call, deterministic exact
+	// output for a realistic input, adapter URL is a trusted googlevideo
+	// videoplayback (real wrappers reject other hosts).
+	gotN, err := cipher.TransformN(realisticN)
+	if err != nil {
+		t.Fatalf("TransformN: %v", err)
+	}
+	if gotN != realisticN+"_mod" {
+		t.Fatalf("exact n mismatch: got %q", gotN)
+	}
+
+	// Public DecryptSignature: the wrapper applies a deterministic transform
+	// (reverse of the single-encoded signature); the exact reference output
+	// must come back — alnum-only realistic signature, so the single
+	// encodeURIComponent is identity and the reference is the reversed input.
+	srev := &Cipher{
+		runtime:            runtime,
+		sigFunctionName:    "jW",
+		sigUsesURLWrapper:  true,
+		urlWrapperProtocol: true,
+		urlWrapperName:     "jW",
+		playerURL:          "/s/player/urlwtest/base.js",
+		playerFingerprint:  "urlwtest-fp2",
+	}
+	srev.playerJS = urlWrapperTestPlayer("srev")
+	if err := srev.WarmURLTransformContext(context.Background()); err != nil {
+		t.Fatalf("WarmURLTransformContext (srev): %v", err)
+	}
+	sig := realisticSig(t)
+	gotS, err := srev.DecryptSignature(sig)
+	if err != nil {
+		t.Fatalf("DecryptSignature: %v", err)
+	}
+	refBytes := make([]byte, len(sig))
+	for i := 0; i < len(sig); i++ {
+		refBytes[i] = sig[len(sig)-1-i]
+	}
+	if gotS != string(refBytes) {
+		t.Fatalf("exact signature mismatch: got %d bytes want %d bytes (reversed reference)", len(gotS), len(sig))
+	}
+	if len(gotS) != 300 {
+		t.Fatalf("unexpected signature length: got %d want 300", len(gotS))
+	}
+
+	// Strict changed-n: an unchanged realistic n is an explicit error.
+	unchanged := &Cipher{
+		runtime:            runtime,
+		sigFunctionName:    "jW",
+		sigUsesURLWrapper:  true,
+		urlWrapperProtocol: true,
+		urlWrapperName:     "jW",
+		playerURL:          "/s/player/urlwtest/base.js",
+		playerFingerprint:  "urlwtest-fp3",
+	}
+	unchanged.playerJS = urlWrapperTestPlayer("unchanged")
+	if err := unchanged.WarmURLTransformContext(context.Background()); err != nil {
+		t.Fatalf("WarmURLTransformContext (unchanged): %v", err)
+	}
+	if _, err := unchanged.TransformN(realisticN); err == nil {
+		t.Fatal("expected unchanged modern n to be an explicit error")
+	}
+}
+
+func TestGetStreamURLNilCipherModernInitFailsStrict(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	runtime := NewRuntime()
+	runtime.SetEngineType(jsengine.EngineQuickJS) // modern init must fail fast: no runner
+	defer runtime.CloseCachedEngine()
+
+	ext := &Extractor{
+		runtime:      runtime,
+		cacheManager: cache.NewCacheManagerWithDir(cacheDir),
+		config:       GetClientConfig(ModeVideo),
+	}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	playerJS := urlWrapperTestPlayer("ok")
+	cm := ext.cacheManager
+	if err := cm.Save(&cache.CipherCache{
+		Version:            cache.CurrentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cache.CacheTTL),
+		PlayerURL:          "/s/player/urlwtest/base.js",
+		PlayerFingerprint:  computePlayerFingerprint(playerJS),
+		BaseJSPath:         "/s/player/urlwtest/base.js",
+		SigFunction:        "jW",
+		SigUsesURLWrapper:  true,
+		NFunction:          "xp",
+		SignatureTimestamp: 20726,
+		WrapperBuildID:     currentWrapperBytecodeBuildID(),
+		JSCode:             "",
+	}); err != nil {
+		t.Fatalf("Save cipher cache: %v", err)
+	}
+	if err := cm.SavePlayerJS(playerJS); err != nil {
+		t.Fatalf("SavePlayerJS: %v", err)
+	}
+
+	stream := &Format{
+		URL:      "https://stream.test/videoplayback?n=abc123&keep=keepme",
+		Itag:     141,
+		Bitrate:  256000,
+		MimeType: "audio/mp4; codecs=\"mp4a.40.2\"",
+		Quality:  "tiny",
+	}
+	_, err := ext.getStreamURL("dQw4w9WgXcQ", stream)
+	if err == nil {
+		t.Fatal("expected modern nil-cipher init to propagate the failure, not return an untransformed URL")
+	}
+	if ext.cipher == nil || !ext.cipher.isModernURLWrapperProtocol() {
+		t.Fatal("expected the cached modern cipher to be installed before the QuickJS rejection")
+	}
+	if !strings.Contains(err.Error(), "QuickJS") || !strings.Contains(err.Error(), "bun/node") {
+		t.Fatalf("expected a QuickJS-incompatibility error from the installed modern protocol, got: %v", err)
+	}
+}
+
+func TestGetStreamURLNilCipherLegacyInitStillDegrades(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	runtime := NewRuntime()
+	runtime.SetEngineType(jsengine.EngineQuickJS) // legacy wrapper works on QuickJS
+	defer runtime.CloseCachedEngine()
+
+	ext := &Extractor{
+		runtime:      runtime,
+		cacheManager: cache.NewCacheManagerWithDir(cacheDir),
+		config:       GetClientConfig(ModeVideo),
+	}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	playerJS := []byte(`
+(function(){
+function URLObj(sig){this.map={s:sig};}
+URLObj.prototype.get=function(k){return this.map[k];};
+URLObj.prototype.set=function(k,v){this.map[k]=v;};
+URLObj.prototype.apply=function(){this.map.s=this.map.s.split('').reverse().join('');};
+var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");o.apply();return o;};
+})();`)
+	cm := ext.cacheManager
+	if err := cm.Save(&cache.CipherCache{
+		Version:            cache.CurrentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cache.CacheTTL),
+		PlayerURL:          "/s/player/legacy/base.js",
+		PlayerFingerprint:  computePlayerFingerprint(playerJS),
+		BaseJSPath:         "/s/player/legacy/base.js",
+		SigFunction:        "kS",
+		SigUsesURLWrapper:  true,
+		SignatureTimestamp: 20726,
+		WrapperBuildID:     currentWrapperBytecodeBuildID(),
+		JSCode:             "",
+	}); err != nil {
+		t.Fatalf("Save cipher cache: %v", err)
+	}
+	if err := cm.SavePlayerJS(playerJS); err != nil {
+		t.Fatalf("SavePlayerJS: %v", err)
+	}
+
+	stream := &Format{
+		URL:      "https://stream.test/videoplayback?n=abc123&keep=keepme",
+		Itag:     141,
+		Bitrate:  256000,
+		MimeType: "audio/mp4; codecs=\"mp4a.40.2\"",
+		Quality:  "tiny",
+	}
+	got, err := ext.getStreamURL("dQw4w9WgXcQ", stream)
+	if err != nil {
+		t.Fatalf("legacy nil-cipher init must keep its degradation behavior, got error: %v", err)
+	}
+	if ext.cipher == nil || ext.cipher.isModernURLWrapperProtocol() {
+		t.Fatal("expected the cached legacy cipher to be installed without modern protocol binding")
+	}
+	if got != stream.URL {
+		t.Fatalf("expected the exact untransformed URL on legacy degradation, got %q want %q", got, stream.URL)
+	}
+}
+
+const realisticN = "nY9oQ2vL7kM3xZ8wP5rT6uJ1sD4fG9hK0jA2sD5fG7hJ3"
