@@ -2,7 +2,9 @@ package ytx
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -1178,6 +1180,445 @@ var kS=function(url,mode,sig){var o=new URLObj(sig);o.set("alr","yes");o.apply()
 	}
 	if got != stream.URL {
 		t.Fatalf("expected the exact untransformed URL on legacy degradation, got %q want %q", got, stream.URL)
+	}
+}
+
+func TestGetCachedCipherModernMigrationDiscardsStaleArtifacts(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	runtime := NewRuntime()
+	runtime.SetEngineType(jsengine.EngineQuickJS) // hermetic: never spawns a subprocess
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+
+	ext := &Extractor{
+		runtime:      runtime,
+		cacheManager: cache.NewCacheManagerWithDir(cacheDir),
+		config:       GetClientConfig(ModeVideo),
+	}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	playerJS := urlWrapperTestPlayer("ok")
+	staleNRuntime := []byte(`_exposed['xp']=xp;})...stale-n-runtime`)
+	staleWrapper := []byte("stale-wrapper-bytecode")
+	cm := ext.cacheManager
+	if err := cm.Save(&cache.CipherCache{
+		Version:            cache.CurrentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cache.CacheTTL),
+		PlayerURL:          "/s/player/urlwtest/base.js",
+		PlayerFingerprint:  computePlayerFingerprint(playerJS),
+		BaseJSPath:         "/s/player/urlwtest/base.js",
+		SigFunction:        "jW",
+		SigUsesURLWrapper:  true,
+		NFunction:          "xp", // stale cached n decoder must be discarded
+		SignatureTimestamp: 20726,
+		IsBytecode:         true,
+		WrapperBuildID:     currentWrapperBytecodeBuildID(),
+		JSCode:             "",
+	}); err != nil {
+		t.Fatalf("Save cipher cache: %v", err)
+	}
+	if err := cm.SavePlayerJS(playerJS); err != nil {
+		t.Fatalf("SavePlayerJS: %v", err)
+	}
+	if err := cm.SaveNRuntimeJS(staleNRuntime); err != nil {
+		t.Fatalf("SaveNRuntimeJS: %v", err)
+	}
+	if err := cm.SaveWrapperRuntimeBytecode(staleWrapper); err != nil {
+		t.Fatalf("SaveWrapperRuntimeBytecode: %v", err)
+	}
+
+	// The fixture must really be persisted, otherwise the assertions below
+	// could pass on an empty cache instead of exercising migration.
+	seeded, err := cm.Load()
+	if err != nil {
+		t.Fatalf("precondition: Load seeded cache: %v", err)
+	}
+	if seeded.PlayerFingerprint != computePlayerFingerprint(playerJS) {
+		t.Fatalf("precondition: fingerprint=%q", seeded.PlayerFingerprint)
+	}
+	if !seeded.SigUsesURLWrapper || seeded.NFunction != "xp" {
+		t.Fatalf("precondition: wrapper=%v nfunc=%q", seeded.SigUsesURLWrapper, seeded.NFunction)
+	}
+	if got, err := cm.LoadPlayerJS(); err != nil {
+		t.Fatalf("precondition: LoadPlayerJS: %v", err)
+	} else if string(got) != string(playerJS) {
+		t.Fatalf("precondition: player.js mismatch: %d bytes", len(got))
+	}
+	if got, err := cm.LoadNRuntimeJS(); err != nil {
+		t.Fatalf("precondition: LoadNRuntimeJS: %v", err)
+	} else if string(got) != string(staleNRuntime) {
+		t.Fatalf("precondition: stale n runtime mismatch: %q", got)
+	}
+	if got, err := cm.LoadWrapperRuntimeBytecode(); err != nil {
+		t.Fatalf("precondition: LoadWrapperRuntimeBytecode: %v", err)
+	} else if string(got) != string(staleWrapper) {
+		t.Fatalf("precondition: stale wrapper bytecode mismatch: %q", got)
+	}
+
+	cipher, err := ext.getCachedCipher("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("getCachedCipher returned error: %v", err)
+	}
+	if !cipher.urlWrapperProtocol {
+		t.Fatal("expected modern protocol derivation from cached player.js")
+	}
+	if cipher.urlWrapperName != "jW" {
+		t.Fatalf("unexpected wrapper name: got %q want %q", cipher.urlWrapperName, "jW")
+	}
+	if cipher.nFunctionName != "" {
+		t.Fatalf("expected stale n=xp to be discarded, got %q", cipher.nFunctionName)
+	}
+	if len(cipher.nRuntimeJS) != 0 {
+		t.Fatalf("expected stale n runtime to be discarded, got %d bytes", len(cipher.nRuntimeJS))
+	}
+	if cipher.jsCode != "" || cipher.isBytecode {
+		t.Fatalf("expected stale wrapper bytecode to be discarded (jsCode=%q isBytecode=%v)", cipher.jsCode, cipher.isBytecode)
+	}
+	if string(cipher.playerJS) != string(playerJS) {
+		t.Fatalf("expected cached player.js to be hydrated as the runner source, got %d bytes", len(cipher.playerJS))
+	}
+}
+
+func TestGetCachedCipherLegacyWrapperPathUnchanged(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	runtime := NewRuntime()
+	runtime.SetEngineType(jsengine.EngineQuickJS)
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+
+	ext := &Extractor{
+		runtime:      runtime,
+		cacheManager: cache.NewCacheManagerWithDir(cacheDir),
+		config:       GetClientConfig(ModeVideo),
+	}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	// Decoy-only player: legacy URL-wrapper cache behavior must be preserved.
+	playerJS := []byte(`
+(function(_yt_player){
+var g={};
+g.zc=function(T,M,q){var Q=new g.$I(M,!0);Q.get("alr")||Q.set("alr","yes");T.K&&Q.set("x",1);return Q};
+Veg=function(P,O){this.ZD=new g.$I(P,!0);this.ZD.set("alr", "yes");return this};
+yp=function(T,M){var q=new g.$I(T,!0);q.set("alr","yes");q.set("id","9");return q};
+})();
+`)
+	staleBytecode := []byte("synthetic-bytecode")
+	cm := ext.cacheManager
+	if err := cm.Save(&cache.CipherCache{
+		Version:            cache.CurrentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cache.CacheTTL),
+		PlayerURL:          "/s/player/legacy/base.js",
+		PlayerFingerprint:  computePlayerFingerprint(playerJS),
+		BaseJSPath:         "/s/player/legacy/base.js",
+		SigFunction:        "kS",
+		SigUsesURLWrapper:  true,
+		SignatureTimestamp: 20726,
+		IsBytecode:         true,
+		WrapperBuildID:     currentWrapperBytecodeBuildID(),
+		JSCode:             "",
+	}); err != nil {
+		t.Fatalf("Save cipher cache: %v", err)
+	}
+	if err := cm.SavePlayerJS(playerJS); err != nil {
+		t.Fatalf("SavePlayerJS: %v", err)
+	}
+	if err := cm.SaveWrapperRuntimeBytecode(staleBytecode); err != nil {
+		t.Fatalf("SaveWrapperRuntimeBytecode: %v", err)
+	}
+
+	seeded, err := cm.Load()
+	if err != nil {
+		t.Fatalf("precondition: Load seeded cache: %v", err)
+	}
+	if seeded.PlayerFingerprint != computePlayerFingerprint(playerJS) {
+		t.Fatalf("precondition: fingerprint=%q", seeded.PlayerFingerprint)
+	}
+	if !seeded.SigUsesURLWrapper || seeded.SigFunction != "kS" {
+		t.Fatalf("precondition: wrapper=%v sig=%q", seeded.SigUsesURLWrapper, seeded.SigFunction)
+	}
+	if got, err := cm.LoadPlayerJS(); err != nil {
+		t.Fatalf("precondition: LoadPlayerJS: %v", err)
+	} else if string(got) != string(playerJS) {
+		t.Fatalf("precondition: player.js mismatch: %d bytes", len(got))
+	}
+	if got, err := cm.LoadWrapperRuntimeBytecode(); err != nil {
+		t.Fatalf("precondition: LoadWrapperRuntimeBytecode: %v", err)
+	} else if string(got) != string(staleBytecode) {
+		t.Fatalf("precondition: bytecode mismatch: %q", got)
+	}
+
+	cipher, err := ext.getCachedCipher("dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("getCachedCipher returned error: %v", err)
+	}
+	if cipher.urlWrapperProtocol {
+		t.Fatal("expected decoy-only player to stay on the legacy wrapper path")
+	}
+	if !cipher.sigUsesURLWrapper {
+		t.Fatal("expected legacy URL-wrapper flag to be preserved")
+	}
+	if cipher.sigFunctionName != "kS" {
+		t.Fatalf("expected legacy signature name to be preserved, got %q", cipher.sigFunctionName)
+	}
+	if cipher.jsCode != string(staleBytecode) || !cipher.isBytecode {
+		t.Fatalf("expected legacy bytecode artifact to be reused (jsCode=%q isBytecode=%v)", cipher.jsCode, cipher.isBytecode)
+	}
+	if string(cipher.playerJS) != string(playerJS) {
+		t.Fatalf("expected legacy player.js to remain loaded, got %d bytes", len(cipher.playerJS))
+	}
+}
+
+func TestStoreCipherCacheRotationClosesModernRunner(t *testing.T) {
+	_ = urlWrapperTestEngine(t)
+	runtime := NewRuntime()
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+	ext := &Extractor{runtime: runtime}
+	raw := urlWrapperTestPlayer("ok")
+	const playerURL = "/s/player/urlwtest/base.js"
+	keyA := urlWrapperRunnerCacheKey(playerURL, "fp-a", "jW")
+	keyB := urlWrapperRunnerCacheKey(playerURL, "fp-b", "jW")
+
+	aRunner, err := runtime.GetURLWrapperRunner(context.Background(), raw, playerURL, "fp-a", "jW")
+	if err != nil {
+		t.Fatalf("GetURLWrapperRunner A: %v", err)
+	}
+	if aRunner.IsClosed() || !aRunner.SupportsURLTransform() {
+		t.Fatal("precondition: A runner must be live and URL-capable")
+	}
+	if !testCachedEngineHas(runtime, keyA) {
+		t.Fatal("precondition: A modern runner must be cached")
+	}
+
+	cA := &Cipher{runtime: runtime, sigUsesURLWrapper: true, urlWrapperProtocol: true, urlWrapperName: "jW", playerURL: playerURL, playerFingerprint: "fp-a", playerJS: raw}
+	cB := &Cipher{runtime: runtime, sigUsesURLWrapper: true, urlWrapperProtocol: true, urlWrapperName: "jW", playerURL: playerURL, playerFingerprint: "fp-b", playerJS: raw}
+
+	ext.storeCipherCache(cA, time.Now().Add(time.Hour))
+	ext.storeCipherCache(cB, time.Now().Add(time.Hour))
+	if testCachedEngineHas(runtime, keyA) {
+		t.Fatal("expected rotation to close the old modern runner key")
+	}
+	if !aRunner.IsClosed() {
+		t.Fatal("expected the rotated-out runner to be closed")
+	}
+	if testCachedEngineHas(runtime, keyB) {
+		t.Fatal("rotation must not pre-create the new key")
+	}
+
+	// Populate the CURRENT cipher's modern key with a live URL-mode runner;
+	// the final invalidate must close this exact instance, not merely drop an
+	// absent map entry.
+	bRunner, err := runtime.GetURLWrapperRunner(context.Background(), raw, playerURL, "fp-b", "jW")
+	if err != nil {
+		t.Fatalf("GetURLWrapperRunner B: %v", err)
+	}
+	if bRunner.IsClosed() || !bRunner.SupportsURLTransform() {
+		t.Fatal("expected a live, URL-capable B runner")
+	}
+	if !testCachedEngineHas(runtime, keyB) {
+		t.Fatal("expected B runner to be cached before invalidate")
+	}
+	out, err := bRunner.TransformURLContext(context.Background(), "https://rr.example.com/videoplayback?n=abc123", "sig", "")
+	if err != nil {
+		t.Fatalf("expected B runner to be usable before invalidate: %v", err)
+	}
+	if out.N != "abc123_mod" {
+		t.Fatalf("unexpected B runner n: got %q want %q", out.N, "abc123_mod")
+	}
+
+	ext.invalidateCipherCache()
+	runtime.cipherCache.RLock()
+	current := runtime.cipherCache.cipher
+	runtime.cipherCache.RUnlock()
+	if current != nil {
+		t.Fatal("expected in-memory cipher to be cleared")
+	}
+	if testCachedEngineHas(runtime, keyB) {
+		t.Fatal("expected invalidate to close the current modern runner key")
+	}
+	if !bRunner.IsClosed() {
+		t.Fatal("expected invalidate to close the exact B runner instance")
+	}
+}
+
+func TestGetCachedCipherAmbiguousFailsClosedRefetches(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+
+	runtime := NewRuntime()
+	runtime.SetEngineType(jsengine.EngineQuickJS)
+	t.Cleanup(func() { runtime.CloseCachedEngine() })
+
+	ext := &Extractor{
+		runtime:      runtime,
+		cacheManager: cache.NewCacheManagerWithDir(cacheDir),
+		config:       GetClientConfig(ModeVideo),
+	}
+	ext.invalidateCipherCache()
+	defer ext.invalidateCipherCache()
+
+	ambPlayer := urlWrapperAmbiguousPlayer()
+	staleBytecode := []byte("stale-bytecode")
+	staleN := []byte(`_exposed['xp']=xp;})...ambiguous-stale-n-runtime`)
+	derivedSTS := findSignatureTimestamp(ambPlayer)
+	if derivedSTS != 20726 {
+		t.Fatalf("precondition: ambiguous source STS=%d want 20726", derivedSTS)
+	}
+	if disc := urlWrapperDiscover(ambPlayer); disc.status != urlWrapperDiscoveryAmbiguous {
+		t.Fatalf("precondition: source discovery status=%v, want ambiguous", disc.status)
+	}
+	cm := ext.cacheManager
+	if err := cm.Save(&cache.CipherCache{
+		Version:            cache.CurrentCacheVersion,
+		CreatedAt:          time.Now(),
+		ExpiresAt:          time.Now().Add(cache.CacheTTL),
+		PlayerURL:          "/s/player/amb/base.js",
+		PlayerFingerprint:  computePlayerFingerprint(ambPlayer),
+		BaseJSPath:         "/s/player/amb/base.js",
+		SigFunction:        "jW",
+		SigUsesURLWrapper:  true,
+		NFunction:          "xp", // stale n artifact must not survive fail-closed refetch
+		SignatureTimestamp: derivedSTS,
+		WrapperBuildID:     currentWrapperBytecodeBuildID(),
+		JSCode:             "",
+	}); err != nil {
+		t.Fatalf("Save cipher cache: %v", err)
+	}
+	if err := cm.SavePlayerJS(ambPlayer); err != nil {
+		t.Fatalf("SavePlayerJS: %v", err)
+	}
+	if err := cm.SaveNRuntimeJS(staleN); err != nil {
+		t.Fatalf("SaveNRuntimeJS: %v", err)
+	}
+	if err := cm.SaveWrapperRuntimeBytecode(staleBytecode); err != nil {
+		t.Fatalf("SaveWrapperRuntimeBytecode: %v", err)
+	}
+
+	seeded, err := cm.Load()
+	if err != nil {
+		t.Fatalf("precondition: Load seeded cache: %v", err)
+	}
+	if seeded.PlayerFingerprint != computePlayerFingerprint(ambPlayer) {
+		t.Fatalf("precondition: fingerprint=%q", seeded.PlayerFingerprint)
+	}
+	if !seeded.SigUsesURLWrapper || seeded.SigFunction != "jW" || seeded.NFunction != "xp" {
+		t.Fatalf("precondition: wrapper=%v sig=%q nfunc=%q", seeded.SigUsesURLWrapper, seeded.SigFunction, seeded.NFunction)
+	}
+	if seeded.SignatureTimestamp != derivedSTS {
+		t.Fatalf("precondition: metadata STS=%d, source STS=%d", seeded.SignatureTimestamp, derivedSTS)
+	}
+	if !cm.IsCompatible(seeded) || !cm.IsFresh(seeded) {
+		t.Fatal("precondition: seeded ambiguous cache must be accepted, not rejected for metadata staleness")
+	}
+	if got, err := cm.LoadPlayerJS(); err != nil {
+		t.Fatalf("precondition: LoadPlayerJS: %v", err)
+	} else if string(got) != string(ambPlayer) {
+		t.Fatalf("precondition: ambiguous player.js mismatch: %d bytes", len(got))
+	}
+	if got, err := cm.LoadNRuntimeJS(); err != nil {
+		t.Fatalf("precondition: LoadNRuntimeJS: %v", err)
+	} else if string(got) != string(staleN) {
+		t.Fatalf("precondition: stale n runtime mismatch: %q", got)
+	}
+	if got, err := cm.LoadWrapperRuntimeBytecode(); err != nil {
+		t.Fatalf("precondition: LoadWrapperRuntimeBytecode: %v", err)
+	} else if string(got) != string(staleBytecode) {
+		t.Fatalf("precondition: stale bytecode mismatch: %q", got)
+	}
+
+	// Fail-closed must attempt a real refetch with the expected player
+	// identity URLs, not merely observe that the cache load failed.
+	offlineErr := errors.New("offline: no network in cipher tests")
+	var attempts []string
+	ext.httpClient = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts = append(attempts, req.Method+" "+req.URL.String())
+			return nil, offlineErr
+		}),
+	}
+
+	runtime.cipherCache.RLock()
+	preMemCipher := runtime.cipherCache.cipher
+	runtime.cipherCache.RUnlock()
+	if preMemCipher != nil {
+		t.Fatal("precondition: in-memory cipher cache must be empty")
+	}
+
+	gotCipher, err := ext.getCachedCipher("dQw4w9WgXcQ")
+	if err == nil {
+		t.Fatal("expected fail-closed refetch to fail offline")
+	}
+	if gotCipher != nil {
+		t.Fatalf("expected no cipher on refetch error, got %+v", gotCipher)
+	}
+	runtime.cipherCache.RLock()
+	postMemCipher := runtime.cipherCache.cipher
+	runtime.cipherCache.RUnlock()
+	if postMemCipher != nil {
+		t.Fatal("failed refetch installed an in-memory cipher")
+	}
+	if !errors.Is(err, offlineErr) {
+		t.Fatalf("expected the offline HTTP failure to propagate, got %v", err)
+	}
+	wantAttempts := []string{
+		"GET https://www.youtube.com/embed/dQw4w9WgXcQ?hl=en",
+		"GET https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+	}
+	if len(attempts) != len(wantAttempts) {
+		t.Fatalf("expected %d deterministic fetch attempts, got %d: %v", len(wantAttempts), len(attempts), attempts)
+	}
+	for i, want := range wantAttempts {
+		if attempts[i] != want {
+			t.Fatalf("attempt %d = %q, want %q", i, attempts[i], want)
+		}
+	}
+
+	// A fallback entering the legacy QuickJS path would publish a cached
+	// engine through Runtime.GetCachedEngine. An ephemeral engine created
+	// outside that cache is not observable without production hooks; the
+	// exact offline sentinel and nil cipher above are the primary contract.
+	runtime.engineCache.mu.Lock()
+	cachedQuickJSKey := ""
+	for key, engine := range runtime.engineCache.cachedEngines {
+		if engine != nil && engine.Name() == "quickjs" {
+			cachedQuickJSKey = key
+			break
+		}
+	}
+	lastEngineName := runtime.engineCache.lastEngineName
+	runtime.engineCache.mu.Unlock()
+	if cachedQuickJSKey != "" {
+		t.Fatalf("ambiguous failure cached a QuickJS engine at %q", cachedQuickJSKey)
+	}
+	if lastEngineName == "quickjs" {
+		t.Fatal("ambiguous failure recorded a QuickJS engine in the runtime engine cache")
+	}
+	if _, err := cm.Load(); err == nil {
+		t.Fatal("expected ambiguous cache artifacts to be invalidated (fail closed)")
+	}
+	if _, err := cm.LoadPlayerJS(); err == nil {
+		t.Fatal("expected ambiguous player.js to be removed")
+	}
+	if _, err := cm.LoadWrapperRuntimeBytecode(); err == nil {
+		t.Fatal("expected ambiguous wrapper bytecode to be removed")
+	}
+	if _, err := cm.LoadNRuntimeJS(); err == nil {
+		t.Fatal("expected seeded stale n runtime to be removed")
 	}
 }
 
