@@ -101,8 +101,8 @@ func TestVideoResultMarshalJSON(t *testing.T) {
 		{
 			name: "omits chapters when not requested",
 			result: VideoResult{
-				VideoURL:  "https://video.test",
-				AudioURL:  "https://audio.test",
+				VideoURL:  "https://synthetic-video.googlevideo.com",
+				AudioURL:  "https://synthetic-audio.googlevideo.com",
 				VideoItag: 137,
 				AudioItag: 140,
 				Width:     1920,
@@ -110,14 +110,14 @@ func TestVideoResultMarshalJSON(t *testing.T) {
 				Title:     "test",
 				Author:    "author",
 			},
-			wantContains:   []string{"\"video_url\":\"https://video.test\"", "\"audio_url\":\"https://audio.test\"", "\"video_itag\":137", "\"audio_itag\":140", "\"width\":1920", "\"height\":1080", "\"title\":\"test\"", "\"author\":\"author\""},
+			wantContains:   []string{"\"video_url\":\"https://synthetic-video.googlevideo.com\"", "\"audio_url\":\"https://synthetic-audio.googlevideo.com\"", "\"video_itag\":137", "\"audio_itag\":140", "\"width\":1920", "\"height\":1080", "\"title\":\"test\"", "\"author\":\"author\""},
 			wantNotContain: []string{"\"chapters\""},
 		},
 		{
 			name: "includes empty chapter array when requested",
 			result: VideoResult{
-				VideoURL:          "https://video.test",
-				AudioURL:          "https://audio.test",
+				VideoURL:          "https://synthetic-video.googlevideo.com",
+				AudioURL:          "https://synthetic-audio.googlevideo.com",
 				VideoItag:         137,
 				AudioItag:         140,
 				Width:             1920,
@@ -132,8 +132,8 @@ func TestVideoResultMarshalJSON(t *testing.T) {
 		{
 			name: "includes non-empty chapters without private request flag",
 			result: VideoResult{
-				VideoURL:  "https://video.test",
-				AudioURL:  "https://audio.test",
+				VideoURL:  "https://synthetic-video.googlevideo.com",
+				AudioURL:  "https://synthetic-audio.googlevideo.com",
 				VideoItag: 137,
 				AudioItag: 140,
 				Width:     1920,
@@ -218,7 +218,7 @@ func TestExtractVideoContextFetchChaptersOptIn(t *testing.T) {
 
 func TestResultMarshalJSONOmitsChapters(t *testing.T) {
 	payload, err := json.Marshal(Result{
-		URL:     "https://audio.test",
+		URL:     "https://synthetic-audio.googlevideo.com",
 		Itag:    141,
 		Bitrate: 256000,
 		Title:   "test",
@@ -279,6 +279,9 @@ func fakeVideoHTTPClient(t *testing.T, responseBody string) *http.Client {
 			if req.Method == http.MethodPost && req.URL.Host == "www.youtube.com" && req.URL.Path == "/youtubei/v1/player" {
 				return jsonHTTPResponse(http.StatusOK, responseBody), nil
 			}
+			if req.Method == http.MethodGet && (req.URL.Host == "synthetic-video.googlevideo.com" || req.URL.Host == "synthetic-audio.googlevideo.com") {
+				return rangeProbeResponse(req, 1000), nil
+			}
 
 			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.String())
 		}),
@@ -290,8 +293,8 @@ func playerVideoResponseWithoutChapters() string {
 		"responseContext":{"visitorData":"VISITOR_TEST"},
 		"playabilityStatus":{"status":"OK"},
 		"streamingData":{"adaptiveFormats":[
-			{"itag":137,"url":"https://video.test/videoplayback","mimeType":"video/mp4; codecs=\"avc1.640028\"","bitrate":4000000,"width":1920,"height":1080,"quality":"hd1080"},
-			{"itag":140,"url":"https://audio.test/videoplayback","mimeType":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":128000,"quality":"tiny","audioQuality":"AUDIO_QUALITY_MEDIUM"}
+			{"itag":137,"url":"https://synthetic-video.googlevideo.com/videoplayback","mimeType":"video/mp4; codecs=\"avc1.640028\"","bitrate":4000000,"width":1920,"height":1080,"quality":"hd1080"},
+			{"itag":140,"url":"https://synthetic-audio.googlevideo.com/videoplayback","mimeType":"audio/mp4; codecs=\"mp4a.40.2\"","bitrate":128000,"quality":"tiny","audioQuality":"AUDIO_QUALITY_MEDIUM"}
 		]},
 		"videoDetails":{"videoId":"MR6KSB6I_60","title":"test","lengthSeconds":"120","author":"author","shortDescription":""}
 	}`

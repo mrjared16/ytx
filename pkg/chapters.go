@@ -111,6 +111,12 @@ func (r VideoResult) MarshalJSON() ([]byte, error) {
 	if r.SubURL != "" {
 		payload["sub_url"] = r.SubURL
 	}
+	if r.Client != "" {
+		payload["client"] = r.Client
+	}
+	if r.UserAgent != "" {
+		payload["user_agent"] = r.UserAgent
+	}
 	if len(r.Subtitles) > 0 {
 		payload["subtitles"] = r.Subtitles
 	}

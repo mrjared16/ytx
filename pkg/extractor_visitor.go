@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +13,63 @@ import (
 	"time"
 
 	"github.com/mrjared16/ytx/internal/cache"
+
+	"golang.org/x/sync/singleflight"
 )
+
+// errNativeVideoRequiresGuest rejects the native (guest-only) video path when
+// it is handed an authenticated configuration. Music is the authenticated
+// mode; running the guest visitor flight under a music auth key would share
+// (and collide with) the music flight and could pollute the authenticated
+// visitor caches. Rejected before any state read or network I/O.
+var errNativeVideoRequiresGuest = errors.New("native video extraction is guest-only: an authenticated configuration must use music mode")
+
+// videoVisitorFlightTimeout bounds one shared video visitor bootstrap or
+// forced-refresh request so its lifetime never depends on any caller's
+// cancellation or deadline. Generous enough for slow networks, but a hung
+// request is released and reported within the bound.
+const videoVisitorFlightTimeout = 30 * time.Second
+
+// videoVisitorDoChan starts or joins the single shared video visitor flight
+// for authKey. The flight fn runs at most once (via singleflight), in its own
+// goroutine, under a bounded context derived from the initiating caller's
+// context but stripped of its cancellation and deadline (values are retained).
+// Canceling the initiating caller therefore can never abort the shared work or
+// fail joiners. Each caller must select on its own ctx.Done() vs the returned
+// channel so any caller - leader or joiner - returns promptly on cancellation.
+// There is deliberately no production observation hook: callers that need to
+// prove they reached the wait wrap their own context (see the tests).
+func (e *Extractor) videoVisitorDoChan(ctx context.Context, authKey string, flight func(flightCtx context.Context) (any, error)) <-chan singleflight.Result {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// The bounded context is derived inside the flight closure so joiners
+	// neither create timers nor invoke the flight fn.
+	return e.runtime.visitorGroup.DoChan(authKey, func() (any, error) {
+		flightCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), videoVisitorFlightTimeout)
+		defer stop()
+		return flight(flightCtx)
+	})
+}
+
+// videoVisitorFlightResult decodes one shared video visitor flight result
+// under the strict flight contract. The bootstrap and forced-refresh paths
+// share auth key "video", so a bootstrap that leads with a typed but empty
+// VisitorCache must never be accepted as a successful forced refresh (or an
+// empty bootstrap candidate): an empty shared result is always an error.
+func videoVisitorFlightResult(res singleflight.Result) (string, error) {
+	if res.Err != nil {
+		return "", res.Err
+	}
+	vc, ok := res.Val.(*cache.VisitorCache)
+	if !ok || vc == nil {
+		return "", fmt.Errorf("video visitor flight returned no visitor data")
+	}
+	if vc.Data == "" {
+		return "", fmt.Errorf("video visitor flight returned empty visitor data")
+	}
+	return vc.Data, nil
+}
 
 // fetchVisitorData gets visitorData from YouTube using WEB client (required since Jan 2025)
 // and reuses shared runtime cache state across extractors.
@@ -20,6 +77,12 @@ func (e *Extractor) fetchVisitorData(videoID string) error {
 	return e.fetchVisitorDataContext(context.Background(), videoID)
 }
 
+// fetchVisitorDataContext keeps the historical public signature. The shared
+// flight result (the VALUE, never a leader callback) is delivered to ALL
+// waiters through the singleflight. Auth-key isolation, SWR apply, and store
+// semantics are unchanged. The flight is caller-bound on the initiating
+// caller's context, exactly as HEAD; guest isolation from the native video
+// flight comes from visitorLegacyAuthKey ("video:legacy").
 func (e *Extractor) fetchVisitorDataContext(ctx context.Context, videoID string) error {
 	if e.visitorData != "" {
 		if !e.config.NeedsCookies || e.sessionIndex != "" || e.delegatedSID != "" {
@@ -60,7 +123,16 @@ func (e *Extractor) fetchVisitorDataContext(ctx context.Context, videoID string)
 		}
 	}
 
-	v, err, _ := e.runtime.visitorGroup.Do(authKey, func() (any, error) {
+	// The shared flight returns the visitor value to every waiter: the leader
+	// runs the fetch, joiners receive the same value through the singleflight
+	// result — never through a leader-only callback.
+	//
+	// Guest and music both keep the historical caller-bound singleflight: the
+	// flight runs under the initiating caller's own context, exactly as HEAD.
+	// Guest isolation comes from the dedicated key (visitorLegacyAuthKey), not
+	// from a detached lifetime, so a canceled legacy caller aborts its own
+	// flight without ever touching the native guest flight.
+	v, err, _ := e.runtime.visitorGroup.Do(e.visitorLegacyAuthKey(), func() (any, error) {
 		vc, err := e.fetchFreshVisitorDataContext(ctx, videoID)
 		if err != nil {
 			return nil, err
@@ -77,6 +149,72 @@ func (e *Extractor) fetchVisitorDataContext(ctx context.Context, videoID string)
 	return nil
 }
 
+// fetchVideoVisitorCandidate returns the visitorData candidate for one video
+// extraction WITHOUT committing it: nothing is applied to extractor state and
+// nothing is written to the runtime or disk caches. The candidate may come
+// from already-validated extractor state, the shared runtime visitor cache,
+// the disk cache, or a fresh bootstrap. The value is committed only after
+// the video chain validates it end-to-end, so failed runs leave every layer
+// of state untouched. No stale-while-revalidate refresh is started here: an
+// async refresh would commit an unvalidated fresh visitor.
+//
+// The native video path is explicitly GUEST-ONLY. An authenticated
+// (cookie-bearing) configuration belongs to the music/audio path; running
+// this flight under a music auth key would share (and collide with) the music
+// visitor flight and could pollute the authenticated visitor caches. The
+// configuration is therefore rejected before any state read or network I/O.
+func (e *Extractor) fetchVideoVisitorCandidate(ctx context.Context, videoID string) (string, error) {
+	if e.config.NeedsCookies {
+		return "", errNativeVideoRequiresGuest
+	}
+
+	// Guest-only from here on, so any already-present visitor is usable as the
+	// candidate without the session/delegated-SID probe the shared path needs.
+	if e.visitorData != "" {
+		return e.visitorData, nil
+	}
+
+	authKey := e.visitorAuthKey()
+
+	e.runtime.visitorCache.RLock()
+	memVisitor := &cache.VisitorCache{
+		Data:         e.runtime.visitorCache.data,
+		SessionIndex: e.runtime.visitorCache.sessionIndex,
+		DelegatedSID: e.runtime.visitorCache.delegatedSID,
+		IsAuth:       e.runtime.visitorCache.isAuth,
+		AuthKey:      e.runtime.visitorCache.authKey,
+		ExpiresAt:    e.runtime.visitorCache.expiry,
+	}
+	e.runtime.visitorCache.RUnlock()
+	if e.visitorCacheUsable(memVisitor, authKey) {
+		return memVisitor.Data, nil
+	}
+
+	if e.cacheManager != nil {
+		if vc, _, err := e.cacheManager.LoadVisitorDataAllowStale(visitorDataSWRGrace); err == nil && e.visitorCacheUsable(vc, authKey) {
+			return vc.Data, nil
+		}
+	}
+
+	ch := e.videoVisitorDoChan(ctx, authKey, func(flightCtx context.Context) (any, error) {
+		return e.fetchFreshVisitorDataContext(flightCtx, videoID)
+	})
+	var res singleflight.Result
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case res = <-ch:
+		// Prefer the caller's own cancellation even if the shared result
+		// arrived first: a canceled caller must never act on a flight result.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		// Strict on the shared guest video flight: an empty result led by
+		// either the bootstrap or the forced refresh is never a success.
+		return videoVisitorFlightResult(res)
+	}
+}
+
 func (e *Extractor) visitorAuthKey() string {
 	if !e.config.NeedsCookies {
 		return "video"
@@ -85,6 +223,24 @@ func (e *Extractor) visitorAuthKey() string {
 		return "music:" + e.sapisid
 	}
 	return "music"
+}
+
+// visitorLegacyAuthKey returns the singleflight key for the legacy guest
+// visitor flights (fetchVisitorDataContext and refreshVisitorDataAsync, guest
+// only). Those flights commit shared cache state from inside the flight and
+// stay caller-bound on the explicit legacy API, so they are deliberately
+// isolated from the native guest flight key "video": a legacy leader must
+// never impose its cancellation, lifetime, or commit semantics on native
+// extraction-local candidate joiners, and native bounded flights must never
+// hijack legacy committing work. Music/authenticated keys are unchanged (the
+// music foreground path is HEAD's single caller-bound flight on the music auth
+// key, exactly as before). The shared runtime/disk cache is still keyed by
+// visitorAuthKey, so cache isolation and apply/store semantics are unchanged.
+func (e *Extractor) visitorLegacyAuthKey() string {
+	if !e.config.NeedsCookies {
+		return "video:legacy"
+	}
+	return e.visitorAuthKey()
 }
 
 func (e *Extractor) visitorCacheUsable(vc *cache.VisitorCache, authKey string) bool {
@@ -134,7 +290,7 @@ func (e *Extractor) refreshVisitorDataAsync(parent context.Context, videoID stri
 	go func() {
 		ctx, cancel := backgroundRefreshContext(parent, backgroundWarmupTTL)
 		defer cancel()
-		_, err, _ := e.runtime.visitorGroup.Do(e.visitorAuthKey(), func() (any, error) {
+		_, err, _ := e.runtime.visitorGroup.Do(e.visitorLegacyAuthKey(), func() (any, error) {
 			vc, err := e.fetchFreshVisitorDataContext(ctx, videoID)
 			if err != nil {
 				return nil, err
@@ -209,18 +365,65 @@ func (e *Extractor) fetchWebVisitorDataContext(ctx context.Context, videoID stri
 	}, nil
 }
 
-func (e *Extractor) cacheVisitorData() {
-	if e.visitorData == "" {
+// forceRefreshVideoVisitorCandidate fetches a fresh guest WEB visitorData
+// bypassing both memory and disk caches and returns it as a retry candidate,
+// WITHOUT persisting or applying it (self-healing a poisoned guest cache).
+// Video-only: it refuses authenticated configs so music behavior is
+// untouched. Concurrent refreshes are deduped through the shared singleflight
+// group keyed by the video auth key. The caller commits the candidate only if
+// the retry chain validates it end-to-end.
+func (e *Extractor) forceRefreshVideoVisitorCandidate(ctx context.Context, videoID string) (string, error) {
+	if e.config.NeedsCookies {
+		return "", errNativeVideoRequiresGuest
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	ch := e.videoVisitorDoChan(ctx, e.visitorAuthKey(), func(flightCtx context.Context) (any, error) {
+		vc, err := e.fetchWebVisitorDataContext(flightCtx, videoID)
+		if err != nil {
+			return nil, err
+		}
+		// Keep a typed-but-empty result out of the shared flight even when
+		// this caller leads: the common result contract rejects it anyway.
+		if vc == nil || vc.Data == "" {
+			return nil, fmt.Errorf("video visitor refresh returned empty visitor data")
+		}
+		return vc, nil
+	})
+	var res singleflight.Result
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case res = <-ch:
+		// Prefer the caller's own cancellation even if the shared result
+		// arrived first: a canceled caller must never act on a flight result.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		// Guest-only path: always strict against an empty shared result.
+		return videoVisitorFlightResult(res)
+	}
+}
+
+// commitVideoVisitor applies and persists the EXACT visitor candidate that a
+// validated video chain won with. Using the parameter rather than the shared
+// e.visitorData field prevents a concurrent extraction (or an unvalidated SWR
+// result) from substituting a different value into this run's commit.
+func (e *Extractor) commitVideoVisitor(visitorData string) {
+	if visitorData == "" {
 		return
 	}
-	e.storeVisitorCache(&cache.VisitorCache{
-		Data:         e.visitorData,
+	vc := &cache.VisitorCache{
+		Data:         visitorData,
 		SessionIndex: e.sessionIndex,
 		DelegatedSID: e.delegatedSID,
 		IsAuth:       e.config.NeedsCookies,
 		AuthKey:      e.visitorAuthKey(),
 		ExpiresAt:    time.Now().Add(visitorDataTTL),
-	})
+	}
+	e.applyVisitorCache(vc)
+	e.storeVisitorCache(vc)
 }
 
 var (

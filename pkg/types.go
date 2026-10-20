@@ -1,6 +1,11 @@
 package ytx
 
-import "encoding/json"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+)
 
 // === INNERTUBE REQUEST ===
 
@@ -38,19 +43,20 @@ type InnertubeContext struct {
 }
 
 type InnertubeClient struct {
-	HL            string `json:"hl"`
-	GL            string `json:"gl"`
-	ClientName    string `json:"clientName"`
-	ClientVersion string `json:"clientVersion"`
-	UserAgent     string `json:"userAgent,omitempty"`
-	TimeZone      string `json:"timeZone"`
-	UTCOffset     int    `json:"utcOffsetMinutes"`
-	DeviceMake    string `json:"deviceMake,omitempty"`
-	DeviceModel   string `json:"deviceModel,omitempty"`
-	Platform      string `json:"platform,omitempty"`
-	OSName        string `json:"osName,omitempty"`
-	OSVersion     string `json:"osVersion,omitempty"`
-	VisitorData   string `json:"visitorData,omitempty"`
+	HL                string `json:"hl"`
+	GL                string `json:"gl"`
+	ClientName        string `json:"clientName"`
+	ClientVersion     string `json:"clientVersion"`
+	UserAgent         string `json:"userAgent,omitempty"`
+	TimeZone          string `json:"timeZone"`
+	UTCOffset         int    `json:"utcOffsetMinutes"`
+	DeviceMake        string `json:"deviceMake,omitempty"`
+	DeviceModel       string `json:"deviceModel,omitempty"`
+	Platform          string `json:"platform,omitempty"`
+	OSName            string `json:"osName,omitempty"`
+	OSVersion         string `json:"osVersion,omitempty"`
+	AndroidSDKVersion int    `json:"androidSdkVersion,omitempty"`
+	VisitorData       string `json:"visitorData,omitempty"`
 }
 
 type PlaybackContext struct {
@@ -271,6 +277,8 @@ type VideoResult struct {
 	Height    int        `json:"height"`
 	Title     string     `json:"title"`
 	Author    string     `json:"author"`
+	Client    string     `json:"client,omitempty"`
+	UserAgent string     `json:"user_agent,omitempty"`
 	Chapters  []Chapter  `json:"chapters,omitempty"`
 	Subtitles []Subtitle `json:"subtitles,omitempty"`
 	Warnings  []string   `json:"warnings,omitempty"`
@@ -287,4 +295,127 @@ type BulkResult struct {
 	Bitrate int    `json:"bitrate,omitempty"`
 	Title   string `json:"title,omitempty"`
 	Error   string `json:"error,omitempty"`
+}
+
+// Video attempt failure kinds for the sequential video profile chain.
+const (
+	VideoAttemptHTTP        = "http"
+	VideoAttemptDecode      = "decode"
+	VideoAttemptPlayability = "playability"
+	VideoAttemptSABROnly    = "sabr_only"
+	VideoAttemptCipherOnly  = "cipher_only"
+	VideoAttemptNoStream    = "no_stream"
+	VideoAttemptProbe       = "probe"
+	VideoAttemptCancelled   = "cancelled"
+)
+
+// VideoAttemptError records a single failed client attempt in the video chain.
+type VideoAttemptError struct {
+	Client     string
+	Kind       string
+	Status     string
+	Reason     string
+	HTTPStatus int
+	Err        error
+}
+
+func (a VideoAttemptError) Error() string {
+	if a.Reason != "" {
+		return "video attempt " + a.Client + " (" + a.Kind + "): " + a.Status + " - " + a.Reason
+	}
+	if a.Status != "" {
+		return "video attempt " + a.Client + " (" + a.Kind + "): " + a.Status
+	}
+	if a.Err != nil {
+		return "video attempt " + a.Client + " (" + a.Kind + "): " + a.Err.Error()
+	}
+	return "video attempt " + a.Client + " (" + a.Kind + ")"
+}
+
+func (a VideoAttemptError) Unwrap() error { return a.Err }
+
+// VideoExhaustedError aggregates all failed attempts after the chain is exhausted.
+type VideoExhaustedError struct {
+	Attempts []VideoAttemptError
+	Cause    error
+}
+
+func (e *VideoExhaustedError) Error() string {
+	if len(e.Attempts) == 0 {
+		return "video extraction failed: no attempts"
+	}
+	msg := "video extraction failed: all clients exhausted"
+	for _, a := range e.Attempts {
+		msg += "; [" + a.Error() + "]"
+	}
+	return msg
+}
+
+func (e *VideoExhaustedError) Unwrap() error { return e.Cause }
+
+// MostlyLogin reports whether a strict majority of attempts failed with
+// login-gated playability, used to categorize the exhausted error as
+// AUTH_FAILED. Ties do not count: cancellation or rate limiting must never
+// be classified as AUTH_FAILED.
+func (e *VideoExhaustedError) MostlyLogin() bool {
+	if e == nil || len(e.Attempts) == 0 {
+		return false
+	}
+	login := 0
+	for _, a := range e.Attempts {
+		if a.Kind != VideoAttemptPlayability {
+			continue
+		}
+		if a.Status == "LOGIN_REQUIRED" {
+			login++
+		}
+	}
+	return login > 0 && login*2 > len(e.Attempts)
+}
+
+// Cancelled reports whether the chain stopped due to caller cancellation or
+// deadline (aggregate Cause or a cancelled attempt).
+func (e *VideoExhaustedError) Cancelled() bool {
+	if e == nil {
+		return false
+	}
+	if e.Cause != nil && (errors.Is(e.Cause, context.Canceled) || errors.Is(e.Cause, context.DeadlineExceeded)) {
+		return true
+	}
+	for _, a := range e.Attempts {
+		if a.Kind == VideoAttemptCancelled {
+			return true
+		}
+	}
+	return false
+}
+
+// RateLimited reports whether any attempt hit HTTP 429.
+func (e *VideoExhaustedError) RateLimited() bool {
+	if e == nil {
+		return false
+	}
+	for _, a := range e.Attempts {
+		if a.HTTPStatus == http.StatusTooManyRequests {
+			return true
+		}
+	}
+	return false
+}
+
+// MostlyUnplayable reports whether a strict majority of attempts failed with
+// non-login playability errors (private/unavailable videos), used to
+// categorize the exhausted error as VIDEO_NOT_FOUND.
+func (e *VideoExhaustedError) MostlyUnplayable() bool {
+	if e == nil || len(e.Attempts) == 0 {
+		return false
+	}
+	unplayable := 0
+	for _, a := range e.Attempts {
+		if a.Kind != VideoAttemptPlayability || a.Status == "LOGIN_REQUIRED" {
+			continue
+		}
+		unplayable++
+	}
+	return unplayable > 0 && unplayable*2 > len(e.Attempts)
 }
