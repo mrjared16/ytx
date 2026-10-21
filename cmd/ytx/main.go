@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -25,7 +27,8 @@ Usage:
     ytx cache refresh VIDEO_ID             Refresh player.js/cipher cache now
 
 Modes:
-    video   Fast extraction using ANDROID_VR client (no auth needed)
+    video   Fast extraction using sequential native client chain
+            (VISIONOS → ANDROID_VR → ANDROID → IOS, no auth needed)
             Returns video and audio URLs for players like MPV
 
     music   Premium 256kbps audio using WEB_MUSIC client
@@ -306,6 +309,23 @@ func printError(code, message, debug string) {
 }
 
 func categorizeError(err error) string {
+	var exhausted *ytxpkg.VideoExhaustedError
+	if errors.As(err, &exhausted) {
+		// Cancellation and rate limiting are never auth failures.
+		switch {
+		case exhausted.Cancelled() || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			return "API_ERROR"
+		case exhausted.RateLimited():
+			return "API_ERROR"
+		case exhausted.MostlyLogin():
+			return "AUTH_FAILED"
+		case exhausted.MostlyUnplayable():
+			return "VIDEO_NOT_FOUND"
+		default:
+			return "API_ERROR"
+		}
+	}
+
 	errStr := err.Error()
 
 	switch {

@@ -311,7 +311,7 @@ All errors are returned as JSON to stderr:
 | Code | Meaning |
 |------|---------|
 | `BAD_COOKIES` | Cookie file invalid or SAPISID missing |
-| `AUTH_FAILED` | Authentication failed (expired cookies) |
+| `AUTH_FAILED` | Authentication required, or cookies are invalid/expired. A guest video-mode `LOGIN_REQUIRED` result does not by itself prove bad cookies. |
 | `PREMIUM_NEEDED` | Content requires Premium (rare) |
 | `VIDEO_NOT_FOUND` | Video doesn't exist or is private |
 | `CIPHER_FAILED` | Signature decryption failed |
