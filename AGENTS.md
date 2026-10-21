@@ -143,6 +143,7 @@ Verified in this repo: `go test -v -run '^TestCacheIsolation$' -count=1 ./pkg`
 - `signatureTimestamp` in playback context is critical; do not remove it casually
 - When YouTube changes behavior, consult `DEVELOPMENT.md` and compare with `yt-dlp` before large refactors
 - Keep Bun preferred but preserve Node fallback unless the runtime strategy is being changed intentionally
+- Music mode work must preserve the highest available valid decode; speed never excuses invalid decode or silent downgrade.
 
 ## Agent workflow guidance
 - Make minimal, local changes first
