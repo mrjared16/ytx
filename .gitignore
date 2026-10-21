@@ -1,5 +1,5 @@
 # Binaries
-ytx
+/ytx
 go-ytmusic*
 *.exe
 *.exe~
@@ -61,3 +61,6 @@ release/
 .serena
 /.agents/skills
 /.codex
+
+# bv (beads viewer) local config and caches
+.bv/
