@@ -8,11 +8,13 @@ Fast YouTube stream URL extractor written in Go. Designed for integration with m
 
 ## Features
 
-- **Video Mode**: Extract video + audio URLs (**~240ms**) - no authentication required, configurable max resolution
-- **Music Mode**: Extract 256kbps premium audio (~1100ms) - requires YouTube Premium cookies
-- **Bulk Mode**: Extract multiple tracks with pipelined requests (3 tracks in ~1100ms)
-- **Direct URLs**: No cipher required for video mode (ANDROID_VR client)
+- **Video Mode**: Extract video + audio URLs with no authentication required; optional maximum resolution
+- **Music Mode**: Extract the highest available authenticated audio format; requires a cookies file
+- **Bulk Mode**: Extract multiple tracks sequentially and stream NDJSON results
+- **Direct URLs**: Native video profiles return direct URLs without cipher, PO, or JS processing
 - **NDJSON Output**: Streaming JSON output for bulk operations
+
+Timing varies with network conditions, cache state, and JS runtime startup; this project does not publish a fixed latency SLO.
 
 ## Architecture
 
@@ -21,28 +23,38 @@ ytx/
 ├── cmd/
 │   └── ytx/           # CLI entry point
 ├── pkg/               # Core packages
-│   ├── client.go      # Client configuration factory (ANDROID_VR vs WEB_MUSIC)
+│   ├── client.go      # Video native profile chain and WEB_REMIX music config
 │   ├── extractor.go   # Core extraction logic (API calls, stream selection)
-│   ├── bulk.go        # Pipelined bulk extraction with rate limiting
+│   ├── bulk.go        # Sequential bulk extraction with inter-track delay
 │   ├── cipher.go      # Signature decryption (music mode only)
-│   ├── auth.go        # SAPISIDHASH authentication for premium access
+│   ├── auth.go        # SAPISIDHASH authentication for music access
 │   ├── constants.go   # Client constants, API endpoints, itag priorities
 │   ├── types.go       # Data structures for requests/responses
 │   └── cache.go       # Persistent cipher cache
 └── docs/             # Documentation
 ```
 
-### Dual-Client Architecture
+### Video and Music Paths
 
-| Mode | Client | Auth | Cipher | Speed | Quality |
-|------|--------|------|--------|-------|---------|
-| `video` | ANDROID_VR | None | No | **~260ms** | 1080p video + 160kbps audio |
-| `music` | WEB_MUSIC | SAPISIDHASH | Yes | **~512ms (warm)** | 256kbps audio (itag 141/774) |
+| Mode | Client | Auth | Cipher | Quality |
+|------|--------|------|--------|---------|
+| `video` | VISIONOS → ANDROID_VR → ANDROID → IOS (sequential fallback) | None | No | 1080p variants preferred, then 720p; otherwise highest available, subject to `--max-height`; direct audio |
+| `music` | WEB_REMIX | SAPISIDHASH | Yes | Highest available supported audio (141/774 when offered; 251/140 fallbacks) |
 
-**Why two clients?**
+Video mode tries each native client in order and keeps the first one that
+returns direct adaptive streams whose end byte—and, when length discovery is
+needed, start byte—probe successfully (HTTP 206 with matching Content-Range).
+This validates reachability and byte access, not decoder or playback support.
+Direct audio format and bitrate depend on the winning client and available
+formats. The winning `client` and `user_agent` are included in the JSON output.
+HTTP 429 or cancellation stops the fallback chain.
 
-- **ANDROID_VR**: Returns direct URLs (no cipher), but max 160kbps audio
-- **WEB_MUSIC**: Requires cipher decryption, but provides premium 256kbps audio
+**Why separate video and music paths?**
+
+- **Video path**: Guest native profiles return direct adaptive URLs without
+  cipher, PO, or JS processing.
+- **Music path**: `WEB_REMIX` uses authenticated cookies plus cipher and
+  n-transform handling to select the highest available supported audio.
 
 ## Installation
 
@@ -58,13 +70,16 @@ go install github.com/mrjared16/ytx@latest
 
 ## Usage
 
+Examples use sample IDs; stream formats, bitrates, and URLs are illustrative
+and vary by video, account, and network conditions.
+
 ### Video Mode (MPV Playback)
 
 Extract video + audio URLs for players like MPV. No authentication required.
 
 ```bash
 ytx video VIDEO_ID
-ytx video VIDEO_ID --max-height 1080    # Limit to 1080p (saves bandwidth)
+ytx video VIDEO_ID --max-height 1080    # Limit to 1080p when available
 ytx video VIDEO_ID --max-height 720     # Limit to 720p
 ytx video VIDEO_ID --subs               # Include subtitles (en by default)
 ytx video VIDEO_ID --chapters           # Include chapter metadata for mpv/players
@@ -89,6 +104,8 @@ ytx video VIDEO_ID_WITH_CHAPTERS --subs --chapters
   "height": 1080,
   "title": "Rick Astley - Never Gonna Give You Up",
   "author": "Rick Astley",
+  "client": "VISIONOS",
+  "user_agent": "Mozilla/5.0 ...",
   "chapters": [
     {"start_time": 0, "end_time": 42.5, "title": "Intro"},
     {"start_time": 42.5, "end_time": 95.0, "title": "Verse 1"}
@@ -102,17 +119,21 @@ ytx video VIDEO_ID_WITH_CHAPTERS --subs --chapters
 
 **MPV Integration:**
 ```bash
-# Play video with separate audio track
+# Play video with separate audio track.
+# Pass the returned user_agent so stream hosts see the winning client UA.
 result=$(ytx video hbl2Cuw75oE)
 video_url=$(echo "$result" | jq -r '.video_url')
 audio_url=$(echo "$result" | jq -r '.audio_url')
-mpv "$video_url" --audio-file="$audio_url"
+ua=$(echo "$result" | jq -r '.user_agent // empty')
+mpv "$video_url" --audio-file="$audio_url" ${ua:+--user-agent="$ua"}
 
 # Play with subtitles
 result=$(ytx video hbl2Cuw75oE --subs)
+ua=$(echo "$result" | jq -r '.user_agent // empty')
 mpv "$(echo $result | jq -r '.video_url')" \
     --audio-file="$(echo $result | jq -r '.audio_url')" \
-    --sub-file="$(echo $result | jq -r '.sub_url')"
+    --sub-file="$(echo $result | jq -r '.sub_url')" \
+    ${ua:+--user-agent="$ua"}
 
 # Print chapter metadata for external player integration
 result=$(ytx video MR6KSB6I_60 --chapters)
@@ -122,15 +143,20 @@ echo "$result" | jq '.chapters'
 result=$(ytx video VIDEO_ID --subs)
 mpv_args=("$(echo $result | jq -r '.video_url')")
 mpv_args+=(--audio-file="$(echo $result | jq -r '.audio_url')")
+if ua=$(echo $result | jq -r '.user_agent // empty'); [ -n "$ua" ]; then
+  mpv_args+=(--user-agent="$ua")
+fi
 while IFS= read -r sub; do
   mpv_args+=(--sub-file="$sub")
 done < <(echo $result | jq -r '.subtitles[].url')
 mpv "${mpv_args[@]}"
 ```
 
-### Music Mode (Premium 256kbps)
+### Music Mode (Highest Available Audio)
 
-Extract premium quality audio. Requires YouTube Premium account cookies.
+Extract the highest available supported audio. Music mode requires a cookies
+file; higher-quality formats may require YouTube Premium and depend on the
+track and account.
 
 ```bash
 ytx music VIDEO_ID --cookies PATH
@@ -155,7 +181,8 @@ ytx music hbl2Cuw75oE --cookies ~/cookies.txt
 
 ### Bulk Mode (Playlists/Albums)
 
-Extract multiple tracks with pipelined requests. Results stream as NDJSON.
+Extract multiple tracks sequentially in the order provided. Results stream as
+NDJSON as each extraction completes.
 
 ```bash
 ytx music --bulk ID1,ID2,ID3 --cookies PATH
@@ -188,10 +215,10 @@ done
 
 ### Why Cookies?
 
-Music mode requires YouTube Premium account cookies to:
-1. Authenticate with YouTube Music API
-2. Access premium audio quality (256kbps, itag 141/774)
-3. Generate SAPISIDHASH authentication header
+Music mode requires a cookies file to:
+1. Authenticate with the YouTube Music API
+2. Request higher-quality audio formats when the account and track offer them
+3. Generate the SAPISIDHASH authentication header
 
 ### Step 1: Export Cookies
 
@@ -202,7 +229,7 @@ Use a browser extension to export cookies in Netscape format:
 - Firefox: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
 
 **Export Steps:**
-1. Log into [music.youtube.com](https://music.youtube.com) with your Premium account
+1. Log into [music.youtube.com](https://music.youtube.com) with your YouTube account (Premium may unlock higher formats when offered)
 2. Click: extension icon
 3. Select "Export" or "Download cookies.txt"
 4. Save as `cookies.txt`
@@ -255,40 +282,20 @@ ytx music hbl2Cuw75oE
 
 # Test explicit path
 ytx music hbl2Cuw75oE --cookies ~/cookies.txt
-
-# Should return itag 141 or 774 (256kbps)
-# If you get itag 140 (128kbps), cookies may be invalid or not Premium
-```
-# Netscape HTTP Cookie File
-.youtube.com	TRUE	/	TRUE	1234567890	SAPISID	ABC123...
-.youtube.com	TRUE	/	TRUE	1234567890	__Secure-3PAPISID	ABC123...
-.youtube.com	TRUE	/	TRUE	1234567890	SID	DEF456...
-.youtube.com	TRUE	/	TRUE	1234567890	HSID	GHI789...
-.youtube.com	TRUE	/	TRUE	1234567890	SSID	JKL012...
 ```
 
-**Required Cookies:**
-- `SAPISID` or `__Secure-3PAPISID` (essential for SAPISIDHASH auth)
-- `SID`, `HSID`, `SSID` (session cookies)
-- `__Secure-1PSID`, `__Secure-3PSID` (secure session)
-
-### Step 3: Verify Cookies
-
-```bash
-# Test that cookies work
-ytx music dQw4w9WgXcQ --cookies ~/cookies.txt
-
-# Should return itag 141 or 774 (256kbps)
-# If you get itag 140 (128kbps), cookies may be invalid or not Premium
-```
+Common higher-quality formats are 141/774 when offered; 251/140 are valid
+lower-quality fallbacks. A 140/251 result does not by itself prove bad cookies.
+If a higher format is known to be available for the track but is missing,
+re-check the cookies.
 
 ### Cookie Troubleshooting
 
 | Error | Cause | Solution |
 |-------|-------|----------|
 | `SAPISID cookie not found` | Missing SAPISID in cookie file | Re-export cookies while logged in |
-| `AUTH_FAILED` | Cookies expired or invalid | Export fresh cookies |
-| `itag 140 instead of 141` | Not a Premium account | Use YouTube Premium account |
+| `AUTH_FAILED` | Authentication required, or cookies invalid/expired | Re-export cookies if authenticated music still fails; guest video-mode `LOGIN_REQUIRED` is not cookie proof |
+| `itag 140/251 instead of 141/774` | Higher format may not be offered for this track or account | Check a track where the higher format is known available; only then suspect cookies |
 | `video not playable` | Region restriction or private video | Try different video |
 
 ### Cookie Security
@@ -300,7 +307,9 @@ ytx music dQw4w9WgXcQ --cookies ~/cookies.txt
 
 ## Error Handling
 
-All errors are returned as JSON to stderr:
+Single-extraction and command-level errors are returned as JSON to stderr.
+Bulk per-track failures are emitted as NDJSON on stdout alongside successful
+track results.
 
 ```json
 {"error":"ERROR_CODE","message":"description"}
@@ -319,50 +328,28 @@ All errors are returned as JSON to stderr:
 
 ## Performance
 
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Video mode (single) | **~260ms** | No cipher, direct URLs |
-| Music mode (cold) | **~1134ms** | First call, cipher fetched |
-| Music mode (warm) | **~512ms** | Cipher cached to disk |
-| Bulk (4 tracks, warm) | **~393ms** | Batched + pipelined (~98ms/track) |
-| Bulk (10 tracks, est) | **~980ms** | 2 batches × ~490ms |
-| Bulk (50 tracks, est) | **~4.9s** | 5 batches × ~980ms |
+Timing varies with network conditions, YouTube responses, cache state, and JS
+runtime startup. This project does not publish a fixed latency SLO; cold and
+warm runs have different costs. Use `--profile` for per-stage timings on your
+machine.
 
 ### Persistent Cipher Cache
 
-The cipher (extracted from YouTube's base.js) is cached to disk at `~/.cache/ytx/cipher.json`. This eliminates the ~1500ms cipher fetch overhead on subsequent calls.
+Cipher, player.js, and n-runtime artifacts are cached in the user cache
+directory (`~/.cache/ytx` on typical Linux setups; `cipher.json` is the main
+entry). Cipher entries expire after 6 hours.
 
-**Cache behavior:**
-- **TTL:** 6 hours (cipher rarely changes)
-- **Fail-forward:** If decryption fails, cache is invalidated and refreshed automatically
-- **Size:** ~20KB (only extracted functions, not the full 2.3MB base.js)
+- **Legacy signature path:** a failed signature decrypt may invalidate and
+  refresh the cipher, then retry decryption with a fresh player response.
+- **Modern URL-wrapper path:** fails closed instead of automatically retrying
+  or purging the cache. Use `ytx cache purge` to clear cached data manually.
 
-```
-First call:    ~1800ms (fetch cipher, save to disk)
-Second call:    ~300ms (load from disk ~10ms + API ~290ms)
-Cache stale:   ~1800ms (one-time refresh)
-```
+### Bulk Scheduling
 
-### Intelligent Batching
-
-Bulk mode uses bucket-based pipelining to maximize throughput while staying under rate limits:
-
-```
-┌────────────────────────────────────────────────────────┐
-│  Bucket 1: [id1...id10]  → 50ms stagger, parallel      │
-│  Wait 200ms                                            │
-│  Bucket 2: [id11...id20] → 50ms stagger, parallel      │
-│  ...                                                   │
-└────────────────────────────────────────────────────────┘
-```
-
-| Parameter | Default | Rationale |
-|-----------|---------|-----------|
-| Batch size | 10 | Safe concurrent window for premium accounts |
-| Intra-batch delay | 50ms | Stagger within batch |
-| Inter-batch delay | 200ms | Breathing room between batches |
-
-Premium accounts have higher rate limits - this configuration is tuned for authenticated users.
+Bulk mode processes IDs sequentially in the order provided, prefetches shared
+visitor/cipher/n-runtime state once, and applies a randomized inter-track delay
+(150ms base, ±100ms jitter). Each result is emitted as NDJSON when its
+extraction completes. There is no fixed throughput or batch-size target.
 
 ## Integration Examples
 
@@ -424,7 +411,7 @@ def get_video_urls(video_id: str) -> dict:
     return json.loads(result.stdout)
 
 def get_music_url(video_id: str, cookies: str) -> dict:
-    """Get premium 256kbps audio URL."""
+    """Get the highest available music audio URL."""
     result = subprocess.run(
         ["ytx", "music", video_id, "--cookies", cookies],
         capture_output=True, text=True
@@ -453,18 +440,18 @@ make test
 # Lint
 make lint
 
-# Cross-compile
-make build-linux
+# Optimized release binary
+make build-release
 
-# Release builds
+# Local release bundle
 make release
 ```
 
 ## Requirements
 
 - Go 1.25+
-- Bun or Node.js (for n-parameter transform in music mode)
-- For music mode: YouTube Premium account and Netscape-format cookies file
+- Bun preferred, with Node.js fallback, for music-mode n-parameter transforms
+- For music mode: a Netscape-format cookies file; higher audio formats may require YouTube Premium and depend on the track and account
 
 ## Troubleshooting
 
