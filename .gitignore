@@ -64,3 +64,6 @@ release/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Local beads tracker state (never tracked)
+/.beads/
