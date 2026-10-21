@@ -28,7 +28,8 @@ const (
 	AudioFormatM4A                     // 141 (m4a/aac) first
 )
 
-// AudioFormatPriority maps format preference to itag priority order
+// AudioFormatPriority maps format preference to itag priority order.
+// Music's 251-over-140 reorder is local to findBestAudioStream; keep this table's base order.
 var AudioFormatPriority = map[AudioFormat][]int{
 	AudioFormatWebm: {774, 141, 140, 251},
 	AudioFormatM4A:  {141, 774, 140, 251},
