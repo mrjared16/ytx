@@ -20,9 +20,9 @@ const usage = `ytx - Fast YouTube stream URL extractor
 
 Usage:
     ytx video VIDEO_ID [options]           Extract video+audio URLs (for MPV)
-    ytx music VIDEO_ID [options]           Extract 256kbps audio URL
+    ytx music VIDEO_ID [options]           Extract highest available audio URL
     ytx music --bulk ID1,ID2,... [options] Bulk extract (NDJSON output)
-    ytx cache purge                        Clear all cached data
+    ytx cache purge                        Clear cached cipher/player/runtime/wrapper/PO data
     ytx cache info                         Show cached player metadata
     ytx cache refresh VIDEO_ID             Refresh player.js/cipher cache now
 
@@ -31,11 +31,12 @@ Modes:
             (VISIONOS → ANDROID_VR → ANDROID → IOS, no auth needed)
             Returns video and audio URLs for players like MPV
 
-    music   Premium 256kbps audio using WEB_MUSIC client
-            Requires Premium account cookies
+    music   Highest available authenticated audio using WEB_REMIX
+            Requires cookies; no fixed bitrate guarantee
 
     cache   Cache management commands
-            purge   - Remove all cached cipher and player.js data
+            purge   - Remove cipher, player.js, n-runtime, wrapper, and PO cache
+                      (visitor.json is retained)
             info    - Show cached player path/fingerprint metadata
             refresh - Re-fetch player.js/cipher cache for a video ID
 
@@ -43,18 +44,21 @@ Options:
     --subs              Include subtitles in output (video mode only)
     --sub-langs LANGS   Subtitle languages: "en" (default), "all", or comma-separated (e.g., "en,es,ja")
     --chapters          Include chapter metadata in output (video mode only)
-    --max-height HEIGHT Maximum video height in pixels (e.g., 1080, 720, 480)
-    --cookies PATH      Path to Netscape-format cookies.txt (optional, defaults to ~/.config/ytx/cookies.txt)
-    --bulk IDS          Comma-separated video IDs for bulk extraction
-    --po                Enable explicit PO-mode extraction path (music mode only)
-    --js-engine ENGINE  bun|node|auto (default: auto, tries Bun → Node)
+    --max-height HEIGHT Maximum video height in pixels (video mode only; e.g. 1080, 720, 480)
+    --cookies PATH      Path to Netscape-format cookies.txt (music mode; optional; defaults to
+                        $XDG_CONFIG_HOME/ytx/cookies.txt or ~/.config/ytx/cookies.txt)
+    --bulk IDS          Comma-separated video IDs for bulk extraction (music mode)
+    --po                Opt-in PO-token path (music mode only); minting may fail
+    --js-engine ENGINE  auto|bun|node|quickjs (default: auto; auto tries Bun → Node,
+                        then embedded QuickJS for legacy n-transform; modern URL-wrapper
+                        players require Bun or Node)
     --profile           Output timing breakdown for each extraction stage
 
 Output:
     video mode: {"video_url":"...","audio_url":"...","video_itag":137,"audio_itag":251}
     with --subs: {"video_url":"...","audio_url":"...","sub_url":"...","subtitles":[{"url":"...","lang":"en","name":"English"}]}
     with --chapters: {"video_url":"...","audio_url":"...","chapters":[{"start_time":0,"end_time":150,"title":"Intro"}]}
-    music mode: {"url":"...","itag":141,"bitrate":256000,"title":"..."}
+    music mode: {"url":"...","itag":141,"bitrate":258454,"title":"..."}
     bulk mode:  NDJSON (one JSON per line, streamed)
 
 Examples:
@@ -249,7 +253,7 @@ func handleMusicMode() {
 			defaultPath, _ := ytxpkg.GetDefaultCookiePath()
 			cookieFile = defaultPath
 		} else {
-			printError("MISSING_COOKIES", "Music mode requires --cookies PATH or config file at ~/.config/ytx/cookies.txt", "")
+			printError("MISSING_COOKIES", "Music mode requires --cookies PATH or a default cookies.txt under $XDG_CONFIG_HOME/ytx or ~/.config/ytx", "")
 			os.Exit(1)
 		}
 	}
