@@ -29,7 +29,7 @@ make deps
 Notes:
 - `make deps` runs `go mod download` and `go mod tidy`
 - Music mode requires `bun` or `node`
-- Some tests/features require `~/.config/ytx/cookies.txt`
+- Regression/live-probe tests hardcode `$HOME/.config/ytx/cookies.txt`; the CLI default cookie path honors `XDG_CONFIG_HOME`
 
 ## Build, format, vet, lint
 Prefer Make targets:
@@ -58,7 +58,7 @@ make test-music-probe
 ```
 
 Testing concerns:
-- `make test` — logical/local correctness; safest default during development
+- `make test` — full `./pkg` suite, including live `TestExtractorRegression`; requires network and can skip cookie-gated music cases (not an offline-only default)
 - `make test-regression` — regression-sensitive coverage and golden-baseline checks
 - `make test-music-probe` — explicit live YouTube-side stream probes; use sparingly
 

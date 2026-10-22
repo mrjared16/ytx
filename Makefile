@@ -1,99 +1,32 @@
 # =============================================================================
-# ytx Makefile - High-Performance YouTube Stream Extractor
+# ytx Makefile - YouTube Stream Extractor
 # =============================================================================
 #
-# Optimized for BULK MUSIC EXTRACTION (your TUI app use case)
+# ARCHITECTURE NOTES:
+# - Video mode: guest-only native chain VISIONOS -> ANDROID_VR -> ANDROID -> IOS.
+#   Direct-URL formats are checked with near-end byte-range probes; this proves
+#   range readability, not signature/n decode correctness.
+# - Music mode: WEB_REMIX with cookies. Modern URL-wrapper players require Bun
+#   or Node. For the legacy n-transform, auto resolves Bun -> Node (the "node"
+#   binary) -> embedded QuickJS. Legacy signature decryption always uses
+#   embedded QuickJS. QuickJS is not a modern URL-wrapper fallback.
+# - PO mode: explicit --po. Each mint starts one short-lived Bun/Node subprocess;
+#   there is no persistent daemon. jsdom/bgutils-js are external dependencies.
+# - Cipher/player disk cache: version 7, 6-hour fresh TTL plus an 18-hour
+#   stale-while-revalidate grace from expires_at. Visitor and PO caches have
+#   separate TTLs. The in-memory runtime cache is process-scoped and resets its
+#   updated timestamp on disk hydration, so that window is not universal.
+#   `cache purge` retains visitor.json; `make cache-clear` removes the Makefile
+#   CACHE_DIR only (the CLI may use a different os.UserCacheDir path).
+# - Bulk extraction is sequential per video ID with a shared warmup and a
+#   randomized inter-track delay. One `ytx music --bulk` process shares its
+#   extractor/runtime; separate CLI invocations reuse only the on-disk cache.
+#   No fixed throughput or audio-quality promise.
 #
-# ARCHITECTURE OVERVIEW:
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │                             ytx CLI                                         │
-# ├──────────────────────────────────┬──────────────────────────────────────────┤
-# │     Video Mode (ANDROID_VR)      │     Music Mode (WEB_REMIX + Cookies)     │
-# │  • Direct URLs, no n-transform   │  • Requires n-parameter transformation  │
-# │  • ~340ms per video              │  • Premium quality (itag 141, 256kbps)   │
-# │  • Used occasionally             │  • YOUR MAIN USE CASE                    │
-# └──────────────────────────────────┴──────────────────────────────────────────┘
-#                                            │
-#                                            ▼
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │                        N-PARAMETER TRANSFORMATION                           │
-# │                                                                             │
-# │  BULK PERFORMANCE (with cached JS runner):                                  │
-# │  ┌────────────────────────────────────────────────────────────────────────┐ │
-# │  │  1st video:  ~700ms (cold start: fetch player.js + start Bun/Node)    │ │
-# │  │  2nd video:  ~100ms (warm: reuse cached runner)                       │ │
-# │  │  3rd video:  ~100ms (warm)                                            │ │
-# │  │  ...                                                                  │ │
-# │  │  100th video: ~100ms (warm)                                           │ │
-# │  │                                                                       │ │
-# │  │  TOTAL 100 videos: ~700ms + 99×100ms ≈ 10.6 seconds                   │ │
-# │  │  vs naive approach: 100×700ms = 70 seconds (6.6x slower!)             │ │
-# │  └────────────────────────────────────────────────────────────────────────┘ │
-# └─────────────────────────────────────────────────────────────────────────────┘
-#
-# WHY GOJA CANNOT RUN THE ENTIRE player.js (and we need Bun/Node):
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │  ANALYSIS RESULTS (from analyze_goja_full.go):                              │
-# │                                                                             │
-# │  1. PARSING: ✓ goja CAN parse the 2.6MB player.js (400ms)                  │
-# │                                                                             │
-# │  2. EXECUTION: ❌ FAILS because player.js uses ES2020+ features:           │
-# │     • async/await         (6 occurrences)   - goja: ES5.1 only             │
-# │     • Optional chaining   (10 occurrences)  - foo?.bar syntax              │
-# │     • Private class fields(135 occurrences) - #privateField syntax         │
-# │     • BigInt              (166 occurrences) - 123n literals                │
-# │                                                                             │
-# │  3. WHY NOT EXTRACT JUST THE N-FUNCTION?                                    │
-# │     The n-function is only 39 bytes:                                        │
-# │       function(S){return MP[z[7]](this,19,S)}                               │
-# │                                                                             │
-# │     But it calls MP[z[7]](), where:                                         │
-# │     • MP is a 707KB function with 533 closure-scoped dependencies           │
-# │     • z is an obfuscation array for method names                            │
-# │     • 'this' refers to the IIFE closure context                             │
-# │                                                                             │
-# │     You CANNOT extract MP without running the entire 2.6MB IIFE first!      │
-# │                                                                             │
-# │  CONCLUSION:                                                                │
-# │  We MUST use a full JavaScript runtime (Bun/Node) to:                       │
-# │  1. Execute the entire player.js in a browser-like VM context               │
-# │  2. Let the IIFE set up all closure variables (MP, z, etc.)                 │
-# │  3. Then call the exposed n-function                                        │
-# │                                                                             │
-# │  Bun is preferred: 2x faster startup than Node.js                           │
-# └─────────────────────────────────────────────────────────────────────────────┘
-#
-# OPTIMIZATION OPPORTUNITIES (10x engineer analysis):
-# ┌─────────────────────────────────────────────────────────────────────────────┐
-# │  CURRENT STATE (already optimized):                                         │
-# │  ✓ Cached JS runner (Bun/Node process stays alive)                          │
-# │  ✓ Compressed player.js cache (2.6MB → 848KB gzip)                          │
-# │  ✓ Connection pooling (HTTP/2, keep-alive)                                  │
-# │  ✓ Pre-compiled cipher (goja.Compile once, reuse)                           │
-# │                                                                             │
-# │  POTENTIAL FURTHER OPTIMIZATIONS:                                           │
-# │  ┌────────────────────────────────────────────────────────────────────────┐ │
-# │  │ 1. BATCH N-TRANSFORMS (not implemented yet)                            │ │
-# │  │    Current: Send 1 n-param per IPC call                                │ │
-# │  │    Better:  Send 10 n-params in one call, get 10 results back          │ │
-# │  │    Benefit: Reduce IPC overhead (each call is ~1ms overhead)           │ │
-# │  │                                                                        │ │
-# │  │ 2. PARALLEL API CALLS (not implemented yet)                            │ │
-# │  │    Current: Sequential YouTube API calls                               │ │
-# │  │    Better:  Concurrent API calls with semaphore (limit 5)              │ │
-# │  │    Benefit: Network latency is the bottleneck, parallelism helps       │ │
-# │  │                                                                        │ │
-# │  │ 3. WEBASSEMBLY QUICKJS (future consideration)                          │ │
-# │  │    Use QuickJS compiled to WASM (github.com/aspect-build/aspect-cli)   │ │
-# │  │    Pros: No external runtime dependency, faster startup                │ │
-# │  │    Cons: Larger binary, WASM overhead, complex build                   │ │
-# │  │                                                                        │ │
-# │  │ 4. PRE-WARM DAEMON (for TUI apps)                                      │ │
-# │  │    Keep a daemon running with hot JS runner                            │ │
-# │  │    TUI connects via Unix socket                                        │ │
-# │  │    Benefit: Instant response, no cold start                            │ │
-# │  └────────────────────────────────────────────────────────────────────────┘ │
-# └─────────────────────────────────────────────────────────────────────────────┘
+# MEASURE PERFORMANCE LOCALLY:
+# Network, player changes, cache state, runtime startup, and account access all
+# affect timings and available formats. The benchmark targets measure the
+# current environment; their output is not a cross-machine guarantee.
 
 # =============================================================================
 # Configuration
@@ -119,7 +52,8 @@ LDFLAGS := -s -w \
 	-X 'main.Version=$(VERSION)' \
 	-X 'main.BuildTime=$(BUILD_TIME)'
 
-# Cache directory
+# Makefile cache path (used by the targets below only). The CLI resolves its own
+# path via os.UserCacheDir()/XDG_CACHE_HOME; set CACHE_DIR to match a custom path.
 CACHE_DIR := $(HOME)/.cache/ytx
 
 # Test video IDs
@@ -144,8 +78,8 @@ all: build
 # =============================================================================
 
 ## build: Build development binary with race detector
-##   WHY: Race detector catches concurrency bugs (e.g., in cached JS runner)
-##   COST: ~10x slower execution, 5-10x memory overhead
+##   WHY: Race detector catches concurrency bugs (e.g., in the cached JS engine)
+##   COST: Slower execution and higher memory use than a normal build
 ##   USE: Development only
 .PHONY: build
 build:
@@ -154,7 +88,7 @@ build:
 	@echo "Done: ./$(BINARY_NAME) ($(shell ls -lh $(BINARY_NAME) | awk '{print $$5}'))"
 
 ## build-release: Build optimized production binary
-##   WHY: Smaller binary, faster execution, no debug overhead
+##   WHY: Smaller distributable binary with production build flags
 ##   -trimpath: Removes local file paths from binary (reproducible builds)
 ##   -ldflags "-s -w": Strips symbols and debug info
 ##   CGO_ENABLED=1: Required for embedded QuickJS support
@@ -181,25 +115,30 @@ build-fast:
 # TEST TARGETS
 # =============================================================================
 
-# Three test concerns:
-#   1. make test              -> logical / local correctness
-#   2. make test-regression   -> regression baseline and timing checks
-#   3. make test-music-probe  -> explicit live YouTube probes
+# Test concerns:
+#   1. make test              -> full ./pkg suite, including live extraction
+#   2. make test-regression   -> focused golden-image regression coverage
+#   3. make test-music-probe  -> explicit live YouTube-side probe tests
+#
+# The default test target is not a local-only unit-test command. Extraction
+# tests use the network and can skip cookie-gated music cases when the test's
+# hardcoded $HOME/.config/ytx/cookies.txt is absent (the CLI may use XDG).
 
-## test: Run logical/local tests
-##   WHY: Fast default correctness check for code changes
-##   SAFE: Probe tests are opt-in and skipped here
+## test: Run the package test suite, including live extraction
+##   WHY: Default correctness check for code changes
+##   NOTE: Includes TestExtractorRegression; network/cookie conditions apply
 .PHONY: test
 test:
-	@echo "Running logical/local tests..."
+	@echo "Running full ./pkg tests (live regression included; network required)..."
 	go test -v -timeout 180s ./pkg
 	@echo "Done"
 
-## test-regression: Run regression-focused tests
-##   WHY: Verifies correctness against saved baseline and regression-sensitive helpers
+## test-regression: Run focused regression tests
+##   WHY: Verifies behavior against the saved golden image
 ##   OUTPUT: Golden comparison plus focused regression coverage
+##   BOUND: TestExtractorRegression fails when total_ms > baseline + 300ms
 ##   TESTS:
-##     - TestExtractorRegression: Video mode extraction with timing
+##     - TestExtractorRegression: Video plus cookie-gated music/PO extraction
 ##     - TestNTransformIsolated: N-parameter transformation
 ##     - TestCacheIsolation: Verifies tests don't pollute system
 .PHONY: test-regression
@@ -216,17 +155,19 @@ test-regression-update:
 	UPDATE_GOLDEN=1 go test -v ./pkg -run '^TestExtractorRegression$$' -count=1 -timeout 180s
 	@echo "Done"
 
-## test-regression-perf: Fail on significant slowdown versus golden baseline
-##   RULE: Fails only when total_ms exceeds baseline by > max(250ms, 35%)
-##   USE: Manual performance gate after latency-sensitive changes
+## test-regression-perf: Run TestExtractorRegression with STRICT_REGRESSION=1
+##   ACTUAL: STRICT_REGRESSION is not read; there is no separate strict gate.
+##   RULE: The regression test allows golden total_ms + 300ms (TimingToleranceMs).
+##   USE: Not a stricter performance gate; compare benchmark results separately.
 .PHONY: test-regression-perf
 test-regression-perf:
-	@echo "Running strict regression performance check..."
+	@echo "Running regression with STRICT_REGRESSION=1 (not read by Go tests)..."
 	STRICT_REGRESSION=1 go test -v ./pkg -run '^TestExtractorRegression$$' -count=1 -timeout 180s
 	@echo "Done"
 
 ## test-music-probe: Run opt-in live YouTube-side probe tests (single + bulk)
-##   REQUIRES: ~/.config/ytx/cookies.txt
+##   REQUIRES: $HOME/.config/ytx/cookies.txt (hardcoded by tests), Bun or Node, network.
+##   PO CASES: Also need jsdom and bgutils-js resolvable by that runtime.
 ##   NOTE: Explicit opt-in live probe against YouTube
 .PHONY: test-music-probe
 test-music-probe:
@@ -238,36 +179,37 @@ test-music-probe:
 # BENCHMARK TARGETS (for your bulk extraction use case)
 # =============================================================================
 
-## bench: Run performance benchmarks
-##   OUTPUT:
-##     BenchmarkNTransform: ~5ms per call (with cached runner)
-##     BenchmarkVideoExtraction: ~360ms per video
+## bench: Run package tests plus all benchmarks
+##   NOTE: No -run filter, so normal tests run first, including live regression.
+##   OUTPUT: Environment-dependent timings (benchtime=3x); not a fixed SLA.
 .PHONY: bench
 bench:
 	@echo "Running benchmarks..."
 	go test -bench=. -benchmem -benchtime=3x ./pkg
 	@echo "Done"
 
-## bench-bulk: Simulate bulk music extraction (your TUI use case)
-##   WHY: Measures real-world performance for your app
-##   SHOWS: Cold start vs warm cache performance
+## bench-bulk: Run one music extraction, then three more sequentially
+##   NOTE: No cache purge; the "cold" run is cold only when cache is empty.
+##   SCOPE: One video ID, not a 50-track throughput test; no fixed ms/track.
+##   PROCESSES: Each run is a separate ytx process; only disk cache is reused.
+##   SHOWS: First-run itag/bitrate; repeats are silent; timing is environment-dependent.
 .PHONY: bench-bulk
 bench-bulk: build-fast
 	@echo "=== Bulk Music Extraction Benchmark ==="
 	@echo ""
-	@echo "Cold start (first video - includes player.js fetch):"
+	@echo "First run (cold only if disk cache is empty; may fetch player.js):"
 	@time -f "  Time: %E (real), CPU: %P" ./$(BINARY_NAME) music $(TEST_VIDEO) 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  Result: itag={d[\"itag\"]}, bitrate={d[\"bitrate\"]}')"
 	@echo ""
-	@echo "Warm cache (subsequent videos - reuses JS runner):"
+	@echo "Subsequent runs (separate processes; reuse valid disk cache):"
 	@for i in 1 2 3; do \
 		time -f "  Video $$i: %E" ./$(BINARY_NAME) music $(TEST_VIDEO) 2>/dev/null | head -c 1 > /dev/null; \
 	done
 	@echo ""
-	@echo "TIP: For your TUI app, first extraction warms the cache."
-	@echo "     Subsequent extractions reuse the cached JS runner (~100ms each)."
+	@echo "TIP: The first run can populate disk cache for later processes."
+	@echo "     No fixed per-track timing or cross-process JS runner is promised."
 
-## bench-compare-runtime: Compare Bun vs Node.js performance
-##   WHY: Validates that Bun is faster (2x startup time improvement)
+## bench-compare-runtime: Compare Bun and Node.js process startup
+##   NOTE: Measures trivial startup only; speedup is environment-dependent.
 .PHONY: bench-compare-runtime
 bench-compare-runtime:
 	@echo "=== JS Runtime Comparison ==="
@@ -278,21 +220,23 @@ bench-compare-runtime:
 	@echo "Node.js startup (10 invocations):"
 	@time -f "  Total: %E" sh -c 'for i in $$(seq 1 10); do node -e "console.log(1)" > /dev/null; done'
 	@echo ""
-	@echo "Bun is typically 2x faster on startup."
+	@echo "Startup difference varies by machine and runtime version; measure here."
 
 # =============================================================================
 # CACHE MANAGEMENT
 # =============================================================================
 
-## cache-info: Show cache status and contents
+## cache-info: Show cache location, contents, and cipher metadata
 ##   SHOWS:
-##     cipher.json: Signature decryption code (~20KB)
-##     player.js.gz: Compressed player.js for n-transform (~850KB)
-##   TTL: 6 hours
+##     cipher.json: Player/cipher metadata; cached file sizes vary
+##     player.js.gz: Gzip-compressed player bundle; cached file sizes vary
+##   PATH: $(CACHE_DIR) is the Makefile default; the CLI uses os.UserCacheDir().
+##   TTL: Cipher/player disk cache: 6 hours fresh plus 18 hours from expires_at.
+##        Visitor/PO caches use separate TTLs; in-memory state is process-scoped.
 .PHONY: cache-info
 cache-info:
 	@echo "=== Cache Information ==="
-	@echo "Location: $(CACHE_DIR)"
+	@echo "Location (Makefile CACHE_DIR; CLI may use os.UserCacheDir/XDG_CACHE_HOME): $(CACHE_DIR)"
 	@echo ""
 	@if [ -d "$(CACHE_DIR)" ]; then \
 		echo "Contents:"; \
@@ -301,25 +245,28 @@ cache-info:
 		echo "Expiry:"; \
 		cat $(CACHE_DIR)/cipher.json 2>/dev/null | python3 -c "import json,sys,datetime; d=json.load(sys.stdin); exp=d.get('expires_at',''); print(f'  Expires: {exp}'); print(f'  Created: {d.get(\"created_at\",\"\")}'); print(f'  Player URL: {d.get(\"player_url\",\"\")}')" 2>/dev/null || echo "  (unable to read)"; \
 	else \
-		echo "No cache found. Run 'make cache-warm' to pre-warm."; \
+		echo "No cache found. Run 'make cache-refresh' to fetch player/cipher artifacts."; \
 	fi
 
-## cache-clear: Clear all cached data
+## cache-clear: Remove the Makefile CACHE_DIR (not necessarily the CLI cache)
 ##   USE: When YouTube updates player.js and extraction fails
+##   PATH: Fixed $(CACHE_DIR); the CLI honors os.UserCacheDir()/XDG_CACHE_HOME.
+##   NOTE: Deletes visitor.json too; `ytx cache purge` retains visitor data.
 .PHONY: cache-clear
 cache-clear:
 	@echo "Clearing cache..."
 	rm -rf $(CACHE_DIR)
 	@echo "Done"
 
-## cache-warm: Pre-warm cache for faster first run
-##   WHY: For your TUI app, warm cache before user starts searching
-##   DOES: Fetches player.js and cipher, saves to cache
+## cache-warm: Warm guest video-mode visitor state
+##   WHY: Warms only the guest video path's visitor cache
+##   DOES: Runs `ytx video`; it does not fetch player.js/cipher or music auth state.
+##   MUSIC CACHE: Use `make cache-refresh` or `ytx cache refresh VIDEO_ID`.
 .PHONY: cache-warm
 cache-warm: build-fast
-	@echo "Warming cache..."
+	@echo "Warming guest video-mode visitor state..."
 	@./$(BINARY_NAME) video $(TEST_VIDEO) > /dev/null 2>&1
-	@echo "Cache warmed:"
+	@echo "Guest video cache attempt complete (music cipher not warmed):"
 	@ls -lh $(CACHE_DIR)/ 2>/dev/null || echo "  Error warming cache"
 
 ## cache-refresh: Force refresh current player.js/cipher cache and print fingerprint
@@ -337,16 +284,16 @@ cache-show: build-fast
 # ANALYSIS & DEBUGGING
 # =============================================================================
 
-## analyze-goja: Analyze why goja cannot run player.js
-##   SHOWS: ES2020+ features that goja doesn't support
-##   EDUCATIONAL: Explains the technical constraints
+## analyze-goja: Run the optional legacy goja compatibility script
+##   NOTE: analyze_goja_full.go is not tracked; absent script prints guidance.
+##   SCOPE: Legacy runtime diagnostics, not the modern Bun/Node URL-wrapper path.
 .PHONY: analyze-goja
 analyze-goja:
-	@echo "Analyzing goja compatibility with player.js..."
+	@echo "Running optional legacy goja compatibility script..."
 	@if [ -f "analyze_goja_full.go" ]; then \
 		go run analyze_goja_full.go; \
 	else \
-		echo "Analysis script not found. See Makefile comments for explanation."; \
+		echo "Analysis script not found; see Makefile comments (legacy diagnostic only)."; \
 	fi
 
 ## diagnose: Compare ytx with yt-dlp and direct API behavior
@@ -431,7 +378,7 @@ deps:
 	go mod download
 	go mod tidy
 	@echo "Checking JS runtime..."
-	@which bun > /dev/null && echo "✓ Bun found (preferred)" || (which node > /dev/null && echo "✓ Node.js found (Bun is 2x faster)" || echo "⚠ Install Bun or Node.js for music mode")
+	@which bun > /dev/null && echo "✓ Bun found (preferred)" || (which node > /dev/null && echo "✓ Node.js found (Bun preferred when available)" || echo "⚠ Install Bun or Node.js for music mode")
 
 # =============================================================================
 # INSTALLATION
@@ -487,10 +434,13 @@ clean-all: clean cache-clear
 # =============================================================================
 
 ## help: Show this help
+##   NOTE: Runtime and bulk sections below are qualitative, with no fixed
+##         timing promise; use the benchmark targets to measure this machine.
+##   NOTE: analyze-goja is a legacy diagnostic, not the current runtime path.
 .PHONY: help
 help:
 	@echo "ytx - YouTube Stream Extractor"
-	@echo "Optimized for bulk music extraction in TUI applications"
+	@echo "Video extraction plus cookie-authenticated music and sequential bulk mode"
 	@echo ""
 	@echo "USAGE: make [target]"
 	@echo ""
@@ -509,12 +459,12 @@ help:
 	@echo "ANALYSIS:"
 	@grep -E '^## (analyze|profile|diagnose|probe)' $(MAKEFILE_LIST) | sed 's/^## /  /' | cut -d: -f1
 	@echo ""
-	@echo "BULK MUSIC PERFORMANCE:"
-	@echo "  First video:  ~700ms (cold start)"
-	@echo "  Subsequent:   ~100ms (cached JS runner)"
-	@echo "  100 videos:   ~10.6s total (vs 70s without caching)"
+	@echo "BULK MUSIC BEHAVIOR:"
+	@echo "  ytx music --bulk is sequential in ONE process with a shared extractor/runtime."
+	@echo "  Separate CLI invocations each start a new process; only disk cache is reused."
+	@echo "  make bench-bulk does one first run plus three separate CLI repeats of one video."
 	@echo ""
-	@echo "WHY BUN/NODE.JS IS REQUIRED:"
-	@echo "  player.js uses ES2020+ features (async/await, ?., #fields)"
-	@echo "  goja only supports ES5.1"
-	@echo "  Run 'make analyze-goja' for detailed analysis"
+	@echo "JS RUNTIME (CURRENT):"
+	@echo "  Modern URL-wrapper players require Bun or Node; QuickJS is rejected."
+	@echo "  Legacy n-transform auto: Bun, then Node (node binary), then embedded QuickJS."
+	@echo "  Legacy signature always uses embedded QuickJS; analyze-goja is legacy-only."

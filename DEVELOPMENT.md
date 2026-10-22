@@ -5,23 +5,27 @@
 ```
 ytx/
 ├── cmd/
-│   └── ytx/           # CLI entry point, argument parsing
+│   ├── ytx/           # CLI entry point, argument parsing
+│   └── diagnose/      # ytx vs yt-dlp diagnostic tool
+├── internal/
+│   ├── cache/         # Versioned persistent cache (models, persistence)
+│   ├── jsengine/      # JS engine interface, Bun/Node subprocess, legacy QuickJS
+│   └── jsextract/     # Player/wrapper code extraction helpers
 ├── pkg/               # Core packages
-│   ├── client.go      # Client configuration factory (ANDROID_VR vs WEB_MUSIC)
-│   ├── extractor.go   # Core extraction logic (API calls, stream selection)
-│   ├── bulk.go        # Optimized bulk extraction with batch n-transform
-│   ├── cipher.go      # Signature/n-transform via QuickJS (wrapper mode)
-│   ├── jsengine.go    # JS engine interface (Bun/Node)
-│   ├── jsrunner.go    # Subprocess-based JS runner (Bun/Node)
-│   ├── quickjsrunner.go # QuickJS-based runner (in-process, no subprocess)
-│   ├── nrunner.mjs    # Node/Bun script for n-transform
+│   ├── client.go      # Video native client chain + mode config factory
+│   ├── extractor*.go  # Extraction flow, API calls, cipher integration, PO lane
+│   ├── bulk.go        # Sequential bulk extraction with shared warmup and jitter
+│   ├── cipher*.go     # Detection, URL-wrapper protocol, signature/n handling
+│   ├── runtime*.go    # Engine selection, caching, modern runner lifecycle
+│   ├── potrunner.go   # One Bun/Node subprocess per PO mint
+│   ├── po_minter.mjs  # Embedded PO minter script
 │   ├── auth.go        # SAPISIDHASH authentication for premium access
 │   ├── constants.go   # Client constants, API endpoints, itag priorities
 │   ├── types.go       # Data structures for requests/responses
-│   ├── cache.go       # Persistent cipher cache with base.js path caching
+│   ├── cache.go       # Public cache management helpers
 │   └── ytx.go         # Public API exports
-├── docs/             # Documentation
-└── dev/              # Development notes (can be deleted)
+├── docs/              # Documentation
+└── Makefile           # Canonical build/test/benchmark/cache commands
 ```
 
 ## Building
@@ -36,29 +40,34 @@ go build -o ytx ./cmd/ytx
 
 ### Dual-Client Design
 
-| Mode | Client | Cipher | Auth | Speed | Quality |
-|------|--------|--------|------|-------|---------|
-| video | ANDROID_VR | No | No | ~400ms | 1080p video + audio |
-| music | WEB_MUSIC | Yes | SAPISIDHASH | ~400-900ms | 256kbps audio |
+| Mode | Client | Cipher/JS | Auth | Quality |
+|------|--------|-----------|------|---------|
+| video | Native chain: VISIONOS → ANDROID_VR → ANDROID → IOS | None (direct ranges + near-end probes) | No (guest-only) | Highest direct adaptive video + audio |
+| music | WEB_REMIX | Yes (modern URL wrapper or legacy cipher) | SAPISIDHASH | Highest valid audio for the account/track |
+
+Video mode is guest-only and returns direct-URL adaptive streams. It probes the final byte (after a 0-0 discovery range when the length is unknown) before accepting a candidate; that verifies range readability, not a decode. Music mode uses `WEB_REMIX`'s endpoint/key and the cipher pipeline.
 
 ### JS Engine Selection
 
 ```bash
-./ytx music VIDEO_ID --js-engine bun      # Force Bun (fastest)
+./ytx music VIDEO_ID --js-engine bun      # Force Bun for the compatible path
 ./ytx music VIDEO_ID --js-engine node     # Force Node.js
-./ytx music VIDEO_ID --js-engine auto     # Auto: Bun → Node (default)
+./ytx music VIDEO_ID --js-engine quickjs  # Legacy-only embedded engine
+./ytx music VIDEO_ID --js-engine auto     # Default: Bun → Node → QuickJS (legacy n-transform)
 ```
 
-### Performance Optimizations (Latest)
+Modern URL-wrapper players require Bun or Node. `--js-engine quickjs` is rejected for those players; the modern path is fail-closed rather than silently falling back. For legacy players, engine selection applies to the n-transform: `auto` tries Bun first, then Node, then embedded QuickJS. Legacy signature decryption always uses the embedded QuickJS wrapper context.
 
-1. **FCIS Tiered Architecture** — Fallback ladder of regex window/full-file scanning drastically dropping regex analysis (~4.2s → ~100ms)
-2. **QuickJS bytecode caching** — Evaluates wrapper/URL functions as precompiled `libquickjs` bytecode rather than raw JS strings, dropping warmup from 500ms down to near 0ms in successive runs.
-3. **Decoupled API/Cipher fetching** — Signals STS incredibly early allowing asynchronous HTTP fetches to completely lap the JS evaluations.
-4. **Cache base.js URL path + payloads** — Skips embed page fetch AND HTTP player fetch on warm starts (100% network bypass).
-5. **Send player.js via file path** — Writes to temp file instead of 1.5MB IPC transfer for Botguard `bun` challenges.
-6. **Batch n-transform in bulk mode** — Single IPC call for all n-parameters
-7. **HTTP/2 connection pooling** — Reuses connections for bulk requests
-8. **Global visitorData & POToken cache** — Shared across extractions to seamlessly bypass repetitive 4-second Botguard challenges.
+### Performance Optimizations
+
+1. **FCIS Tiered Architecture** — bounded window detection, then wrapper/global legacy fallbacks; modern URL-wrapper recognition runs before the legacy tiers.
+2. **Modern wrapper transform** — one Bun/Node subprocess call produces signature, n, and `alr`, avoiding separate legacy decrypt/transform loops.
+3. **Early STS + overlapping fetch** — STS is signalled as soon as the cipher is available so the API call can overlap remaining runtime preparation.
+4. **Persistent identity-checked cache** — cipher metadata plus player/n-runtime artifacts, with full-content fingerprint and STS validation when a cached player bundle is present (bundle-less legacy caches keep their legacy gates).
+5. **Player bundle over file path** — the subprocess receives a prepared file instead of a large IPC payload.
+6. **Sequential bulk extraction** — one shared warmup, then per-ID extraction with a randomized inter-track delay. There is no batched n-transform in the bulk path.
+7. **HTTP connection reuse** — shared clients/pooling for API and player requests.
+8. **Visitor and PO token caches** — reuse short-lived bootstrap state; PO minting itself is not cached as a running process.
 
 See `docs/architecture/extraction-pipeline.md` for architecture details and the tiered fallback flowchart.
 
@@ -68,24 +77,23 @@ See `docs/architecture/extraction-pipeline.md` for architecture details and the 
 # Enable timing breakdown
 ./ytx music VIDEO_ID --profile
 
-# Output includes comprehensive FCIS diagnostics (in .timings):
+# Output includes FCIS diagnostics (in .timings). Values below are illustrative,
+# not expected timings or performance guarantees. This is a modern URL-wrapper
+# example: n_transform_ms is legacy-only and not instrumented on this path; the
+# unaccounted remainder is shown as other_ms. The displayed fields sum to total_ms.
 {
   "timings": {
     "visitor_data_ms": 260,
     "player_api_ms": 290,
     "cipher_init_ms": 700,
-    "n_transform_ms": 5,
-    "total_ms": 900,
+    "other_ms": 50,
+    "total_ms": 1300,
     "js_engine": "bun",
     "cipher_detail": {
-      "sig_tier": "global_fallback",
-      "wrapper_tier": "windowed",
-      "n_func_tier": "skipped_wrapper",
-      "player_js_bytes": 1666797,
-      "marker_miss": [
-        "set(\"alr\"",
-        "sig_patterns"
-      ]
+      "sig_tier": "urlwrapper",
+      "wrapper_tier": "protocol",
+      "n_func_tier": "skipped_protocol",
+      "player_js_bytes": 1666797
     }
   }
 }
@@ -102,7 +110,7 @@ time ./ytx video dQw4w9WgXcQ --profile
 ./ytx video dQw4w9WgXcQ --sub-langs all       # All languages
 ./ytx video dQw4w9WgXcQ --sub-langs en,es     # Specific languages
 
-# Music mode (needs Premium cookies)
+# Music mode (requires authenticated cookies; Premium may unlock higher formats)
 time ./ytx music dQw4w9WgXcQ --profile
 
 # Bulk mode
@@ -111,35 +119,43 @@ time ./ytx music --bulk id1,id2,id3,id4,id5
 # Verify URL works
 ./ytx music dQw4w9WgXcQ | jq -r '.url' | xargs curl -sI | head -3
 
-# Run regression tests
-go test -v ./pkg/... -run TestExtractorRegression
+# Run the broad package suite (includes live regression coverage)
+make test
 
-# Update golden image
-UPDATE_GOLDEN=1 go test -v ./pkg/... -run TestExtractorRegression
+# Focused offline unit checks (exact names; discover more with go test -list)
+go test -v ./pkg -run '^TestFindSigFunctionName$' -count=1
+go test -v ./internal/cache -run '^TestLoadVisitorDataAllowStaleWithinGrace$' -count=1
+
+# Regression target: live, golden comparison, hard timing bound
+make test-regression
+
+# Update the golden image only after deliberately validating a behavior change
+make test-regression-update
 
 # Opt-in live probe tests (single and bulk music mode)
 make test-music-probe
 
 # Cache management
-./ytx cache purge  # Clear all cache for fresh benchmark
+./ytx cache purge  # Remove cipher/player/PO artifacts; visitor.json is retained
 ```
 
+`make test` runs all tests in `./pkg`, including the live `TestExtractorRegression`; it is not an offline-only target. Music subcases skip without cookies, and a live 403 can fail the run. `make test-regression` compares correctness and fails whenever `total_ms` exceeds the golden baseline by more than 300ms; it has no warning-only mode. `make test-regression-perf` sets `STRICT_REGRESSION=1`, but that variable is not read by the Go tests, so it is not a separate gate.
+
 Live probe tests are intentionally opt-in because they hit YouTube stream URLs directly.
-Use `make test-music-probe` to run both the single-track probe and the 2-ID bulk probe.
+Use `make test-music-probe` to run both the single-track probes and the two-ID bulk probes. See `docs/guides/testing.md` for exact semantics.
 
 ## Performance Benchmarks
 
-| Operation | Cold Start | Warm (disk) | Warm (memory) |
-|-----------|------------|-------------|---------------|
-| Video mode | ~400ms | ~250ms | ~250ms |
-| Music mode | **~1.4s** | ~400ms | ~400ms |
-| PO mode (Botguard) | ~4.6s | ~330ms | ~330ms |
-| Bulk 5 tracks | ~700ms | ~500ms | ~500ms |
-| n-transform | ~500ms (bootstrap) | < 1ms | < 1ms |
+Do not use a fixed table here as a current promise. Measure the build, cache state, mode, runtime, and network in front of you. `make bench-bulk` runs one cold and three warm extractions of a single `TEST_VIDEO`; it is not a 50-track throughput test. `make bench` runs the package benchmarks with `-benchtime=3x`, but because it does not set `-run`, it also runs the package tests (including the live `TestExtractorRegression`) first.
 
-### Throughput (Bulk Mode)
-- **7+ videos/sec** with warm cache
-- All URLs verified HTTP 200 OK
+For measurement guidance and historical context, see `docs/guides/benchmarking.md` and the dated historical tables in `docs/architecture/extraction-pipeline.md`.
+
+### Bulk behavior
+
+- Extraction is sequential per video ID.
+- The first ID may start a shared visitor/cipher/n-runtime warmup in the background.
+- Between non-final IDs, `pkg/bulk.go` sleeps a randomized 50–250ms (`150ms ± 100ms`).
+- There is no fixed videos-per-second claim and no batched n-transform in the bulk path.
 
 ## When YouTube Breaks Things
 
@@ -148,20 +164,23 @@ For the step-by-step operational workflow, use `docs/extractor-breakage-playbook
 ### Quick Diagnosis
 
 ```bash
-# 1. Check if yt-dlp works (baseline)
-yt-dlp -f 141 -g "https://music.youtube.com/watch?v=hbl2Cuw75oE"
+# 1. Check if yt-dlp works (baseline; 141 is not offered for every track/account)
+yt-dlp -f bestaudio/best -g "https://music.youtube.com/watch?v=hbl2Cuw75oE"
 
 # 2. Check if ytx gets the URL but it returns 403
 ./ytx music hbl2Cuw75oE | jq -r '.url' | xargs curl -sI | head -1
-# If "HTTP 403" -> cipher/n-transform is broken
-# If "HTTP 200" -> working correctly
+# "HTTP 403" can be signature/n, a PO requirement, cookies, or YouTube-side blocking.
+# "HTTP 200" means at least the probed request was accepted.
 
-# 3. Compare n parameter between ytx and yt-dlp
+# 3. Compare n parameter as a lead, not as a pass/fail test
 YTX_N=$(./ytx music hbl2Cuw75oE | jq -r '.url' | tr '&' '\n' | grep '^n=' | cut -d= -f2)
-YTDLP_N=$(yt-dlp -f 141 -g "https://music.youtube.com/watch?v=hbl2Cuw75oE" | tr '&' '\n' | grep '^n=' | cut -d= -f2)
+YTDLP_N=$(yt-dlp -f bestaudio/best -g "https://music.youtube.com/watch?v=hbl2Cuw75oE" | tr '&' '\n' | grep '^n=' | cut -d= -f2)
 echo "ytx n: $YTX_N"
 echo "yt-dlp n: $YTDLP_N"
-# If different -> n-function is wrong (most common issue)
+# Independently obtained values can differ without proving the decoder is
+# wrong. Decode equivalence requires the same player and the same input run
+# through a known-valid independent oracle; matching range reachability is
+# not decode proof.
 ```
 
 ### Root Cause: Missing signatureTimestamp (Dec 2025 Incident)
@@ -182,7 +201,7 @@ F4: TransformN(n) → n'
 **Fix:** 
 1. Extract STS from player.js: `findSignatureTimestamp()` in `pkg/cipher.go`
 2. Include in API request: `SignatureTimestamp` field in `ContentPlaybackContext`
-3. Wait for cipher before API call (cipher contains STS)
+3. Gate the API call on a positive STS from the player/cipher (the current pipeline can signal STS before full cipher initialization)
 
 **Files changed:** `pkg/types.go`, `pkg/cipher.go`, `pkg/cache.go`, `pkg/extractor.go`
 
@@ -198,7 +217,7 @@ klj=function(S){return MP[z[7]](this,19,S)};  // Just a wrapper!
 realFunc=function(S){var W=S.split("");try{...}catch(e){...}...}
 ```
 
-**Solution:** Use yt-dlp's AST-based solver which validates function body structure.
+**Historical response:** adopt yt-dlp-style AST/structural validation instead of accepting the first matching wrapper. Current detection validates structure in `pkg/cipher_detect.go` and `internal/jsextract`; modern URL wrappers are recognized by bounded markers.
 
 ### yt-dlp Reference Files
 
@@ -212,33 +231,50 @@ When yt-dlp releases a fix, check these files:
 | `yt_dlp/extractor/youtube/_video.py:2632-2650` | `_generate_player_context` - API request body |
 | `yt_dlp/extractor/youtube/_base.py` | Client configs, headers, SAPISIDHASH |
 
-### Testing with yt-dlp's Solver (POC)
+### Comparing with yt-dlp
+
+The repository does not ship a standalone solver POC script. Use the shipped diagnostics instead:
 
 ```bash
-# Run the POC to test yt-dlp's solver directly
-bun poc_solver.mjs
+# Side-by-side ytx vs yt-dlp, including direct API and URL probes
+make diagnose DEBUG_VIDEO=dQw4w9WgXcQ
 
-# This uses yt-dlp's yt.solver.core.js to:
-# 1. Parse player.js with meriyah AST parser
-# 2. Find correct n-function and sig-function
-# 3. Transform challenge values
+# Probe the extracted URL with an HTTP Range request
+make probe-url DEBUG_MODE=music DEBUG_VIDEO=dQw4w9WgXcQ
+
+# Full-stream download check (distinguishes blocking from throttling)
+make probe-download DEBUG_MODE=music DEBUG_VIDEO=dQw4w9WgXcQ
 ```
 
-If signature decryption fails, the issue is likely in `pkg/cipher_detect.go`. The system uses an FCIS (Functional Core/Imperative Shell) tiered fallback:
+> **Signed URLs:** both `probe-url` and `probe-download` echo the full extracted
+> URL (`URL: ...`). That URL is a short-lived credential. Redact it before
+> pasting logs, issues, or retained files; use `https://...` placeholders in
+> anything public. The commands do not print cookies.
 
-1. **Tier 1 (Fast Windowed Regex):** Uses `detectFastSignature` to scan an 8KB window of `player.js` for well-known structural clues (e.g. `encodeURIComponent(`).
-2. **Tier 2 (Wrapper AST/Regex):** Uses `detectWrapperSignature` if Tier 1 misses.
-3. **Tier 3 (Global Fallback):** Uses `detectGlobalSignature` to scan the full 1.66MB file using heavy recursive regex. This protects the pipeline against minification variable changes.
+For the underlying comparison, the diagnostic runs `yt-dlp -f 141 -g` and reports both tools' `sig`/`n` values. Format 141 must actually be offered for the track/account; a failure there is not a universal baseline. Read the output before changing detection code.
 
-If YouTube completely overhauls the AST, we will see `detail.SigTier = "not_found"` in the `--profile` diagnostic output. Adjust the window markers (`sigFunctionPatterns`) in `cipher_detect.go`.
+If signature decryption fails, the cause depends on the path:
+
+- **Modern URL wrapper**: inspect wrapper recognition/validation and Bun/Node availability. Ambiguous wrappers are fail-closed and do not use legacy QuickJS.
+- **Legacy**: inspect the FCIS ladder in `pkg/cipher_detect.go` and the wrapper/signature extraction helpers. A `global_fallback` tier means Tier 1 missed.
+
+The legacy ladder is:
+
+1. **Tier 1 (Fast Windowed Regex):** `detectFastSignature` scans a small window of `player.js` for structural clues.
+2. **Tier 2 (Wrapper AST/Regex):** `detectWrapperSignature` runs when Tier 1 misses.
+3. **Tier 3 (Global Fallback):** `detectGlobalSignature` scans the full file. This protects against minification variable changes.
+
+If YouTube completely overhauls the player shape, extraction fails with an error instead of a profile: `--profile` output is emitted only on a successful extraction, and the CLI prints a JSON error without a profile on failure. Inspect the extraction error, especially signature detection failures or modern wrapper ambiguity, then adjust the relevant bounded markers/validation rather than adding a broad fallback.
 
 ### Client Version Updates
 
 Update `pkg/constants.go`:
 
 ```go
-ClientVersion = "1.20251216.01.00"
+ClientVersion = "1.20260114.03.00"
 ```
+
+Use the version currently observed on `music.youtube.com`; the checked-in value is the source of truth.
 
 ### Diagnose Tool
 
@@ -255,7 +291,7 @@ This tool:
 4. Tests API directly with signatureTimestamp
 5. Verifies both URLs return HTTP 200
 
-Example output:
+Example output (illustrative; values and extraction state will differ):
 ```
 [0] Cookie status:
     PREMIUM ✓ (authenticated with YouTube Premium)
@@ -281,17 +317,24 @@ DIAGNOSIS:
 
 ### Clear Cache and Retry
 
+Use the cache command so all cipher/player/runtime artifacts are removed:
+
 ```bash
-rm ~/.cache/ytx/cipher.json
-./ytx music VIDEO_ID
+./ytx cache purge
+./ytx music VIDEO_ID --profile
 ```
+
+`cache purge` preserves `visitor.json`. Deleting only `cipher.json` from the cache directory leaves player/n-runtime artifacts behind and is not a full reset.
 
 ## Dependencies
 
-- `github.com/buke/quickjs-go` - QuickJS runtime for wrapper-mode sig/n (ES2020+ required)
-- `github.com/dop251/goja` - Pure Go JavaScript interpreter (legacy sig extraction, AST parsing)
-- `github.com/dop251/goja/parser` - JS AST parsing
+- `github.com/buke/quickjs-go` — embedded QuickJS runtime for the **legacy** path and legacy wrapper bytecode (CGO)
+- `github.com/dop251/goja` — pure-Go JavaScript parser/interpreter used by legacy extraction helpers (e.g. `internal/jsextract`)
+- `github.com/dop251/goja/parser` — JS AST parsing
 
-### External (for n-transform, fallback)
-- `bun` - Preferred JS runtime (fastest subprocess)
-- `node` - Fallback JS runtime
+### External runtimes
+- `bun` — preferred Bun/Node runtime for the modern URL-wrapper path and legacy subprocess path
+- `node` — fallback subprocess runtime. The subprocess lookup also accepts the
+  `nodejs` binary name after `node` is missing (explicit `--js-engine node` and
+  the modern URL-wrapper path); legacy `auto` checks `node` only.
+- PO mode additionally needs `jsdom` and `bgutils-js` resolvable by the chosen runtime. They are **not** vendored, and the repository has no package manifest or install step for them; a fresh checkout is not guaranteed to mint PO tokens. See `docs/architecture/po-token.md`.
