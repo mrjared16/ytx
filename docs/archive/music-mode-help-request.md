@@ -1,5 +1,7 @@
 # ytx Music Mode: Context, Current State, Goals, and Help Request
 
+> **ARCHIVED — historical help request.** This describes the project state at the time it was written; it is **not** the current implementation. Retained for technical context. Original repository date: 2026-03-27.
+
 This document is intended to give enough context for an external engineer to help debug and optimize `ytx music` mode without needing the full conversation history.
 
 It focuses on:
@@ -25,10 +27,11 @@ Main relevant paths:
 - `pkg/extractor.go` — high-level extraction flow
 - `pkg/cipher.go` — player bootstrap, signature decryption, n-transform discovery/execution
 - `pkg/cache.go` — persistent cache for player/cipher artifacts
-- `pkg/jsengine.go` — JS engine selection/cache for n-transform
-- `pkg/quickjsrunner.go` / `pkg/jsrunner.go` / `pkg/nrunner.mjs` — runtime execution paths
-- `pkg/extractor_test.go` — integration/regression tests
-- `docs/TECHNICAL.md` — intended architecture/design reference
+- `internal/jsengine/engine.go` — current mapping: engine types, parser, and `JSEngine` interface (historical name: `pkg/jsengine.go`); it does not own selection/cache
+- `pkg/runtime_engine.go` — current engine selection/cache and URL-wrapper runner lifecycle; `pkg/runtime.go` — shared runtime caches
+- `internal/jsengine/quickjs.go` / `internal/jsengine/subprocess.go` / `internal/jsengine/nrunner.mjs` — runtime execution paths (historical names: `pkg/quickjsrunner.go` / `pkg/jsrunner.go` / `pkg/nrunner.mjs`)
+- `pkg/extractor_regression_test.go` — integration/regression tests (historical name: `pkg/extractor_test.go`)
+- `DEVELOPMENT.md` and `docs/architecture/extraction-pipeline.md` — architecture/design reference (the original `docs/TECHNICAL.md` no longer exists)
 
 The repo supports two major modes:
 
@@ -94,7 +97,7 @@ The repo had drifted into several bad states during debugging:
 3. A temporary **POT-first path** that was not part of the intended architecture and did not reliably solve the real issue
 4. Test harness behavior that **hid failures by skipping music cases** and made progress look better than it was
 
-We explicitly backed away from the POT-first path and restored the documented extractor/cipher architecture from `docs/TECHNICAL.md` as the primary design.
+We explicitly backed away from the POT-first path and restored the documented extractor/cipher architecture (originally recorded in `docs/TECHNICAL.md`, which has since been removed; current equivalents are `DEVELOPMENT.md` and `docs/architecture/extraction-pipeline.md`) as the primary design.
 
 ---
 
@@ -437,7 +440,7 @@ That path was explored and intentionally backed out from the critical production
 
 ### 12.2 The intended primary architecture is the documented internal cipher path
 
-We want the default path to stay aligned with `docs/TECHNICAL.md`.
+We want the default path to stay aligned with the documented internal cipher architecture (originally `docs/TECHNICAL.md`; see current `DEVELOPMENT.md` and `docs/architecture/extraction-pipeline.md`).
 
 ### 12.3 Caching should be player-version-centric, not video-centric
 
@@ -522,18 +525,19 @@ If someone wants to help, these are the best entry points.
 
 ### Runtime caching
 
-- `pkg/jsengine.go`
-- `pkg/quickjsrunner.go`
-- `pkg/jsrunner.go`
-- `pkg/nrunner.mjs`
+- `internal/jsengine/engine.go` (historical: `pkg/jsengine.go`)
+- `internal/jsengine/quickjs.go` (historical: `pkg/quickjsrunner.go`)
+- `internal/jsengine/subprocess.go` (historical: `pkg/jsrunner.go`)
+- `internal/jsengine/nrunner.mjs` (historical: `pkg/nrunner.mjs`)
 
 ### Persistent cache
 
 - `pkg/cache.go`
+- `internal/cache/`
 
 ### Tests
 
-- `pkg/extractor_test.go`
+- `pkg/extractor_regression_test.go` (historical: `pkg/extractor_test.go`)
 - `pkg/cipher_sig_test.go`
 - `pkg/jsengine_test.go`
 
@@ -616,5 +620,5 @@ If someone wants to help, the most important remaining areas are:
 
 Related existing repo docs:
 
-- `docs/TECHNICAL.md` — intended project architecture
-- `docs/youtube-403-fix-learnings.md` — earlier technical learnings from the 403/cipher debugging work
+- `DEVELOPMENT.md` — broader architecture and debugging notes (the original `docs/TECHNICAL.md` no longer exists)
+- `docs/archive/youtube-403-fix-learnings.md` — earlier technical learnings from the 403/cipher debugging work (archived)

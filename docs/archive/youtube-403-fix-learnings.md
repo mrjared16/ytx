@@ -1,5 +1,14 @@
 # YouTube 403 Forbidden Fix: Technical Learnings
 
+> **ARCHIVED — historical technical record.** This describes the implementation and measurements at the time it was written; it is **not** the current implementation. Retained for technical context. Original repository date: 2026-03-27. Historical client/path names are preserved; for example, `WEB_MUSIC` is now `WEB_REMIX`.
+>
+> **Editorial supersession (current):** the §6 claim that HTTP `200`/`206` is
+> "the only definitive proof" of a valid signature/n-transform is false as a
+> general decoder test. A `200`/`206` response proves reachability/byte access
+> for the probed request only; it is not independent decoding or playback
+> proof. The original historical body and measurements below are retained
+> unchanged.
+
 This document synthesizes the root cause analysis, technical decisions, and performance optimizations implemented to resolve systemic HTTP 403 Forbidden errors in `ytx music` mode and optimize the cipher extraction process.
 
 ## 1. The Problem
@@ -61,7 +70,7 @@ To achieve the 8x performance target, `extractWithAST` was completely refactored
 
 ## 6. Key Learnings & Gotchas
 - **Cold-Cache Reliability**: Always verify with `ytx cache purge`. Cache often masks systemic failures during development.
-- **Range Request Necessity**: HTTP 200/206 status is the only definitive proof of a valid signature/n-transform combination; mere string presence is insufficient.
+- **Range Request Necessity** (historical claim; superseded by the banner above): HTTP 200/206 status is the only definitive proof of a valid signature/n-transform combination; mere string presence is insufficient.
 - **Brittle Regex vs. AST**: Fixed-length regex patterns (like the old 3-char N-check) are highly susceptible to obfuscation drift. Structural AST analysis is significantly more resilient.
 - **Dependency Filtering**: When performing recursive extraction, it is critical to filter out unsafe non-function snippets (e.g., `var F=d[v]`) that can drag in unresolved global references.
 - **JS Engine Errors**: `ReferenceError` in the JS engine usually indicates a failure in the dependency crawler, not the engine itself.
