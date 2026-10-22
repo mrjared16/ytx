@@ -1,41 +1,73 @@
 # PO Token (Botguard) Engine
 
-This document details the low-level technical architecture of the `--po` (Proof of Origin) Botguard minting pipeline designed to bypass YouTube's heavy IP throttling walls while maximizing runtime response times.
+This document describes the explicit `--po` (Proof of Origin) token lane. It is not part of normal mode and it does not replace signature/n decoding.
 
 ## Overview
 
-When YouTube aggressively flags an IP address or requires signed attestation (especially on Music Premium tracks), standard streams will yield `HTTP 403 Forbidden`. The `--po` flag opts the extraction pipeline into a dedicated subprocess lane that mounts a simulated DOM environment, executes an obfuscated JS challenge sent by Google's attestation endpoints, and mints an encrypted token (`po_token`).
+Some requests need a PO token in addition to cookies and a valid decoded stream URL. `--po` opts an extraction into minting that token. A successful mint is only one step: the signature and n transform must still succeed, and YouTube can still return 403 for other reasons (expired cookies, account restrictions, or YouTube-side blocking).
 
-Because evaluating this Botguard payload natively blocks the UI thread for ~4.5 seconds, the `ytx` PO Mode uses aggressive off-critical-path caching.
+Normal mode performs no PO work.
 
-## The PO State Machine
+## Mint flow
 
-### 1. Attestation Block Fetch
-A background request is fired immediately at the `watch?v=` HTML payload to extract a unique 195+ character `Botguard Challenge` encoded in the Google configuration objects. 
+`--po` runs a token coordinator that:
 
-### 2. Node/Bun JSDOM Payload
-Instead of heavily polyfilling the native `quickjs` (which is highly restricted and synchronous), PO mode routes the Botguard execution to an external `bun` (or `node`) persistent subprocess. 
+1. Loads a cached token when the stored video/visitor/session identity validates and the entry is unexpired.
+2. Otherwise loads a Botguard challenge. `loadPOTokenChallengeContext` first tries the music watch-page extractor; that helper is currently gated on the historical `WEB_MUSIC` config name, so the active `WEB_REMIX` configuration falls through to the attestation (`att/get`) request.
+3. Calls the minting subprocess and waits for the result.
+4. Sends the player token to the Innertube API in `ServiceIntegrityDimensions`.
+5. Applies the URL token as the `pot` query parameter, when present.
+6. Persists the result in `po_token.json` with an expiry.
 
-The subprocess uses `JSDOM` to establish an artificial `window.document` capable of intercepting and executing the obfuscated script without crashing.
+### The subprocess is per mint, not a daemon
 
-### 3. Asynchronous Coordination
-Because fetching the challenge, booting the subprocess, and minting the Token is heavily CPU-bound (taking ~4100ms in modern Bun), this work is fully decoupled from the core `Cipher` initialization.
-- The `fetchPlayerJSContext` and API endpoints continue their fetching while `poc_mint` operates concurrently.
+`mintPOTokenWithEngine` in `pkg/potrunner.go`:
 
-## Optimization Strategy (Fastest Response Time)
-Our explicit goal is to drop the 4.6s PO penalty down to matching the unauthenticated 300ms stream speeds.
+- resolves a Bun or Node binary (`auto` prefers Bun, then Node; an explicit engine must exist). QuickJS is not supported for PO minting.
+- writes the embedded `pkg/po_minter.mjs` to the ytx cache directory (or a temporary path)
+- creates `exec.CommandContext(ctx, runtime, scriptPath)`
+- sends one JSON request on stdin and reads one JSON response on stdout
+- waits for the process and returns the player token, URL token, and TTL
 
-### Dedicated Persistent Caching
-To minimize process overhead across multiple CLI invocations, `ytx` persists the Botguard token directly to a `po_token.json` disk cache along with the current `visitorData` fingerprint. 
-By saving this cache cross-session, any subsequent run skips the 4.1s execution payload entirely and immediately pipes the JWT into the final stream extraction API parameters.
+There is **no persistent Bun/Node daemon**, no long-lived JSON challenge stream, and no sub-10 ms inter-track response guarantee. Bulk extraction is sequential; each mint that misses the token cache starts a new subprocess. A cached token avoids the mint entirely.
 
-**Benchmark Impact:**
-- **PO Cold Start:** `~4600ms` (Subprocess mint heavily bound to CPU).
-- **PO Warm Start:** `~330ms` (Botguard engine completely skipped. 100% harmonized with standard pipeline execution speeds).
+The process is cancellable through the caller's context.
 
-### Persistent Subprocess (Bulk Mode)
-When running across multiple tracks via the `--bulk` pipeline, PO mode uses a pre-booted persistent `bun` subprocess stream. Instead of incurring the 150ms `node` cold start overhead on every individual track, the engine streams JSON challenges to the live daemon, yielding sub-10ms inter-track PO challenge responses.
+### Runtime dependencies are not bundled
+
+`pkg/po_minter.mjs` imports:
+
+```js
+import { BG, buildURL, GOOG_API_KEY, USER_AGENT } from 'bgutils-js';
+import { JSDOM } from 'jsdom';
+```
+
+The repository has no `package.json`, lockfile, `node_modules`, or install step for these modules. The minter script is embedded in the Go binary, but those two modules must already be resolvable by the chosen Bun/Node runtime.
+
+Implications:
+
+- A fresh checkout is not guaranteed to have a working PO runtime.
+- Bun is preferred when present, but that does not supply the JS modules by itself.
+- Node fallback is conditional on module resolution and is not reliable on a clean machine without those dependencies.
+- This document does not prescribe package versions or installation commands, because the repository does not pin or provision them.
+
+## Caching
+
+Tokens are stored in the ytx cache as `po_token.json`. Entries are keyed by video, visitor data, session index, and network key. On load, `LoadPOToken` looks for a matching entry and validates video, visitor data, session, and expiry; the network-key comparison is enforced only when a network key is supplied. Expired entries are not reused. The default in-process TTL fallback is 10 minutes when the mint does not return one.
+
+A cached token skips the challenge fetch and mint, but not signature/n processing.
+
+## Failure modes
+
+- **Mint / runtime failure**: returned as an explicit PO error (`POFailureRuntimeMint`, or `POFailureTokenUnavailable` when the coordinator has no token). It happens before final URL publication.
+- **Mint succeeds, final URL still 403**: the token did not address the actual cause. Investigate signature/n decoding, cookies, account, or YouTube-side blocking.
+- **Missing modules / runtime**: the subprocess or import fails; this is an environment problem, not evidence that `--po` fixed a decoder bug.
+
+`--po` is therefore not a universal 403 fix and should not be documented as one.
 
 ## Invariants
-- **Global Key:** The cache strictly verifies that the `visitorData` from the initial HTML session matches the local cache block payload.
-- **Fail-Fast:** If Botguard minting outright fails, `ytx` returns an explicit `POFailureTokenUnavailable` error rather than blindly passing an undecryptable payload and forcing a 403.
+
+- **Explicit opt-in**: no PO challenge or mint work happens without `--po`.
+- **Token identity**: entries are keyed by video, visitor data, session, and network; load-time validation checks video, visitor, session, and expiry, and enforces the network key only when one is supplied.
+- **Separate failures**: mint errors and decoder errors are surfaced distinctly.
+- **No hidden fallback**: if PO minting fails, extraction fails rather than appending an invalid token and hoping for the best.

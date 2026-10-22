@@ -1,46 +1,49 @@
 # Architecture Overview
 
-`ytx` is designed with a single goal: **minimal latency for single-video extraction.** 
+`ytx` is built for low-latency extraction, with separate paths for video and music because the two modes need different YouTube clients and validation.
 
-## The Dual-Client Strategy
+## The dual-client strategy
 
-Unlike generic extractors that use a "one-size-fits-all" approach, `ytx` selects the optimal YouTube client based on the requested mode:
-
-| Client Mode | Internal Client | Advantage |
+| Client mode | Client path | What it does |
 | :--- | :--- | :--- |
-| **Video** | `ANDROID_VR` | Returns direct URLs. skip cipher decryption entirely (~220ms total). |
-| **Music** | `WEB_REMIX` | Access to premium 256kbps audio (itag 141). Requires cipher but optimized. |
+| **Video** | Sequential native chain: `VISIONOS` → `ANDROID_VR` → `ANDROID` → `IOS` | Guest-only, direct-URL formats, no cipher/PO/JS. Each candidate is checked with near-end byte-range probes. |
+| **Music** | `WEB_REMIX` | Authenticated audio path; uses cipher/signature/n handling and, on modern players, the URL-wrapper protocol. |
 
-## Performance Philosophy
+Video mode's probes prove that the returned direct range is readable; they are not proof that a signature/n decode is correct. The native chain deliberately does not run cipher or PO work.
 
-`ytx` achieves its speed through several key architectural decisions:
+Music mode's modern URL-wrapper path requires Bun or Node and produces signature, n, and `alr` in one subprocess transform. QuickJS is legacy-only: legacy signature decryption always uses it, and legacy `auto` may use it for the n-transform. It cannot run modern wrappers.
 
-1.  **Native Go Execution**: Core logic is implemented in Go, eliminating Python/Node overhead.
-2.  **FCIS Tiered Detection**: Using a "Functional Core / Imperative Shell" strategy with windowed regex scanning to analyze the 1.6MB `player.js` in ~100ms.
-3.  **HTTP/2 Connection Pooling**: Reusing TCP connections for API calls and script fetching.
-4.  **PO Token Optimization**: Persistent Botguard challenge caching to eliminate the 4s attestation penalty on repeat runs.
+Authentication is intentionally separated: the native video path is guest-only, while cookies/SAPISIDHASH belong to the music path. See `docs/architecture/extraction-pipeline.md` for the call chain.
 
-## High-Level Flow
+## Design principles
+
+1. **Native Go orchestration**: HTTP, cache, and extraction control live in Go.
+2. **FCIS detection ladder**: bounded windowed markers first, broader wrapper/global scans only when needed. A recognized modern wrapper takes precedence and ambiguous wrapper candidates fail closed.
+3. **Connection reuse**: HTTP clients are shared and pooled for API and player fetches.
+4. **Identity-checked cache**: when a cached player bundle is present, it is reused only when the full-content fingerprint (and, when available, the STS) agrees.
+5. **Explicit PO lane**: `--po` mints a token in a short-lived Bun/Node subprocess. It is not a daemon and not a universal 403 fix.
+6. **Explicit failure over silent fallback**: modern wrapper failures return errors; they do not silently fall back to QuickJS or an untransformed URL.
+
+## High-level flow
 
 ```mermaid
 graph TD
-    A[Request: Video ID] --> B{Client Mode?}
-    B -- Video --> C[ANDROID_VR API]
-    C --> D[Direct URL - Result]
-    B -- Music --> E[Tiered Detection Pipeline]
-    E -- Tier 1 --> F[Fast Window Scan]
-    F -- Fail --> G[Tier 2/3 Fallback]
-    G --> H[Signature Decryption]
-    H --> I[N-Transform]
-    I --> J[Final URL - Result]
+    A[Request: Video ID] --> B{Mode?}
+    B -- Video --> C[Native guest chain: VISIONOS → ANDROID_VR → ANDROID → IOS]
+    C --> D[Direct-URL audio/video + near-end range probes]
+    D --> E[Result]
+    B -- Music --> F[Visitor/cipher prep + early STS]
+    F --> P[Optional PO mint in parallel]
+    F --> G[Await visitor/STS and, in --po, the token]
+    P --> G
+    G --> H[Player API: select audio]
+    H --> I{Modern URL wrapper?}
+    I -- Yes --> J[Bun/Node wrapper transform: sig + n + alr]
+    I -- No --> K[Legacy detection ladder + decrypt/n transform]
+    J --> L[Result]
+    K --> L
 ```
 
-## Performance Comparison (Cold Start)
+## Performance
 
-| Tool | Video Mode | Music Mode |
-| :--- | :--- | :--- |
-| yt-dlp | ~1200ms | ~1500ms |
-| pytubefix| ~3000ms | ~2800ms |
-| **ytx** | **~220ms** | **~1400ms** |
-
-*Note: Warm starts for ytx Music Mode drop to **~350-450ms**.*
+There are no current fixed latency promises. Historical measurements and their dates are retained in `docs/architecture/extraction-pipeline.md`; they describe older paths and environments and should not be presented as current benchmarks. Use `docs/guides/benchmarking.md` to measure a specific build and cache state.
